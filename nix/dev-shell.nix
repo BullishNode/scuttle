@@ -94,12 +94,14 @@ let
 
 	clightning = (if isDarwin then null else pkgs.clightning.overrideAttrs (old: {
 		version = lightningVersion;
-		src = pkgs.fetchurl {
-			url = "https://github.com/ElementsProject/lightning/releases/download/v${lightningVersion}/clightning-v${lightningVersion}.zip";
-			hash = "sha256-cZEfzDXkqyRuvH1FMcrPK8OBYGnZZ5jcj3pztAMgfO0=";
+		src = pkgs.fetchFromGitHub {
+			owner = "BullishNode";
+			repo = "lightning";
+			rev = "1c008fef3c887d8850c6a661cd627babe5e45dd3";
+			fetchSubmodules = true;
+			hash = "sha256-HtMoHg2g2nT2BxxSa3mUEEbhRrdGzpRCmtUhHyXEtZ4=";
 		};
 		makeFlags = [ "VERSION=v${lightningVersion}" ];
-		patches = (old.patches or []) ++ [ ./patches/cln-xpay-completed-route-error.patch ];
 		postPatch = (old.postPatch or "") + ''
 			chmod +x devtools/blockreplace.py
 			patchShebangs devtools/blockreplace.py

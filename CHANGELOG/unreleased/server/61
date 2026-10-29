@@ -1,0 +1,3 @@
+- Pin Core Lightning to the BullishNode fork
+  Keep the existing xpay correction and its regression test in one source revision.
+  [#61](https://github.com/BullishNode/scuttle/pull/61)
