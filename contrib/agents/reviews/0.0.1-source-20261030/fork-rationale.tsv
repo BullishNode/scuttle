@@ -1,13 +1,17 @@
 path	production_metric_candidate	necessity_or_disposition
 .config/nextest.toml	False	Retain the existing separately agreed scale profile; ordinary 180-second profile, retries and money assertions are unchanged.
+CHANGELOG/unreleased/ark-lib/2	False	State the actual draft PR and compatibility boundary; no runtime change.
 CHANGELOG/unreleased/ark-lib/46	False	Explain the fork contract, operational/recovery limits or historical change; documentation is outside the production metric.
 CHANGELOG/unreleased/bark-cli/32	False	Explain the fork contract, operational/recovery limits or historical change; documentation is outside the production metric.
 CHANGELOG/unreleased/bark-json/32	False	Explain the fork contract, operational/recovery limits or historical change; documentation is outside the production metric.
 CHANGELOG/unreleased/bark-rest/32	False	Explain the fork contract, operational/recovery limits or historical change; documentation is outside the production metric.
+CHANGELOG/unreleased/bark/2	False	State the actual draft PR and compatibility boundary; no runtime change.
 CHANGELOG/unreleased/bark/32	False	Explain the fork contract, operational/recovery limits or historical change; documentation is outside the production metric.
 CHANGELOG/unreleased/bark/59	False	Explain the fork contract, operational/recovery limits or historical change; documentation is outside the production metric.
 CHANGELOG/unreleased/bitcoin-ext/32	False	Explain the fork contract, operational/recovery limits or historical change; documentation is outside the production metric.
+CHANGELOG/unreleased/server-rpc/2	False	State the actual draft PR and compatibility boundary; no runtime change.
 CHANGELOG/unreleased/server-rpc/32	False	Explain the fork contract, operational/recovery limits or historical change; documentation is outside the production metric.
+CHANGELOG/unreleased/server/2	False	State the actual draft PR and compatibility boundary; no runtime change.
 CHANGELOG/unreleased/server/32	False	Explain the fork contract, operational/recovery limits or historical change; documentation is outside the production metric.
 CHANGELOG/unreleased/server/60	False	Explain the fork contract, operational/recovery limits or historical change; documentation is outside the production metric.
 Cargo.lock	False	Retain the existing test-only lightning dependency edge; no new production dependency is introduced by the fork.
@@ -70,6 +74,14 @@ bark/src/round/mod.rs	True	Preserve recipient proofs, complete signed recovery m
 bark/src/vtxo/mod.rs	True	Preserve recipient proofs, complete signed recovery material and single-count wallet balances across ordinary upstream actions; adopt upstream GuardedCheckpoint where it applies.
 bark/tests/bark_persister_test.rs	False	Keep native regression coverage and exact money oracles; adapt fixtures to required ownership proofs and upstream interfaces. No current-candidate execution inferred.
 bitcoin-ext/src/bdk.rs	True	Extend the upstream CPFP builder for verified orphan-child replacement and confirmed funding exclusions; retain unchanged immutable parent and fee limits.
+contrib/agents/reviews/0.0.1-source-20261030/baseline-delta.json	False	Requested source-review/LOC evidence and reproducible measurement tooling; excluded from runtime source. No product or test dependency.
+contrib/agents/reviews/0.0.1-source-20261030/candidate-delta.json	False	Requested source-review/LOC evidence and reproducible measurement tooling; excluded from runtime source. No product or test dependency.
+contrib/agents/reviews/0.0.1-source-20261030/evidence-index.json	False	Requested source-review/LOC evidence and reproducible measurement tooling; excluded from runtime source. No product or test dependency.
+contrib/agents/reviews/0.0.1-source-20261030/fork-rationale.tsv	False	Requested source-review/LOC evidence and reproducible measurement tooling; excluded from runtime source. No product or test dependency.
+contrib/agents/reviews/0.0.1-source-20261030/loc-summary.json	False	Requested source-review/LOC evidence and reproducible measurement tooling; excluded from runtime source. No product or test dependency.
+contrib/agents/reviews/0.0.1-source-20261030/measure.py	False	Requested source-review/LOC evidence and reproducible measurement tooling; excluded from runtime source. No product or test dependency.
+contrib/agents/reviews/0.0.1-source-20261030/upstream-review.tsv	False	Requested source-review/LOC evidence and reproducible measurement tooling; excluded from runtime source. No product or test dependency.
+contrib/agents/reviews/release/0.0.1-source-20261030.md	False	Requested source-review/LOC evidence and reproducible measurement tooling; excluded from runtime source. No product or test dependency.
 docs/fallback.md	False	Explain the fork contract, operational/recovery limits or historical change; documentation is outside the production metric.
 justfile	False	Keep the existing generator recipe correction so untagged generated errors preserve the stable refusal code instead of decoding it as generic 400.
 lib/src/address.rs	True	Carry bounded versioned coin/mailbox authorization in recipient addresses; use existing secp256k1 and mailbox blinding primitives, never Bitcoin-key ownership proof.
