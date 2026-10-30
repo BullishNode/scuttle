@@ -6,6 +6,7 @@ use bitcoin::bip32::{Xpriv, Xpub};
 use bitcoin::secp256k1::{Keypair, PublicKey};
 
 use ark::{ProtocolEncoding, ServerVtxo, Vtxo, VtxoId, SECP};
+use ark::attestations::VtxoStatusAttestation;
 use ark::recovery::XpubRecoveryAuthorization;
 use ark::test_util::dummy::DummyTestVtxoSpec;
 use ark::vtxo::Full;
@@ -109,9 +110,11 @@ async fn recover_vtxos_by_xpub_splits_a_key_over_several_calls() {
 	assert!(key0.len() > 2 * RECOVERY_VTXO_PAGE_SIZE);
 	let key2 = (0..3).map(|i| build(keypair(2), i)).collect::<Vec<_>>();
 
-	let db = Db::connect(&srv.config().postgres).await.expect("connect to captaind's postgres");
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.expect("connect to captaind's postgres");
+	super::register_test_owners(&db, &srv.mailbox_keypair(), super::test_server_mailbox_key(),
+		&[keypair(0), keypair(2)]).await;
 	for batch in key0.chunks(RECOVERY_VTXO_PAGE_SIZE).chain([&key2[..]]) {
-		db.write(async |t| t.upsert_vtxos(batch.iter().map(|v| ServerVtxo::from(v.clone()))).await)
+		db.write(async |t| t.upsert_vtxos(batch.iter().map(|v| ServerVtxo::from(v.clone())), Some((bitcoin::Network::Regtest, &srv.mailbox_keypair()))).await)
 			.await.expect("upsert vtxos");
 	}
 
@@ -228,3 +231,6 @@ async fn recover_vtxos_by_xpub_disabled() {
 	let err = client.recover_vtxos_by_xpub(req).await.expect_err("the rpc is disabled");
 	assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
 }
+
+
+include!("recovery_fallback.rs");

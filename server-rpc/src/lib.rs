@@ -116,12 +116,12 @@ use bitcoin::address::NetworkUnchecked;
 /// The minimum protocol version supported by the client.
 ///
 /// For info on protocol versions, see [server_rpc](crate) module documentation.
-pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_PPM_FEE_TOTAL;
+pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF;
 
 /// The maximum protocol version supported by the client.
 ///
 /// For info on protocol versions, see [server_rpc](crate) module documentation.
-pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES;
+pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF;
 
 /// The bark client version sent in HandshakeRequest. Exposed so
 /// alternate callers (e.g. integration tests) send the same string a

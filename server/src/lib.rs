@@ -33,6 +33,8 @@ mod intman;
 pub mod ln;
 pub mod nursery;
 mod offboards;
+mod expiry_readiness;
+pub mod owner_proof;
 pub mod recovery;
 mod round;
 pub mod telemetry;
@@ -45,6 +47,7 @@ use crate::database::htlc_vtxo::{self, HtlcDirection};
 use crate::database::tree::VtxoTreeUpdate;
 pub use crate::intman::{CAPTAIND_API_KEY, CAPTAIND_CLI_API_KEY};
 pub use crate::config::Config;
+pub use crate::error::OwnershipRefusal;
 pub use bark_common::{fs_perms, secret};
 
 use std::collections::HashSet;
@@ -257,7 +260,7 @@ impl Server {
 		fs::create_dir_all(&cfg.data_dir).context("can't create dir")?;
 		fs_perms::harden(&cfg.data_dir, 0o700)?;
 
-		let db = database::Db::create(&cfg.postgres).await?;
+		let db = database::Db::create(&cfg.postgres, cfg.network).await?;
 
 		// Initiate key material.
 		let seed = {
@@ -358,7 +361,7 @@ impl Server {
 		info!("Starting server at {}", cfg.data_dir.display());
 
 		info!("Connecting to db at {}:{}", cfg.postgres.host, cfg.postgres.port);
-		let db = database::Db::connect(&cfg.postgres)
+		let db = database::Db::connect(&cfg.postgres, cfg.network)
 			.await
 			.context("failed to connect to db")?;
 
@@ -420,6 +423,9 @@ impl Server {
 		// Captaind is the only process broadcasting via the nursery, so it
 		// also runs the follow-up.
 		listeners.push(Box::new(tx_nursery.clone()));
+		listeners.push(Box::new(database::expiry_chain::ExpiryChainListener::start(
+			db.clone(), BlockTable::Captaind,
+		).await?));
 
 		let sync_manager = Arc::new(SyncManager::start(
 			rtmgr.clone(),
@@ -511,6 +517,7 @@ impl Server {
 		srv.lightning_manager.spawn_hold_settler(srv.clone(), settlement_stream);
 
 		srv.clone().start_offboard_retry_task().await;
+		srv.clone().start_expiry_readiness();
 
 		let srv2 = srv.clone();
 		tokio::spawn(async move {
@@ -632,6 +639,7 @@ impl Server {
 		utxo: OutPoint,
 		funding_tx: Option<&Transaction>,
 		user_pub_nonce: PublicNonce,
+		owner_links: &crate::owner_proof::OwnerLinks,
 	) -> anyhow::Result<ark::board::BoardCosignResponse> {
 		check_max_amount("board", amount, self.config.max_board_amount)?;
 
@@ -746,6 +754,9 @@ impl Server {
 			user_pub_nonce,
 		);
 
+		self.db.write(async |t| owner_links.verify(t, [user_pubkey],
+			self.mailbox_key.leak_ref(), self.config.network).await).await?;
+
 		// Fees and the exit delta can change, so bind the output to one exit
 		// before signing, or two signed exits could spend it.
 		let spk = builder.funding_script_pubkey();
@@ -850,7 +861,7 @@ impl Server {
 					vtxo.chain_anchor(),
 				);
 			}
-			let inserted = t.execute_vtxo_tree_update(update).await?;
+			let inserted = t.execute_vtxo_tree_update(update, Some((self.config.network, self.mailbox_key.leak_ref()))).await?;
 			t.add_funding_vtxos_to_frontier(funding_txid, Some(confirmed_height)).await
 				.context("failed to add board vtxos to frontier")?;
 			Ok(inserted)
@@ -1030,7 +1041,7 @@ impl Server {
 			.provide_signatures(vtxos)
 			.mark_vtxos_registered(registered_ids);
 		self.db.write(async |t| {
-			t.execute_vtxo_tree_update(update).await?;
+			t.execute_vtxo_tree_update(update, None).await?;
 			htlc_vtxo::create_htlc_vtxos(&t, &htlc_sends, HtlcDirection::Incoming).await?;
 			Ok(())
 		}).await?;

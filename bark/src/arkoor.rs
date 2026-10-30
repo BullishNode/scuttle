@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::Context;
 use bitcoin::{Amount, NetworkKind};
 use bitcoin::hex::DisplayHex;
@@ -5,6 +7,7 @@ use bitcoin::secp256k1::Keypair;
 use log::{error, info, warn};
 
 use ark::{ProtocolEncoding, VtxoPolicy};
+use ark::fallback::OwnerLink;
 use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::vtxo::{Full, Vtxo, VtxoId};
@@ -32,6 +35,8 @@ pub enum ArkoorAddressError {
 	PolicyNotSupported(VtxoPolicy),
 	#[error("Unknown delivery mechanism: {0}")]
 	UnknownDeliveryMechanism(String),
+	#[error("Recipient must update their wallet and provide a signed mailbox address")]
+	RecipientMustUpdate,
 	#[error("Other error: {0}")]
 	Other(String),
 }
@@ -83,8 +88,8 @@ pub(crate) enum DeliveryOutcome {
 	AllFailed { summary: String },
 }
 
-/// Posts `vtxos` to every [`VtxoDelivery::ServerMailbox`] method found in
-/// `delivery`, in order, skipping any other delivery variant. Mailbox posts
+/// Posts `vtxos` through every typed server-mailbox delivery, in order,
+/// using the common blinded-id accessor. Mailbox posts
 /// are idempotent on the server.
 ///
 /// Any-success semantics: one accepted post is enough, since the recipient
@@ -101,7 +106,7 @@ pub(crate) async fn post_arkoor_to_mailboxes(
 	let mut any_succeeded = false;
 	let mut failures: Vec<String> = Vec::new();
 	for method in delivery {
-		let VtxoDelivery::ServerMailbox { blinded_id } = method else { continue };
+		let Some(blinded_id) = method.mailbox_id() else { continue };
 		let req = protos::mailbox_server::PostArkoorMessageRequest {
 			blinded_id: blinded_id.as_ref().to_vec(),
 			vtxos: serialized.clone(),
@@ -140,7 +145,7 @@ fn check_delivery(delivery: &[VtxoDelivery]) -> Result<(), ArkoorAddressError> {
 		return Ok(());
 	}
 
-	if delivery.iter().any(|d| matches!(d, VtxoDelivery::ServerMailbox { .. })) {
+	if delivery.iter().any(|d| d.mailbox_id().is_some()) {
 		return Ok(());
 	}
 
@@ -186,6 +191,9 @@ impl Wallet {
 		}
 
 		check_delivery(address.delivery())?;
+		address.owner_link(network, ark_info.mailbox_pubkey)
+			.map_err(|e| ArkoorAddressError::Other(e.to_string()))?
+			.filter(OwnerLink::is_joint).ok_or(ArkoorAddressError::RecipientMustUpdate)?;
 
 		Ok(())
 	}
@@ -203,8 +211,9 @@ impl Wallet {
 		inputs: impl IntoIterator<Item = WalletVtxo>,
 		change_keypair: Keypair,
 		change_pieces: Option<Vec<Amount>>,
+		destination_link: Option<OwnerLink>,
 	) -> anyhow::Result<ArkoorCreateResult> {
-		let (mut srv, _) = self.require_server().await?;
+		let (mut srv, info) = self.require_server().await?;
 		let input_ids = inputs.into_iter().map(|v| v.id()).collect::<Vec<_>>();
 
 		// Hydrate the inputs to their full form: the arkoor builder needs
@@ -252,11 +261,12 @@ impl Wallet {
 			.generate_user_nonces(&user_keypairs)
 			.context("invalid nb of keypairs")?;
 
-		let cosign_request = protos::ArkoorPackageCosignRequest::from(
-			builder.cosign_request(),
-		);
+		let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+		let supplied = destination_link.map(|link| (arkoor_dest.policy.user_pubkey(), link))
+			.into_iter().collect::<BTreeMap<_, _>>();
+		self.attach_owner_links(&mut cosign_request, &supplied, info.mailbox_pubkey).await?;
 
-		let response = srv.client.request_arkoor_cosign(cosign_request).await
+		let response = srv.client.request_arkoor_cosign(cosign_request).await.map_err(crate::FallbackRefusal::map_status)
 			.context("error requesting arkoor cosign")?
 			.into_inner();
 

@@ -1,19 +1,23 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bitcoin::Amount;
+use bitcoin::{Amount, Network, OutPoint, Transaction};
+use bitcoin::consensus::deserialize;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::Keypair;
 use futures::future::join_all;
 use log::{info, trace};
 
-use ark::{ProtocolEncoding, Vtxo, SECP};
+use ark::{ProtocolEncoding, Vtxo, VtxoPolicy, SECP};
 use ark::lightning::PaymentHash;
-use bitcoin_ext::{BlockDelta, BlockHeight};
-use bitcoin_ext::rpc::RpcApi;
+use ark::fallback::OwnerLink;
+use ark::mailbox::MailboxIdentifier;
+use bitcoin_ext::{BlockDelta, BlockHeight, TxOutExt};
+use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use ark::arkoor::ArkoorDestination;
 use ark::attestations::ArkoorCosignAttestation;
 use ark::vtxo::Full;
@@ -31,7 +35,7 @@ use server::vtxopool::VtxoTarget;
 use ark_testing::{Bark, Captaind, TestContext, btc, lightning_test, require_bark_version, sat};
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
 use ark_testing::context::LightningPaymentSetup;
-use ark_testing::daemon::captaind::{self, ArkClient};
+use ark_testing::daemon::captaind::{self, ArkClient, WalletAdminClient};
 use ark_testing::util::{poll_interval, wait_timeout, FutureExt, ToAltString};
 use ark_testing::exit::complete_exit;
 use bitcoin_ext::AmountExt;
@@ -70,7 +74,7 @@ async fn count_htlc_recv_vtxos(db: &Db) -> usize {
 
 async fn assert_vtxopool_consistency(srv: &Captaind) {
 	let pg_cfg = srv.config().postgres.clone();
-	let db = Db::connect(&pg_cfg).await.unwrap();
+	let db = Db::connect(&pg_cfg, bitcoin::Network::Regtest).await.unwrap();
 	assert_vtxopool_consistency_db(&db).await;
 }
 
@@ -146,15 +150,16 @@ async fn revoke_htlc_vtxos(
 	keypairs: &[Keypair],
 ) -> Result<(), tonic::Status> {
 	// Any pubkey works for the revocation output; the tests never claim it.
-	let revocation_pubkey =
-		Keypair::new(&SECP, &mut bip39::rand::thread_rng()).public_key();
+	let revocation_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let revocation_pubkey = revocation_key.public_key();
+	super::test_owner_link(srv, &revocation_key).await;
 	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		htlc_vtxos,
 		ark::VtxoPolicy::new_pubkey(revocation_pubkey),
 	).unwrap().generate_user_nonces(keypairs).unwrap();
 
 	let cosign_request =
-		protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+		super::signed_package(srv, &[], protos::ArkoorPackageCosignRequest::from(builder.cosign_request())).await;
 
 	let mut srv_rpc = srv.get_public_rpc().await;
 	srv_rpc.request_lightning_pay_htlc_revocation(cosign_request).await.map(|_| ())
@@ -303,12 +308,6 @@ async fn reject_revocation_on_successful_lightning_payment() {
 /// This locks the fix from commit 1c1613335. With the old code, a status that
 /// on its own permits revocation (here, `failed`) would let the server sign the
 /// revocation and refund a payment that actually went through: a double-pay.
-///
-/// Note this exercises the settler gate as a whole (the early `is_settled`
-/// bail fires first, since the settlement row is left intact): it pins that the
-/// settler, not the attempt status, decides. Isolating the in-write-tx recheck
-/// specifically would need a settlement committed between the two checks within
-/// a single request, which isn't reproducible without fault injection.
 #[tokio::test]
 async fn reject_revocation_when_settled_but_status_regressed() {
 	require_bark_version!(> "0.5.0");
@@ -339,7 +338,7 @@ async fn reject_revocation_when_settled_but_status_regressed() {
 	// Force the attempt status to diverge from the settlement: the preimage
 	// stays in htlc_settlement, but the status regresses to `failed`, which on
 	// its own would make the attempt eligible for revocation.
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	db.write(async |t| {
 		t.query(
 			"UPDATE lightning_payment_attempt SET status = 'failed', updated_at = NOW() WHERE payment_hash = $1",
@@ -361,6 +360,16 @@ async fn reject_revocation_when_settled_but_status_regressed() {
 		!status.message().to_lowercase().contains("preimage"),
 		"preimage must not appear in the error message",
 	);
+	assert!(client.is_invoice_paid(payment_hash).await.unwrap());
+	let source_ids = htlc_send_vtxo_ids(&client, payment_hash).await;
+	assert!(!source_ids.is_empty());
+	for id in source_ids {
+		let source = db.read(async |t| t.get_user_vtxo_by_id(id).await).await.unwrap();
+		assert_eq!(source.spend_state, server::database::SpendState::LnSpent,
+			"a refused revoke must not reopen an actually paid source");
+		let htlc = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, id).await).await.unwrap().unwrap();
+		assert_ne!(htlc.htlc.offchain_resolution, Some(server::database::htlc_vtxo::HtlcResolution::Revoked));
+	}
 }
 
 /// The invoice-expiry sweep used to cancel an `HtlcsReady` intra-ark receive
@@ -486,7 +495,8 @@ async fn intra_ark_invoice_expiry_after_grant_does_not_allow_revoke() {
 
 /// A granted intra-ark receive whose payee withholds the preimage is
 /// canceled as soon as its HTLC-recv vtxos expire, even though its invoice is
-/// still valid, and canceling it fails the payer's attempt.
+/// still valid. The payer is refunded only after every issued grant closes
+/// canonically and the SDK signs and registers the complete cooperative refund.
 #[tokio::test]
 async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 	require_bark_version!(> "0.5.0");
@@ -495,12 +505,30 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 
-	// The watchman tells the server the HTLC-recv vtxos expired unexited.
+	// Expire the operator pool before the payer's unchanged 432-block board.
+	// Otherwise native payer expiry can fence the cooperative refund itself.
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).watchmand().cfg(|cfg| {
 		cfg.invoice_check_interval = Duration::from_secs(1);
+		cfg.vtxopool.vtxo_lifetime = BlockDelta::new(128);
 	}).create().await;
 	ctx.fund_captaind(&srv, btc(10)).await;
 	srv.wait_for_vtxopool(&ctx).await;
+	// Separate operator-only capital: the existing 10,000-sat CPFP floor.
+	// The payer's 3 BTC funding and 2 BTC board below are unchanged.
+	let fee_address = srv.watchmand().wait_wallet_address().await;
+	let operator_script = srv.watchmand().config().sweep_address.clone().unwrap().assume_checked().script_pubkey();
+	let sponsor_amount = srv.watchmand().config().watchman.min_cpfp_amount;
+	assert_eq!(sponsor_amount, sat(10_000));
+	let sponsor_txid = ctx.bitcoind().fund_addr(fee_address.clone(), sponsor_amount).await;
+	let sponsor_tx = ctx.bitcoind().await_transaction(sponsor_txid).await;
+	let sponsor_outputs = sponsor_tx.output.iter().enumerate()
+		.filter(|(_, out)| out.script_pubkey == fee_address.script_pubkey()).collect::<Vec<_>>();
+	assert_eq!(sponsor_outputs.len(), 1);
+	assert_eq!(sponsor_outputs[0].1.value, sponsor_amount);
+	let sponsor = OutPoint::new(sponsor_txid, sponsor_outputs[0].0 as u32);
+	let funded = ctx.generate_blocks(6).await;
+	srv.wait_for_sync_height(funded).await;
+	srv.watchmand().wait_for_sync_height(funded).await;
 
 	/// Refuses `claim_lightning_receive`, so the payee holds its HTLC-recv
 	/// vtxos but the preimage never reaches the server.
@@ -524,17 +552,73 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 	let bark_payee = ctx.bark("bark-payee", &proxy.address).create().await;
 	bark_payer.board_and_confirm_and_register(&ctx, btc(2)).await;
 
+	let payer = Box::pin(bark_payer.client()).await;
+	let principal = payer.balance().await.unwrap().spendable;
+	assert_eq!(principal, btc(2));
 	let invoice_info = bark_payee.bolt11_invoice(btc(1)).await;
 	let invoice = Bolt11Invoice::from_str(&invoice_info.invoice).unwrap();
 	let payment_hash = PaymentHash::from(&invoice);
 
 	bark_payer.pay_lightning(invoice_info.invoice.clone(), None).await;
 
-	// The payee takes its HTLC-recv vtxos (-> HtlcsReady) and withholds the
-	// preimage.
+	// The payee stores its real grants and records the claim intent before
+	// the proxy withholds the preimage from the server.
 	let _ = bark_payee.try_lightning_receive_no_wait(&invoice_info.invoice).await;
 
-	let htlc_recv_expiry = srv.htlc_vtxos(payment_hash).await.iter()
+	let htlcs = srv.htlc_vtxos(payment_hash).await;
+	let mut payer_htlc_vtxo_ids = htlcs.iter()
+		.filter(|htlc| htlc.direction() == HtlcDirection::Incoming)
+		.map(|htlc| htlc.vtxo.vtxo_id.to_bytes().to_vec()).collect::<Vec<_>>();
+	assert!(!payer_htlc_vtxo_ids.is_empty());
+	payer_htlc_vtxo_ids.sort_unstable();
+	assert!(payer_htlc_vtxo_ids.windows(2).all(|pair| pair[0] != pair[1]));
+	let original_sources = htlcs.iter().filter(|h| h.direction() == HtlcDirection::Incoming)
+		.map(|h| h.vtxo.vtxo.clone()).collect::<Vec<_>>();
+	assert_eq!(original_sources.iter().map(|v| v.amount()).sum::<Amount>(), btc(1));
+	let grants = htlcs.iter().filter(|h| h.direction() == HtlcDirection::Outgoing)
+		.map(|h| h.vtxo.vtxo.clone()).collect::<Vec<_>>();
+	assert!(!grants.is_empty());
+	assert_eq!(grants.iter().map(|v| v.amount()).sum::<Amount>(), btc(1));
+	let grant_ids = grants.iter().map(|v| v.id().to_string()).collect::<Vec<_>>();
+	assert_eq!(grant_ids.iter().collect::<HashSet<_>>().len(), grants.len());
+	let payee = Box::pin(bark_payee.client()).await;
+	let receive = payee.lightning_receive_checkpoint(payment_hash).await.unwrap().unwrap();
+	assert_eq!(receive.payment_hash, payment_hash);
+	assert_eq!(receive.invoice, invoice);
+	// The SDK records disclosure intent before wire; our existing proxy never
+	// forwards it. Do not pretend this checkpoint is still HtlcsReady.
+	let bark::actions::lightning::receive::Progress::PreimageRevealed(received) = &receive.progress else {
+		panic!("withheld claim must retain its authentic granted checkpoint: {:?}", receive.progress);
+	};
+	assert_eq!(received.vtxo_ids.len(), grants.len());
+	assert_eq!(received.vtxo_ids.iter().copied().collect::<HashSet<_>>(), grants.iter().map(|v| v.id()).collect::<HashSet<_>>());
+	for grant in &grants {
+		assert_eq!(payee.get_full_vtxo(grant.id()).await.unwrap(), *grant);
+		let funding = ctx.bitcoind().await_transaction(grant.chain_anchor().txid).await;
+		grant.validate(&funding).expect("every actual handed grant must have a fully signed exit chain");
+		assert_eq!(grant.policy().as_server_htlc_recv().unwrap().payment_hash, payment_hash);
+		assert_eq!(payee.get_vtxo_key(grant).await.unwrap().public_key(), grant.user_pubkey());
+	}
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	assert_eq!(db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM htlc_settlement WHERE payment_hash=$1",
+		&[&payment_hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0,
+		"the proxy must actually have withheld the preimage from the settlement WAL");
+	let send = payer.lightning_send_checkpoint(payment_hash).await.unwrap().unwrap();
+	assert_eq!(send.payment_amount, btc(1));
+	assert_eq!(send.fee, Amount::ZERO);
+	let bark::actions::lightning::pay::Progress::PaymentInitiated(checkpoint) = &send.progress else {
+		panic!("payer must retain its original initiated HTLCs: {:?}", send.progress);
+	};
+	let mut checkpoint_ids = checkpoint.vtxo_ids.iter().map(|id| id.to_bytes().to_vec()).collect::<Vec<_>>();
+	checkpoint_ids.sort_unstable();
+	assert_eq!(checkpoint_ids, payer_htlc_vtxo_ids);
+	let mut original_change = Vec::new();
+	for coin in payer.spendable_vtxos().await.unwrap() {
+		assert!(!checkpoint.vtxo_ids.contains(&coin.id()));
+		original_change.push(payer.get_full_vtxo(coin.id()).await.unwrap());
+	}
+	assert_eq!(original_change.iter().map(|v| v.amount()).sum::<Amount>() + btc(1), principal);
+	let htlc_recv_expiry = htlcs.iter()
 		.filter(|h| h.direction() == HtlcDirection::Outgoing)
 		.map(|h| h.htlc_expiry())
 		.max()
@@ -558,13 +642,191 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 	assert_eq!(log.reason, "htlc-recv vtxos expired");
 	assert!(!invoice.is_expired());
 
+	// The own attempt is Failed; that status alone does not refund its live sources.
+	let pending = srv.get_public_rpc().await.check_lightning_payment(protos::CheckLightningPaymentRequest {
+		hash: payment_hash.to_vec(), wait: false, htlc_vtxo_ids: payer_htlc_vtxo_ids.clone(),
+	}).wait_millis(30_000).await.unwrap().into_inner();
+	let mut pending_ids = pending.htlc_vtxo_ids.clone();
+	pending_ids.sort_unstable();
+	assert_eq!(pending_ids, payer_htlc_vtxo_ids);
+	assert!(matches!(pending.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Failed(_))));
+	assert_eq!(payer.balance().await.unwrap().pending_lightning_send, btc(1));
+	for source in &original_sources {
+		assert!(srv.htlc_vtxos(payment_hash).await.iter().any(|h|
+			h.vtxo.vtxo_id == source.id() && h.htlc.offchain_resolution.is_none()
+			&& h.htlc.chain_resolution.is_none() && h.vtxo.oor_spent_txid.is_none()));
+	}
+
+	let core = ctx.bitcoind().sync_client();
+	let grant_expiry = grants.iter().map(|v| v.expiry_height()).max().unwrap();
+	let refund_height = send.htlc_expiry + BlockDelta::new(1);
+	assert!(refund_height.max(grant_expiry + BlockDelta::new(6)) < original_sources.iter().map(|v| v.expiry_height()).min().unwrap(),
+		"native grant closure and signed refund must precede payer-source expiry");
+	let height = core.get_block_count().unwrap() as u32;
+	ctx.generate_blocks(grant_expiry.to_u32().saturating_sub(height)).await;
+	// Observe native publication; never replay or fabricate a grant spend.
+	let fee_change = async {
+		loop {
+			let point = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
+			srv.wait_for_sync_height(point.height).await;
+			srv.watchmand().wait_for_sync_height(point.height).await;
+			let rebuilt = db.read(async |t| {
+				let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
+				Ok(view.captaind == point && view.watchmand == point && t.expiry_view_is_rebuilt(view).await?)
+			}).await.unwrap();
+			if !rebuilt { tokio::time::sleep(Duration::from_millis(50)).await; continue; }
+			let rows = db.read(async |t| Ok(t.query(
+				"SELECT DISTINCT e.vtxo_id,a.sweep_tx,a.sweep_txid,a.status='confirmed' AS confirmed \
+				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
+				JOIN expiry_allocation a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND c.active AND c.disposition='operator' AND a.broadcast_at IS NOT NULL",
+				&[&grant_ids],
+			).await?)).await.unwrap();
+			let mut covered = HashSet::new();
+			let mut fee_change = HashSet::new();
+			let mut deep = true;
+			for row in rows {
+				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
+				deep &= row.get::<_, bool>("confirmed");
+				let Some((child, child_fee)) = super::watchman::observed_payout_fee_child(&ctx, &parent) else { deep = false; continue; };
+				assert_eq!(parent.compute_txid().to_string(), row.get::<_, String>("sweep_txid"));
+				let granted_id = row.get::<_, String>("vtxo_id");
+				let granted = grants.iter().find(|grant| grant.id().to_string() == granted_id).unwrap();
+				assert!(parent.input.iter().any(|input| input.previous_output == granted.chain_anchor()),
+					"the actual parent must close this precise grant's backing root");
+				// This fixture has only operator pool coins in the expired tree.
+				assert!(parent.input.iter().all(|input| grants.iter().any(|v| v.chain_anchor() == input.previous_output)));
+				let mut value = Amount::ZERO;
+				for input in &parent.input {
+					let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
+					value += previous.output[input.previous_output.vout as usize].value;
+				}
+				assert_eq!(parent.output.iter().map(|out| out.value).sum::<Amount>(), value, "operator parent must take no payer fee");
+				assert!(parent.output.iter().filter(|out| out.value > Amount::ZERO).all(|out| out.script_pubkey == operator_script));
+				let anchors = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == *bitcoin_ext::fee::P2A_SCRIPT).collect::<Vec<_>>();
+				assert_eq!(anchors.len(), 1);
+				let anchor = OutPoint::new(parent.compute_txid(), anchors[0].0 as u32);
+				assert_eq!(anchors[0].1.value, Amount::ZERO);
+				assert_eq!(child.input.len(), 2);
+				assert_eq!(child.input.iter().map(|input| input.previous_output).collect::<HashSet<_>>(), HashSet::from([anchor, sponsor]));
+				let anchor_input = child.input.iter().find(|input| input.previous_output == anchor).unwrap();
+				assert!(anchor_input.witness.is_empty() && anchor_input.script_sig.is_empty());
+				assert!(!child.input.iter().find(|input| input.previous_output == sponsor).unwrap().witness.is_empty());
+				let fee = sponsor_amount.checked_sub(child.output.iter().map(|out| out.value).sum::<Amount>()).unwrap();
+				assert!(fee > Amount::ZERO);
+				for (vout, output) in child.output.iter().enumerate().filter(|(_, out)| out.value > Amount::ZERO) {
+					fee_change.insert(OutPoint::new(child.compute_txid(), vout as u32));
+					assert!(output.value < sponsor_amount);
+				}
+				assert_eq!(fee.to_sat(), u64::try_from(child_fee).unwrap());
+				let Some(parent_info) = core.custom_get_raw_transaction_info(parent.compute_txid(), None).unwrap() else { deep = false; continue; };
+				let Some(child_info) = core.custom_get_raw_transaction_info(child.compute_txid(), None).unwrap() else { deep = false; continue; };
+				assert_eq!(deserialize::<Transaction>(&parent_info.hex).unwrap(), parent);
+				assert_eq!(deserialize::<Transaction>(&child_info.hex).unwrap(), child);
+				covered.insert(granted_id);
+				if parent_info.confirmations.unwrap_or(0) < 6 || child_info.confirmations.unwrap_or(0) < 6 {
+					deep = false;
+					ctx.generate_blocks(6).await;
+				}
+			}
+			if covered.len() == grants.len() && deep { break fee_change; }
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+	}.wait_millis(30_000).await;
+
+	for grant in &grants {
+		assert!(core.get_tx_out(&grant.chain_anchor().txid, grant.chain_anchor().vout, Some(true)).unwrap().is_none(),
+			"no recipient grant backing root may remain live after canonical operator recovery");
+	}
+	let mut admin = WalletAdminClient::connect(format!("http://{}", srv.watchmand().config().admin_address.unwrap())).await.unwrap();
+	let watchman_coins = admin.wallet_status(protos::Empty {}).await.unwrap().into_inner().watchman.unwrap()
+		.confirmed_utxos.into_iter().map(|point| OutPoint::from_str(&point).unwrap()).collect::<HashSet<_>>();
+	assert!(!fee_change.is_empty());
+	assert!(fee_change.is_subset(&watchman_coins), "all unused operator fee capital must remain watchman-owned");
+	// The own attempt is Failed; the SDK must still complete the real signed refund.
+	let before_refund = srv.get_public_rpc().await.check_lightning_payment(protos::CheckLightningPaymentRequest {
+		hash: payment_hash.to_vec(), wait: false, htlc_vtxo_ids: payer_htlc_vtxo_ids.clone(),
+	}).wait_millis(30_000).await.unwrap().into_inner();
+	let mut before_refund_ids = before_refund.htlc_vtxo_ids.clone();
+	before_refund_ids.sort_unstable();
+	assert_eq!(before_refund_ids, payer_htlc_vtxo_ids);
+	assert!(matches!(before_refund.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Failed(_))));
+	let height = core.get_block_count().unwrap() as u32;
+	let tip = ctx.generate_blocks(refund_height.to_u32().saturating_sub(height)).await;
+	srv.wait_for_sync_height(tip).await;
+	srv.watchmand().wait_for_sync_height(tip).await;
+	payer.chain().invalidate_caches().await;
+	Box::pin(payer.check_lightning_payment(payment_hash, true)).wait_millis(30_000).await.unwrap();
+	assert!(payer.lightning_send_checkpoint(payment_hash).await.unwrap().is_none());
+	assert!(!payer.is_invoice_paid(payment_hash).await.unwrap());
+	let restored = payer.balance().await.unwrap();
+	assert_eq!(restored.total(), principal);
+	assert_eq!(restored.spendable, principal);
+	assert_eq!(restored.pending(), Amount::ZERO);
+	let history = payer.history().await.unwrap();
+	let movement = history.iter().find(|movement| movement.id == checkpoint.movement_id).unwrap();
+	assert_eq!(movement.status, bark::movement::MovementStatus::Failed);
+	assert_eq!(movement.effective_balance.to_sat(), 0);
+	assert_eq!(movement.offchain_fee, Amount::ZERO);
+	assert!(movement.exited_vtxos.is_empty());
+	assert_eq!(movement.input_vtxos.iter().copied().collect::<HashSet<_>>(), send.input_vtxo_ids.iter().copied().collect::<HashSet<_>>());
+	let mut refunded = Amount::ZERO;
+	let mut refund_ids = HashSet::new();
+	let mut refund_coins = Vec::new();
+	for id in &movement.output_vtxos {
+		assert!(refund_ids.insert(*id));
+		let coin = payer.get_full_vtxo(*id).await.unwrap();
+		assert_eq!(payer.get_vtxo_by_id(*id).await.unwrap().state, bark::vtxo::VtxoState::Spendable);
+		let funding = ctx.bitcoind().await_transaction(coin.chain_anchor().txid).await;
+		coin.validate(&funding).expect("payer must own the fully signed registered refund/change chain");
+		assert_eq!(payer.get_vtxo_key(&coin).await.unwrap().public_key(), coin.user_pubkey());
+		let registered = db.read(async |tx| tx.get_user_vtxo_by_id(*id).await).await.unwrap();
+		assert_eq!(registered.vtxo, coin);
+		assert_eq!(registered.spend_state, server::database::SpendState::Spendable);
+		refunded += coin.amount();
+		if let Some(change) = original_change.iter().find(|change| change.id() == coin.id()) {
+			assert_eq!(*change, coin, "preexisting payer change must remain unchanged");
+		} else {
+			refund_coins.push(coin);
+		}
+	}
+	assert_eq!(refunded, principal);
+	assert!(original_change.iter().all(|coin| refund_ids.contains(&coin.id())));
+	assert_eq!(refund_coins.iter().map(|coin| coin.amount()).sum::<Amount>(),
+		original_sources.iter().map(|source| source.amount()).sum::<Amount>(),
+		"the actual refund alone, excluding preexisting change, must return the complete original 1 BTC");
+	for source in &original_sources {
+		assert_eq!(payer.get_vtxo_by_id(source.id()).await.unwrap().state, bark::vtxo::VtxoState::Spent);
+		let raw = db.read(async |t| Ok(t.query_one(
+			"SELECT h.offchain_resolution::TEXT,v.spend_state::TEXT,t.signed_tx,v.oor_spent_txid \
+			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id \
+			JOIN virtual_transaction t ON t.txid=v.oor_spent_txid WHERE v.vtxo_id=$1",
+			&[&source.id().to_string()],
+		).await?)).await.unwrap();
+		assert_eq!(raw.get::<_, &str>(0), "revoked");
+		assert_eq!(raw.get::<_, &str>(1), "spent");
+		let signed = raw.get::<_, Vec<u8>>(2);
+		let tx = deserialize::<Transaction>(&signed).unwrap();
+		assert_eq!(tx.compute_txid().to_string(), raw.get::<_, String>(3));
+		let inputs = tx.input.iter().filter(|input| input.previous_output == source.point()).collect::<Vec<_>>();
+		assert_eq!(inputs.len(), 1);
+		assert!(!inputs[0].witness.is_empty());
+		assert!(refund_coins.iter().any(|coin| coin.transactions().any(|step|
+			bitcoin::consensus::serialize(&step.tx) == signed)),
+			"each original source's exact registered signed refund must belong to an actual restored refund chain");
+	}
+
 	let status = srv.get_public_rpc().await.check_lightning_payment(protos::CheckLightningPaymentRequest {
 		hash: payment_hash.to_vec(),
 		wait: true,
+		htlc_vtxo_ids: payer_htlc_vtxo_ids.clone(),
 	}).wait_millis(30_000).await.expect("check_lightning_payment failed").into_inner();
+	let mut echoed_ids = status.htlc_vtxo_ids.clone();
+	echoed_ids.sort_unstable();
+	assert_eq!(echoed_ids, payer_htlc_vtxo_ids, "terminal failure must identify the original payer's complete HTLC set");
 	assert!(
 		matches!(status.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Failed(_))),
-		"canceling should fail the payer's attempt, got {:?}", status.payment_status,
+		"the complete signed refund should fail the payer's attempt, got {:?}", status.payment_status,
 	);
 }
 
@@ -597,6 +859,8 @@ impl captaind::proxy::ArkRpcProxy for HoldClaim {
 /// invoice-expiry sweep used to leave behind, so only the receive side
 /// decides whether a revoke goes through.
 struct ParkedReceive {
+	_lightning: LightningPaymentSetup,
+	_proxy: captaind::proxy::ArkRpcProxyServer,
 	srv: Arc<Captaind>,
 	payer: Wallet,
 	payee: Arc<Bark>,
@@ -610,7 +874,8 @@ impl ParkedReceive {
 	async fn setup(ctx: &TestContext) -> ParkedReceive {
 		let lightning = ctx.new_lightning_setup("lightningd").await;
 
-		// The watchman tells the server the HTLC-recv vtxos expired unexited.
+		// An unexposed grant stays committed through its expiry in both
+		// daemon views. The existing timeout contract permits a later refund.
 		let srv = ctx.captaind("server").lightningd(&lightning.internal).watchmand().cfg(|cfg| {
 			cfg.invoice_check_interval = Duration::from_secs(1);
 		}).create().await;
@@ -650,7 +915,7 @@ impl ParkedReceive {
 			.max()
 			.expect("the payee was granted HTLC-recv vtxos");
 
-		let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+		let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 		db.write(async |t| {
 			t.query(
 				"UPDATE lightning_payment_attempt SET status = 'failed', updated_at = NOW() WHERE payment_hash = $1",
@@ -660,68 +925,93 @@ impl ParkedReceive {
 		}).await.unwrap();
 
 		let payer = bark_payer.client().await;
-		ParkedReceive { srv, payer, payee, payment_hash, htlc_recv_expiry, release, payee_task }
+		ParkedReceive { _lightning: lightning, _proxy: proxy, srv, payer, payee, payment_hash, htlc_recv_expiry, release, payee_task }
 	}
 
 	async fn revoke(&self) -> Result<(), tonic::Status> {
 		try_request_htlc_revocation(&self.srv, &self.payer, self.payment_hash).await
 	}
 
-	/// Try a revoke at every height until one is cosigned, which must happen
-	/// the block after the HTLC-recv vtxos expired.
-	async fn revoke_every_block_until_cosigned(&self, ctx: &TestContext) {
+	/// Refuse through expiry and release the unexposed grant only after
+	/// both completed daemon views have passed it.
+	async fn assert_revoke_after_expiry(&self, ctx: &TestContext) {
 		let mut tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 		loop {
 			self.srv.wait_for_sync_height(tip).await;
 			self.srv.watchmand().wait_for_sync_height(tip).await;
-			match self.revoke().await {
-				Ok(()) => {
-					assert_eq!(tip, self.htlc_recv_expiry + BlockDelta::new(1),
-						"the first revoke should be cosigned right after the HTLC-recv vtxos expired");
-					return;
-				},
-				Err(status) => {
-					assert!(tip <= self.htlc_recv_expiry,
-						"revoke refused after the HTLC-recv vtxos expired: {status:?}");
-					assert!(status.message().contains("already committed"),
-						"unexpected refusal: {status:?}");
-				},
-			}
+			if tip > self.htlc_recv_expiry { break; }
+			let status = self.revoke().await.expect_err("a live grant must retain the sender's refund");
+			assert!(status.message().contains("already committed"), "unexpected refusal: {status:?}");
 			ctx.generate_blocks_unsynced(1).await;
 			tip = tip + BlockDelta::new(1);
 		}
+		let db = Db::connect(&self.srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
+		let open = db.read(async |t| { Ok(t.query_one("SELECT COUNT(*) AS grants, \
+			BOOL_AND(v.confirmed_height IS NULL AND h.offchain_resolution IS NULL AND h.chain_resolution IS NULL \
+			AND NOT EXISTS(SELECT 1 FROM expiry_allocation a \
+			JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+			JOIN expiry_entitlement e ON e.id=c.entitlement_id \
+			WHERE e.vtxo_id=v.vtxo_id AND c.disposition='operator' AND a.status='confirmed')) AS open \
+			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id \
+			WHERE h.payment_hash=$1 AND h.direction='outgoing'", &[&self.payment_hash.to_string()]).await?) }).await.unwrap();
+		assert!(open.get::<_, i64>("grants") > 0);
+		assert!(open.get::<_, bool>("open"), "this case requires actual unexposed, unreclaimed grants");
+
+		// Keep the real refund in the payer's wallet rather than discarding a
+		// cosign response into a synthetic test output.
+		let checkpoint = self.payer.lightning_send_checkpoint(self.payment_hash).await.unwrap().unwrap();
+		let htlcs = match &checkpoint.progress {
+			bark::actions::lightning::pay::Progress::HtlcReceived(htlcs)
+				| bark::actions::lightning::pay::Progress::PaymentInitiated(htlcs)
+				| bark::actions::lightning::pay::Progress::RevocableHtlcs { htlcs, .. }
+				| bark::actions::lightning::pay::Progress::RevocationStuck { htlcs, .. } => htlcs,
+			other => panic!("payer must retain its real HTLC checkpoint: {other:?}"),
+		};
+		Box::pin(self.payer.check_lightning_payment(self.payment_hash, true)).wait_millis(30_000).await.unwrap();
+		assert!(self.payer.lightning_send_checkpoint(self.payment_hash).await.unwrap().is_none());
+		assert!(!self.payer.is_invoice_paid(self.payment_hash).await.unwrap());
+		let balance = self.payer.balance().await.unwrap();
+		assert_eq!(balance.total(), btc(2));
+		assert_eq!(balance.spendable, btc(2));
+		assert_eq!(balance.pending(), Amount::ZERO);
+		let history = self.payer.history().await.unwrap();
+		let movement = history.iter().find(|movement| movement.id == htlcs.movement_id).unwrap();
+		assert_eq!(movement.status, bark::movement::MovementStatus::Failed);
+		assert_eq!(movement.effective_balance, bitcoin::SignedAmount::ZERO);
+		assert_eq!(movement.offchain_fee, Amount::ZERO);
+		assert!(movement.exited_vtxos.is_empty());
+		self.revoke().await.expect_err("a completed refund must not be signed a second time");
+		assert_eq!(self.payer.balance().await.unwrap().spendable, btc(2));
 	}
 
 	/// Release the parked claim, which must be refused, leaving the payee
-	/// unpaid.
+	/// unpaid after the payer has recovered the original principal.
 	async fn assert_claim_refused(self) {
 		self.release.notify_one();
 		self.payee_task.wait_millis(120_000).await
 			.expect("payee claim task panicked")
-			.expect_err("claim should be refused after the revoke");
+			.expect_err("claim should be refused after grant expiry");
 		assert_eq!(self.payee.spendable_balance().await, Amount::ZERO);
 	}
 }
 
 /// The payer of an intra-ark payment tries to revoke at every block height
 /// while the payee holds granted HTLC-recv vtxos and withholds the preimage.
-/// Every revoke must be refused while the payee can still claim them, and the
-/// first one the server cosigns must come right after they expired. The
-/// parked claim is then refused.
+/// Refuse through HTLC expiry, then let the payer recover its principal once
+/// both views pass expiry. The parked recipient claim must still be refused.
 #[tokio::test]
 async fn intra_ark_revoke_refused_until_htlc_recvs_expire() {
 	require_bark_version!(> "0.5.0");
 
 	let ctx = TestContext::new("server/intra_ark_revoke_refused_until_htlc_recvs_expire").await;
 	let parked = ParkedReceive::setup(&ctx).await;
-	parked.revoke_every_block_until_cosigned(&ctx).await;
+	parked.assert_revoke_after_expiry(&ctx).await;
 	parked.assert_claim_refused().await;
 }
 
 /// Like [intra_ark_revoke_refused_until_htlc_recvs_expire], but with the
-/// receive already canceled. Canceling only refuses the cooperative claim:
-/// the payee can still claim live HTLC-recv vtxos on-chain, so the canceled
-/// receive must stay committed until they expired.
+/// receive already canceled. Canceling refuses the cooperative claim, but the
+/// live grant must still retain the sender's refund through expiry.
 #[tokio::test]
 async fn intra_ark_revoke_refused_on_canceled_receive_until_htlc_recvs_expire() {
 	require_bark_version!(> "0.5.0");
@@ -729,7 +1019,7 @@ async fn intra_ark_revoke_refused_on_canceled_receive_until_htlc_recvs_expire() 
 	let ctx = TestContext::new("server/intra_ark_revoke_refused_on_canceled_receive_until_htlc_recvs_expire").await;
 	let parked = ParkedReceive::setup(&ctx).await;
 
-	let db = Db::connect(&parked.srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&parked.srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	db.write(async |t| {
 		t.query(
 			"UPDATE lightning_htlc_subscription SET status = 'canceled', updated_at = NOW() WHERE payment_hash = $1",
@@ -738,14 +1028,15 @@ async fn intra_ark_revoke_refused_on_canceled_receive_until_htlc_recvs_expire() 
 		Ok(())
 	}).await.unwrap();
 
-	parked.revoke_every_block_until_cosigned(&ctx).await;
+	parked.assert_revoke_after_expiry(&ctx).await;
 	parked.assert_claim_refused().await;
 }
 
 /// Exits, resolutions and on-chain preimages are only recorded by the
 /// watchman. While it is behind, the server cannot tell whether the payee
 /// exited an HTLC-recv vtxo, so the revoke must be refused past their expiry
-/// until the watchman caught up.
+/// until the watchman catches up. An unexposed grant can release the refund
+/// once both completed views are strictly beyond expiry.
 #[tokio::test]
 async fn intra_ark_revoke_refused_while_watchman_is_behind() {
 	require_bark_version!(> "0.5.0");
@@ -764,7 +1055,7 @@ async fn intra_ark_revoke_refused_while_watchman_is_behind() {
 
 	parked.srv.watchmand().start().await.unwrap();
 	parked.srv.watchmand().wait_for_sync_height(tip).await;
-	parked.revoke().await.expect("revoke should be cosigned once the watchman caught up");
+	parked.assert_revoke_after_expiry(&ctx).await;
 	parked.assert_claim_refused().await;
 }
 
@@ -789,6 +1080,7 @@ impl RawHtlcSend {
 		let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 		let vtxos = cosign_htlc_send_to_pubkey(
 			ctx, srv, client, input_ids, keypair.public_key(), payment_hash,
+			super::test_owner_link(srv, &keypair).await,
 		).await;
 
 		let mut srv_rpc = srv.get_public_rpc().await;
@@ -842,7 +1134,7 @@ impl ForeignReceive {
 
 		let invoice = victim.bolt11_invoice(btc(1)).await.invoice;
 		let payment_hash = PaymentHash::from(&Bolt11Invoice::from_str(&invoice).unwrap());
-		let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+		let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 
 		ForeignReceive {
 			srv, _srv_ln: lightning.external, payer: Arc::new(lightning.internal), victim, attacker, attacker_vtxos,
@@ -918,7 +1210,7 @@ async fn revoke_judged_on_own_attempt_not_newer_same_hash_attempt() {
 
 	let payment_hash = ark::lightning::Preimage::random().compute_payment_hash();
 	let amount = sat(10_000);
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 
 	// The honest payment goes to a node nobody can route to, so it fails.
 	let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -979,7 +1271,9 @@ async fn request_second_htlc_cosign(
 	);
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let htlc_expiry = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
-	let htlc_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng()).public_key();
+	let htlc_pair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let htlc_key = htlc_pair.public_key();
+	super::test_owner_link(&srv, &htlc_pair).await;
 	let outputs = vec![ArkoorDestination {
 		total_amount: htlc_vtxos.iter().map(|v| v.amount()).sum(),
 		policy: ark::VtxoPolicy::new_server_htlc_send(htlc_key, second_hash, htlc_expiry),
@@ -991,7 +1285,7 @@ async fn request_second_htlc_cosign(
 
 	let mut srv_rpc = srv.get_public_rpc().await;
 	srv_rpc.request_lightning_pay_htlc_cosign(protos::LightningPayHtlcCosignRequest {
-		parts: protos::ArkoorPackageCosignRequest::from(builder.cosign_request()).parts,
+		parts: super::signed_package(&srv, &[&client], protos::ArkoorPackageCosignRequest::from(builder.cosign_request())).await.parts,
 	}).await.expect_err("server should refuse an HTLC vtxo as a lightning-send cosign input")
 }
 
@@ -1026,7 +1320,7 @@ async fn refuse_generic_spends_of_htlc_send_vtxo_while_payment_in_flight() {
 	let htlc_vtxo_ids = htlc_send_vtxo_ids(&client, payment_hash).await;
 
 	// The premise: the server is on the hook for this payment.
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	let open_attempts = db.read(async |t| Ok(t.query("
 		SELECT id FROM lightning_payment_attempt
 		WHERE payment_hash = $1 AND status NOT IN ('failed', 'succeeded')
@@ -1085,6 +1379,7 @@ async fn cosign_htlc_send_to_pubkey(
 	input_ids: &[ark::VtxoId],
 	owner: bitcoin::secp256k1::PublicKey,
 	payment_hash: ark::lightning::PaymentHash,
+	owner_link: ark::fallback::OwnerLink,
 ) -> Vec<Vtxo<Full>> {
 	let mut inputs = Vec::with_capacity(input_ids.len());
 	let mut keypairs = Vec::with_capacity(input_ids.len());
@@ -1102,10 +1397,15 @@ async fn cosign_htlc_send_to_pubkey(
 		inputs.clone(), policy,
 	).unwrap().generate_user_nonces(&keypairs).unwrap();
 
+	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		assert_eq!(VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey(), owner);
+		output.owner_proof = Some(owner_link.into());
+	}
 	let mut srv_rpc = srv.get_public_rpc().await;
 	let response = srv_rpc.request_lightning_pay_htlc_cosign(protos::LightningPayHtlcCosignRequest {
-		parts: protos::ArkoorPackageCosignRequest::from(builder.cosign_request()).parts,
-	}).await.expect("server cosigns the HTLC; nothing binds its owner key to the inputs")
+		parts: package.parts,
+	}).await.expect("a valid recipient link allows a gift without making its recipient the input owner")
 		.into_inner();
 
 	let cosign_responses =
@@ -1138,10 +1438,11 @@ async fn unfunded_htlc_revocation_keeps_receive() {
 	let refund_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let htlcs = cosign_htlc_send_to_pubkey(
 		&ctx, &srv, &attacker_client, &input_ids, refund_key.public_key(), payment_hash,
+		super::test_owner_link(&srv, &refund_key).await,
 	).await;
 	attacker_client.register_vtxo_transactions_with_server(&htlcs).await.unwrap();
 
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let before = db.read(async |t| t.get_htlc_subscription_by_payment_hash(payment_hash).await)
 		.await.unwrap().unwrap();
 
@@ -1152,7 +1453,8 @@ async fn unfunded_htlc_revocation_keeps_receive() {
 	).unwrap().generate_user_nonces(&keys).unwrap();
 	let mut rpc = srv.get_public_rpc().await;
 	rpc.request_lightning_pay_htlc_revocation(
-		protos::ArkoorPackageCosignRequest::from(builder.cosign_request()),
+		super::signed_package(&srv, &[&attacker_client],
+			protos::ArkoorPackageCosignRequest::from(builder.cosign_request())).await,
 	).await.expect("the attacker may refund their own uninitiated HTLCs");
 
 	let after = db.read(async |t| t.get_htlc_subscription_by_payment_hash(payment_hash).await)
@@ -1187,10 +1489,9 @@ async fn refuse_htlc_send_vtxo_posted_to_arkoor_mailbox() {
 	let victim = ctx.bark("victim", &srv).create().await;
 	let victim_addr = ark::Address::from_str(&victim.address().await).unwrap();
 	let victim_pubkey = victim_addr.policy().user_pubkey();
-	let blinded_id = victim_addr.delivery().iter().find_map(|d| match d {
-		ark::address::VtxoDelivery::ServerMailbox { blinded_id } => Some(blinded_id.clone()),
-		_ => None,
-	}).expect("victim address carries a server mailbox delivery");
+	let blinded_id = victim_addr.delivery().iter().find_map(|delivery| delivery.mailbox_id())
+		.expect("victim address carries a server mailbox delivery");
+	let victim_link = victim_addr.owner_link(bitcoin::Network::Regtest, srv.ark_info().await.mailbox_pubkey).unwrap().unwrap();
 
 	// The attacker funds a real HTLC out of their own boarded vtxos.
 	let attacker = ctx.bark("attacker", &srv).funded(btc(3)).create().await;
@@ -1201,7 +1502,7 @@ async fn refuse_htlc_send_vtxo_posted_to_arkoor_mailbox() {
 		sha256::Hash::hash(b"attacker invoice").to_byte_array(),
 	);
 	let htlc_vtxos = cosign_htlc_send_to_pubkey(
-		&ctx, &srv, &attacker_client, &input_ids, victim_pubkey, payment_hash,
+		&ctx, &srv, &attacker_client, &input_ids, victim_pubkey, payment_hash, victim_link,
 	).await;
 	assert!(!htlc_vtxos.is_empty());
 	assert!(htlc_vtxos.iter().all(|v| v.policy().policy_type() == VtxoPolicyKind::ServerHtlcSend),
@@ -1255,9 +1556,10 @@ async fn refuse_generic_spends_of_htlc_send_vtxo_with_no_payment_in_flight() {
 		async fn check_lightning_payment(
 			&self,
 			_upstream: &mut ArkClient,
-			_req: protos::CheckLightningPaymentRequest,
+			req: protos::CheckLightningPaymentRequest,
 		) -> Result<protos::LightningPaymentStatus, tonic::Status> {
 			Ok(protos::LightningPaymentStatus {
+				htlc_vtxo_ids: req.htlc_vtxo_ids,
 				payment_status: Some(
 					protos::lightning_payment_status::PaymentStatus::Pending(protos::Empty {}),
 				),
@@ -1282,7 +1584,7 @@ async fn refuse_generic_spends_of_htlc_send_vtxo_with_no_payment_in_flight() {
 	let htlc_vtxo_ids = htlc_send_vtxo_ids(&client, payment_hash).await;
 
 	// The premise: the HTLC vtxos exist and the server never started paying.
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	let attempts = db.read(async |t| Ok(t.query("
 		SELECT id FROM lightning_payment_attempt WHERE payment_hash = $1
 	", &[&payment_hash.to_string()]).await?)).await.unwrap();
@@ -1340,9 +1642,10 @@ async fn refuse_revocation_of_banned_htlc_send_vtxo() {
 		async fn check_lightning_payment(
 			&self,
 			_upstream: &mut ArkClient,
-			_req: protos::CheckLightningPaymentRequest,
+			req: protos::CheckLightningPaymentRequest,
 		) -> Result<protos::LightningPaymentStatus, tonic::Status> {
 			Ok(protos::LightningPaymentStatus {
+				htlc_vtxo_ids: req.htlc_vtxo_ids,
 				payment_status: Some(
 					protos::lightning_payment_status::PaymentStatus::Pending(protos::Empty {}),
 				),
@@ -1396,7 +1699,7 @@ async fn revoked_htlc_send_vtxo_can_be_offboarded() {
 	bark_1.pay_lightning_wait(invoice, None).await;
 
 	// The xpay call failed along with the attempt.
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	assert_eq!(cln_xpay_status(&db, payment_hash).await.as_deref(), Some("fail"));
 
 	// The revocation gave the funds back as a plain pubkey vtxo.
@@ -1492,7 +1795,7 @@ async fn server_should_release_hold_invoice_when_subscription_is_canceled() {
 	assert!(err.contains("incorrect_or_unknown_payment_details"), "err: {err}");
 
 	// The hold invoice was canceled along with the subscription.
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	let payment_hash: ark::lightning::PaymentHash =
 		Bolt11Invoice::from_str(&invoice_info.invoice).unwrap().into();
 	wait_for_cln_hold_status(&db, payment_hash, "cancelled").await;
@@ -1573,6 +1876,7 @@ async fn check_lightning_receive_returns_on_canceled_subscription() {
 	let payment_hash = ark::lightning::Preimage::random().compute_payment_hash();
 	let mut rpc = srv.get_public_rpc().await;
 	rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
+		claim_destination: None,
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: btc(1).to_sat(),
 		min_cltv_delta: 6,
@@ -1581,7 +1885,7 @@ async fn check_lightning_receive_returns_on_canceled_subscription() {
 		expiry_secs: None,
 	}).await.unwrap();
 
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	wait_for_subscription_status(&db, payment_hash, "canceled").await;
 
 	let resp = rpc.check_lightning_receive(protos::CheckLightningReceiveRequest {
@@ -1589,6 +1893,93 @@ async fn check_lightning_receive_returns_on_canceled_subscription() {
 		wait: true,
 	}).ready().await.unwrap().into_inner();
 	assert_eq!(resp.status, protos::LightningReceiveStatus::Canceled as i32);
+}
+
+#[derive(Clone)]
+struct CheckClaim {
+	wallet: Wallet,
+	db: Db,
+	server: Keypair,
+	other_mailbox: Keypair,
+	hold: hold::hold_client::HoldClient<tonic::transport::Channel>,
+	native_payment: bool,
+	checked: Arc<AtomicBool>,
+}
+#[async_trait::async_trait]
+impl captaind::proxy::ArkRpcProxy for CheckClaim {
+	async fn claim_lightning_receive(&self, upstream: &mut ArkClient, req: protos::ClaimLightningReceiveRequest)
+		-> Result<protos::ArkoorPackageCosignResponse, tonic::Status> {
+		if self.checked.load(Ordering::SeqCst) {
+			return Ok(upstream.claim_lightning_receive(req).await?.into_inner());
+		}
+		let output = req.cosign_request.as_ref().unwrap().parts.last().unwrap().outputs.last().unwrap();
+		let key = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
+		let (_, pair) = self.wallet.pubkey_keypair(&key).await.unwrap().unwrap();
+		let hash = PaymentHash::try_from(req.payment_hash.as_slice()).unwrap();
+		let native_request = hold::ListRequest { constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())) };
+		let mut hold = self.hold.clone();
+		let before = super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await;
+		let native_before = hold.list(native_request.clone()).await.unwrap().into_inner().invoices;
+		if self.native_payment {
+			assert_eq!(native_before.len(), 1);
+			assert_eq!(native_before[0].state(), hold::InvoiceState::Accepted);
+		}
+		let mut invalid = req.clone();
+		invalid.cosign_request.as_mut().unwrap().parts.last_mut().unwrap().outputs.last_mut().unwrap()
+			.owner_proof.as_mut().unwrap().signature = vec![0; 64];
+		super::expiry_admission::assert_owner_refusal(upstream.claim_lightning_receive(invalid).await.unwrap_err(),
+			key, bark::FallbackRefusal::InvalidOwnerProof);
+		assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await, before);
+		assert_eq!(hold.list(native_request.clone()).await.unwrap().into_inner().invoices, native_before,
+			"a refused claim must leave the native payer's HTLC uncollected");
+		let link: OwnerLink = output.owner_proof.clone().unwrap().try_into().unwrap();
+		self.db.write(async |tx| tx.verify_owner_link(&self.server, key, &link, Network::Regtest).await).await.unwrap();
+		let before = super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await;
+		let mut conflict = req.clone();
+		conflict.cosign_request.as_mut().unwrap().parts.last_mut().unwrap().outputs.last_mut().unwrap().owner_proof =
+			Some(OwnerLink::new_joint(Network::Regtest, self.server.public_key(), &self.other_mailbox, &pair).unwrap().into());
+		super::expiry_admission::assert_owner_refusal(upstream.claim_lightning_receive(conflict.clone()).await.unwrap_err(),
+			key, bark::FallbackRefusal::ConflictingOwnerBinding);
+		assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await, before);
+		assert_eq!(hold.list(native_request.clone()).await.unwrap().into_inner().invoices, native_before);
+		let _accepted_response = upstream.claim_lightning_receive(req.clone()).await?.into_inner();
+		wait_for_subscription_status(&self.db, hash, "settled").await;
+		let settled_before = super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await;
+		let settled_native = hold.list(native_request.clone()).await.unwrap().into_inner().invoices;
+		super::expiry_admission::assert_owner_refusal(upstream.claim_lightning_receive(conflict).await.unwrap_err(),
+			key, bark::FallbackRefusal::ConflictingOwnerBinding);
+		assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await, settled_before);
+		assert_eq!(hold.list(native_request).await.unwrap().into_inner().invoices, settled_native,
+			"a settled retry cannot collect a second payment or change the first binding");
+		let mut replay = req;
+		let mailbox = MailboxIdentifier::from_blinded(link.blinded_id, key, &self.server).unwrap();
+		let keys = replay.cosign_request.as_ref().unwrap().parts.iter().flat_map(|part|
+			part.outputs.iter().chain(&part.isolated_outputs)).map(|output|
+			VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey()).collect::<Vec<_>>();
+		let mut proofs = std::collections::BTreeMap::new();
+		for actual in keys {
+			let (_, pair) = self.wallet.pubkey_keypair(&actual).await.unwrap().unwrap();
+			assert_eq!(mailbox, self.wallet.mailbox_identifier());
+			proofs.insert(actual, OwnerLink::new_joint(Network::Regtest, self.server.public_key(), &self.wallet.mailbox_keypair(), &pair).unwrap());
+		}
+		for part in &mut replay.cosign_request.as_mut().unwrap().parts {
+			for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) {
+				let actual = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
+				output.owner_proof = Some(proofs[&actual].into());
+			}
+		}
+		let response = upstream.claim_lightning_receive(replay).await.unwrap().into_inner();
+		let mut replayed = super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await;
+		let mut expected = settled_before;
+		for rows in [&mut replayed, &mut expected] {
+			rows[2] = serde_json::to_string(&super::expiry_admission::vtxo_replay_rows(serde_json::from_str(&rows[2]).unwrap())).unwrap();
+		}
+		assert_eq!(replayed, expected, "valid replay may touch only the VTXO update timestamp; bindings and settlement stay exact");
+		// Only this replay response reaches the real wallet, which verifies its
+		// partial signatures and consumes the original user nonce exactly once.
+		self.checked.store(true, Ordering::SeqCst);
+		Ok(response)
+	}
 }
 
 async fn server_claim_lightning_receive_is_idempotent(
@@ -1605,12 +1996,25 @@ async fn server_claim_lightning_receive_is_idempotent(
 	let bark = Arc::new(ctx.bark("bark-1", srv).funded(btc(3)).create().await);
 	bark.board_and_confirm_and_register(&ctx, btc(2)).await;
 
+	let postgres = srv.config().postgres.clone();
+	let db = Db::connect(&postgres, bitcoin::Network::Regtest).await.unwrap();
+	let other = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	super::expiry_admission::unmapped_owner_link(srv, &other, &other).await;
+	let checked = Arc::new(AtomicBool::new(false));
+	let proxy = srv.start_proxy_no_mailbox(CheckClaim {
+		wallet: bark.client().await, db, server: srv.mailbox_keypair(),
+		other_mailbox: other,
+		hold: _lightning.internal.hold_client().await, native_payment: false, checked: checked.clone(),
+	}).await;
+	bark.set_ark_url(&proxy.address).await;
 	let invoice_info = bark.bolt11_invoice(btc(1)).await;
 
 	tokio::join!(
 		pay(invoice_info.invoice.clone()),
 		bark.lightning_receive(&invoice_info.invoice).wait_millis(10_000),
 	);
+
+	assert!(checked.load(Ordering::SeqCst), "the ready claim must reach the actual RPC probe");
 
 	// Wait for the onboarding round to be deeply enough confirmed
 	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
@@ -1637,6 +2041,7 @@ async fn server_claim_lightning_receive_is_idempotent(
 }
 lightning_test!(server_claim_lightning_receive_is_idempotent);
 
+
 async fn server_returned_htlc_recv_vtxos_identical(
 	ctx: &TestContext,
 	_lightning: &LightningPaymentSetup,
@@ -1654,11 +2059,25 @@ async fn server_returned_htlc_recv_vtxos_identical(
 	let invoice_info = bark.bolt11_invoice(btc(1)).await;
 	let receive = bark.lightning_receive_status(&invoice_info.invoice).await.unwrap();
 
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
+	srv.integration_cmd(&["add", "receive-admission"]).await;
+	let stdout = srv.integration_cmd(&["generate-api-key", "receive-admission", "receiver", "1h"]).await;
+	let api_key = stdout.split_whitespace().last().unwrap().to_string();
+	srv.integration_cmd(&["configure-token-type", "receive-admission", "single-use-board", "1", "3600"]).await;
+	let stdout = srv.integration_cmd(&["generate-token", "receive-admission", "single-use-board", "--integration-api-key", &api_key]).await;
+	let token = stdout.split_whitespace().nth(1).unwrap().to_string();
+	let token_state = async || db.read(async |tx| Ok(tx.query_one("SELECT status::TEXT,updated_at::TEXT,updated_by_api_key_id \
+		FROM integration_token WHERE token=$1", &[&token]).await?)).await.unwrap();
+	let token_before = token_state().await;
+	let token_before = (token_before.get::<_, String>(0), token_before.get::<_, String>(1), token_before.get::<_, i64>(2));
+	assert_eq!(token_before.0, "unused");
+
 	let mut client = srv.get_public_rpc().await;
 
 	// pay runs concurrently with the gRPC assertions. In intra mode
 	// pay_lightning_wait blocks forever (no one claims), so we use select!
 	// to drop pay once the assertions complete.
+	let mut assertions_completed = false;
 	tokio::select! {
 		_ = pay(invoice_info.invoice) => {},
 		_ = async {
@@ -1669,15 +2088,40 @@ async fn server_returned_htlc_recv_vtxos_identical(
 			}).wait_millis(10_000).await.unwrap().into_inner();
 
 			let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+			let link = super::expiry_admission::unmapped_owner_link(srv, &keypair, &keypair).await;
 			let req_1 = protos::PrepareLightningReceiveClaimRequest {
-				payment_hash: receive.payment_hash.to_vec(),
-				user_pubkey: keypair.public_key().serialize().to_vec(),
-				htlc_recv_expiry: 172,
-				lightning_receive_anti_dos: None,
+				owner_proof: Some(link.into()), payment_hash: receive.payment_hash.to_vec(),
+				user_pubkey: keypair.public_key().serialize().to_vec(), htlc_recv_expiry: 172,
+				lightning_receive_anti_dos: Some(protos::prepare_lightning_receive_claim_request::LightningReceiveAntiDos::Token(token.clone())),
 			};
+			let pool_ids = db.read(async |tx| Ok(tx.query("SELECT vtxo.vtxo_id FROM vtxo \
+				JOIN vtxo_pool ON vtxo_pool.vtxo_id=vtxo.vtxo_id WHERE vtxo_pool.spent_at IS NULL ORDER BY vtxo.vtxo_id", &[]).await?
+				.into_iter().map(|row| row.get::<_, String>(0).parse::<ark::VtxoId>().unwrap()).collect::<Vec<_>>())).await.unwrap();
+			let pool_before = super::expiry_admission::source_rows(&db, &pool_ids).await;
+			let before = super::expiry_admission::receive_admission_rows(&db, receive.payment_hash, &[keypair.public_key()]).await;
+			assert!(super::expiry_admission::owner_rows(&db, &[keypair.public_key()]).await.is_empty());
+			let mut invalid = req_1.clone(); invalid.owner_proof.as_mut().unwrap().signature = vec![0; 64];
+			super::expiry_admission::assert_owner_refusal(client.prepare_lightning_receive_claim(invalid).await.unwrap_err(),
+				keypair.public_key(), bark::FallbackRefusal::InvalidOwnerProof);
+			assert_eq!(super::expiry_admission::receive_admission_rows(&db, receive.payment_hash, &[keypair.public_key()]).await, before);
+			assert_eq!(super::expiry_admission::source_rows(&db, &pool_ids).await, pool_before);
+			let state = token_state().await;
+			assert_eq!((state.get::<_, String>(0), state.get::<_, String>(1), state.get::<_, i64>(2)), token_before);
+			db.write(async |tx| tx.verify_owner_link(&srv.mailbox_keypair(), keypair.public_key(), &link, Network::Regtest).await).await.unwrap();
+			let other = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+			let conflicting = super::expiry_admission::unmapped_owner_link(srv, &keypair, &other).await;
+			let before = super::expiry_admission::receive_admission_rows(&db, receive.payment_hash, &[keypair.public_key()]).await;
+			let mut conflict = req_1.clone(); conflict.owner_proof = Some(conflicting.into());
+			super::expiry_admission::assert_owner_refusal(client.prepare_lightning_receive_claim(conflict).await.unwrap_err(),
+				keypair.public_key(), bark::FallbackRefusal::ConflictingOwnerBinding);
+			assert_eq!(super::expiry_admission::receive_admission_rows(&db, receive.payment_hash, &[keypair.public_key()]).await, before);
+			assert_eq!(super::expiry_admission::source_rows(&db, &pool_ids).await, pool_before);
+			let state = token_state().await;
+			assert_eq!((state.get::<_, String>(0), state.get::<_, String>(1), state.get::<_, i64>(2)), token_before);
 			let vtxos_1 = client.prepare_lightning_receive_claim(req_1.clone()).await.unwrap()
 				.into_inner().htlc_vtxos.into_iter().map(|b| Vtxo::deserialize(&b))
 				.collect::<Result<Vec<Vtxo<Full>>, _>>().unwrap();
+			assert_eq!(token_state().await.get::<_, String>(0), "used", "only the valid preparation consumes the token");
 			assert!(vtxos_1.iter().all(|v| v.has_all_witnesses()), "first call vtxos should be fully signed");
 
 			// We test once again with the same request
@@ -1689,6 +2133,7 @@ async fn server_returned_htlc_recv_vtxos_identical(
 			// we change keypair to make sure server don't use it on second request
 			let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 			let req_2 = protos::PrepareLightningReceiveClaimRequest {
+				owner_proof: Some(super::expiry_admission::unmapped_owner_link(srv, &keypair, &keypair).await.into()),
 				payment_hash: receive.payment_hash.to_vec(),
 				user_pubkey: keypair.public_key().serialize().to_vec(),
 				htlc_recv_expiry: 172,
@@ -1700,10 +2145,16 @@ async fn server_returned_htlc_recv_vtxos_identical(
 				.collect::<Result<Vec<Vtxo<Full>>, _>>().unwrap();
 			assert!(vtxos_3.iter().all(|v| v.has_all_witnesses()), "third call vtxos should be fully signed");
 
+			assert!(super::expiry_admission::owner_rows(&db, &[keypair.public_key()]).await.is_empty(),
+				"changed retry key must not acquire an output mapping for already-issued grants");
+
 			assert_eq!(vtxos_1, vtxos_2, "should have the same VTXOs");
 			assert_eq!(vtxos_1, vtxos_3, "should have the same VTXOs");
+			assertions_completed = true;
 		} => {},
 	}
+
+	assert!(assertions_completed, "the grant/token assertions must complete before the payer branch returns");
 
 	assert_vtxopool_consistency(srv).await;
 }
@@ -1732,7 +2183,7 @@ async fn server_concurrent_prepare_lightning_claim(
 	let receive = bark.lightning_receive_status(&invoice_info.invoice).await.unwrap();
 
 	let pg_cfg = srv.config().postgres.clone();
-	let db = Db::connect(&pg_cfg).await.unwrap();
+	let db = Db::connect(&pg_cfg, bitcoin::Network::Regtest).await.unwrap();
 
 	// pay blocks until the payment is claimed, which never happens here, so
 	// we race it against the wait for its HTLC to arrive and then drop it.
@@ -1748,19 +2199,33 @@ async fn server_concurrent_prepare_lightning_claim(
 		} => {},
 	}
 
-	// Fire all requests at once, each over its own connection. Every call
-	// uses a fresh user pubkey, so nothing but the server's own bookkeeping
-	// ties the requests together.
-	let results = join_all((0..NB_REQUESTS).map(|_| async {
-		let mut client = srv.get_public_rpc().await;
-		client.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
-			payment_hash: receive.payment_hash.to_vec(),
-			user_pubkey: Keypair::new(&SECP, &mut bip39::rand::thread_rng())
-				.public_key().serialize().to_vec(),
-			htlc_recv_expiry: 172,
-			lightning_receive_anti_dos: None,
-		}).await
+	// Authenticate all real actors through the existing connection pool before
+	// the RPC storm; fixture setup must not open 100 PostgreSQL pools at once.
+	let server_mailbox = srv.mailbox_keypair();
+	let mut actors = Vec::with_capacity(NB_REQUESTS);
+	for _ in 0..NB_REQUESTS {
+		let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+		super::register_test_owners(&db, &server_mailbox, &keypair, &[keypair]).await;
+		let proof = ark::fallback::OwnerLink::new_joint(Network::Regtest, server_mailbox.public_key(), &keypair, &keypair).unwrap();
+		actors.push((keypair, proof));
+	}
+	assert_eq!(actors.len(), NB_REQUESTS);
+	// Fire the same 100 RPCs at once, each over its own connection and with
+	// its own key. Only the server's bookkeeping ties the requests together.
+	let results = join_all(actors.into_iter().map(|(keypair, proof)| {
+		let payment_hash = receive.payment_hash;
+		async move {
+			let mut client = srv.get_public_rpc().await;
+			client.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+				owner_proof: Some(proof.into()),
+				payment_hash: payment_hash.to_vec(),
+				user_pubkey: keypair.public_key().serialize().to_vec(),
+				htlc_recv_expiry: 172,
+				lightning_receive_anti_dos: None,
+			}).await
+		}
 	})).await;
+	assert_eq!(results.len(), NB_REQUESTS);
 
 	// Collect every distinct HTLC vtxo the calls handed out.
 	let mut nb_success = 0;
@@ -1797,11 +2262,12 @@ async fn server_concurrent_prepare_lightning_claim(
 
 	// The losers are told to retry, so a retry after the storm must
 	// return the winner's vtxos instead of allocating a new set.
+	let retry_keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let retry = srv.get_public_rpc().await
 		.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+			owner_proof: Some(super::test_owner_link(&srv, &retry_keypair).await.into()),
 			payment_hash: receive.payment_hash.to_vec(),
-			user_pubkey: Keypair::new(&SECP, &mut bip39::rand::thread_rng())
-				.public_key().serialize().to_vec(),
+			user_pubkey: retry_keypair.public_key().serialize().to_vec(),
 			htlc_recv_expiry: 172,
 			lightning_receive_anti_dos: None,
 		}).await
@@ -1850,7 +2316,7 @@ async fn refuses_htlc_recv_expiry_past_lowest_incoming_htlc_expiry(
 			}).wait_millis(10_000).await.unwrap().into_inner();
 
 			let pg_cfg = srv.config().postgres.clone();
-			let db = Db::connect(&pg_cfg).await.unwrap();
+			let db = Db::connect(&pg_cfg, bitcoin::Network::Regtest).await.unwrap();
 			let sub = db.read(async |t|
 				t.get_htlc_subscription_by_payment_hash(receive.payment_hash).await
 			).await.unwrap().expect("subscription should exist");
@@ -1861,6 +2327,7 @@ async fn refuses_htlc_recv_expiry_past_lowest_incoming_htlc_expiry(
 			let attacker_expiry = lowest.saturating_sub(htlc_expiry_delta).to_u32() + 1;
 			let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 			let req = protos::PrepareLightningReceiveClaimRequest {
+				owner_proof: Some(super::test_owner_link(&srv, &keypair).await.into()),
 				payment_hash: receive.payment_hash.to_vec(),
 				user_pubkey: keypair.public_key().serialize().to_vec(),
 				htlc_recv_expiry: attacker_expiry,
@@ -1879,6 +2346,7 @@ async fn refuses_htlc_recv_expiry_past_lowest_incoming_htlc_expiry(
 			let safe_expiry = lowest.saturating_sub(htlc_expiry_delta).to_u32();
 			let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 			let req_safe = protos::PrepareLightningReceiveClaimRequest {
+				owner_proof: Some(super::test_owner_link(&srv, &keypair).await.into()),
 				payment_hash: receive.payment_hash.to_vec(),
 				user_pubkey: keypair.public_key().serialize().to_vec(),
 				htlc_recv_expiry: safe_expiry,
@@ -1931,6 +2399,7 @@ async fn refuse_receive_claim_after_incoming_htlc_expiry() {
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc
 		.start_lightning_receive(protos::StartLightningReceiveRequest {
+			claim_destination: None,
 			payment_hash: payment_hash.as_ref().to_vec(),
 			amount_sat: btc(1).to_sat(),
 			min_cltv_delta,
@@ -1960,7 +2429,7 @@ async fn refuse_receive_claim_after_incoming_htlc_expiry() {
 	.await
 	.expect("inbound HTLC never arrived");
 
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	let sub = db
 		.read(async |t| t.get_htlc_subscription_by_payment_hash(payment_hash).await)
 		.await
@@ -1975,6 +2444,7 @@ async fn refuse_receive_claim_after_incoming_htlc_expiry() {
 	let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let granted = rpc
 		.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+			owner_proof: Some(super::test_owner_link(&srv, &keypair).await.into()),
 			payment_hash: payment_hash.as_ref().to_vec(),
 			user_pubkey: keypair.public_key().serialize().to_vec(),
 			htlc_recv_expiry: lowest.saturating_sub(srv.config().htlc_expiry_delta).into(),
@@ -1999,11 +2469,10 @@ async fn refuse_receive_claim_after_incoming_htlc_expiry() {
 	// The attack: claim the granted VTXOs cooperatively. The inbound HTLC is
 	// expired, so the server can never settle its hold invoice: cosigning here
 	// pays the attacker twice (granted VTXOs plus the refunded payment).
+	let claim_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	super::test_owner_link(&srv, &claim_key).await;
 	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
-		granted.iter().cloned(),
-		ark::VtxoPolicy::new_pubkey(
-			Keypair::new(&SECP, &mut bip39::rand::thread_rng()).public_key(),
-		),
+		granted.iter().cloned(), ark::VtxoPolicy::new_pubkey(claim_key.public_key()),
 	)
 	.unwrap()
 	.generate_user_nonces(&[keypair])
@@ -2013,9 +2482,9 @@ async fn refuse_receive_claim_after_incoming_htlc_expiry() {
 		.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 			payment_hash: payment_hash.as_ref().to_vec(),
 			payment_preimage: preimage.as_ref().to_vec(),
-			cosign_request: Some(protos::ArkoorPackageCosignRequest::from(
+			cosign_request: Some(super::signed_package(&srv, &[], protos::ArkoorPackageCosignRequest::from(
 				builder.cosign_request(),
-			)),
+			)).await),
 		})
 		.await
 		.expect_err("server must refuse a claim it can no longer settle the inbound HTLC for");
@@ -2059,12 +2528,13 @@ async fn settled_hash_cannot_fund_new_receive() {
 	).await;
 	bark.pay_lightning_wait(seed_invoice, None).await;
 
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	wait_for_preimage_recorded(&db, payment_hash).await;
 
 	// The same hash must now be refused for a receive.
 	let err = srv.get_public_rpc().await
 		.start_lightning_receive(protos::StartLightningReceiveRequest {
+			claim_destination: None,
 			payment_hash: payment_hash.as_ref().to_vec(),
 			amount_sat: btc(1).to_sat(),
 			min_cltv_delta: 6,
@@ -2134,12 +2604,13 @@ async fn settled_hash_cannot_be_granted_htlc_recv_vtxos() {
 	bark.try_pay_lightning(&seed_invoice, None, false).await.unwrap();
 	wait_for_hold_invoice_accepted(&mut eve_hold, payment_hash).await;
 
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 
 	// A receive for H is still allowed because H is not settled yet. Eve pays
 	// it so the subscription is Accepted.
 	let mut rpc = srv.get_public_rpc().await;
 	let receive_invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
+		claim_destination: None,
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: btc(1).to_sat(),
 		min_cltv_delta: 6,
@@ -2169,6 +2640,7 @@ async fn settled_hash_cannot_be_granted_htlc_recv_vtxos() {
 
 	let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let err = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+		owner_proof: Some(super::test_owner_link(&srv, &keypair).await.into()),
 		payment_hash: payment_hash.as_ref().to_vec(),
 		user_pubkey: keypair.public_key().serialize().to_vec(),
 		htlc_recv_expiry: lowest.saturating_sub(srv.config().htlc_expiry_delta).into(),
@@ -2197,6 +2669,7 @@ async fn settled_hash_cannot_be_granted_htlc_recv_vtxos() {
 
 	assert_vtxopool_consistency(&srv).await;
 }
+
 
 /// An intra-Ark payment of a receive is refused while an outgoing payment to
 /// another invoice with the same payment hash is still open.
@@ -2247,6 +2720,7 @@ async fn intra_ark_payment_refused_while_same_hash_send_is_open() {
 	// A receive for H is allowed: H is not settled.
 	let mut rpc = srv.get_public_rpc().await;
 	let receive_invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
+		claim_destination: None,
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: btc(0.5).to_sat(),
 		min_cltv_delta: 6,
@@ -2259,7 +2733,7 @@ async fn intra_ark_payment_refused_while_same_hash_send_is_open() {
 		.expect_err("intra-Ark payment must be refused while a send to H is open");
 	assert!(err.to_string().contains("payment already in progress"), "unexpected error: {err:#}");
 
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	assert_eq!(
 		lightning_subscription_status(&db, payment_hash).await.as_deref(),
 		Some("created"),
@@ -2344,7 +2818,7 @@ async fn should_cap_retry_for_at_maximum() {
 	bark_1.pay_lightning_wait(invoice, None).await;
 
 	let max = srv.config().cln_xpay_max_retry_for;
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let attempt = db.read(async |t|
 		t.get_latest_payment_attempt_by_payment_hash(payment_hash.into()).await
 	).await.unwrap().expect("payment attempt");
@@ -2638,7 +3112,7 @@ async fn server_can_use_multi_input_from_vtxo_pool() {
 	assert_eq!(balance, pay_amount + board_amount);
 
 	// The claim settled the hold invoice, and its row says so.
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	wait_for_cln_hold_status(&db, ark::lightning::PaymentHash::from(&invoice), "paid").await;
 
 	assert_vtxopool_consistency(&srv).await;
@@ -2744,7 +3218,7 @@ async fn vtxo_pool_allocation_stores_checkpoint_vtxos() {
 	// A spent pool vtxo is spent into a checkpoint the server can sweep at
 	// expiry, and the allocation's arkoor txs spend that checkpoint in turn.
 	let pg_cfg = srv.config().postgres.clone();
-	let db = Db::connect(&pg_cfg).await.unwrap();
+	let db = Db::connect(&pg_cfg, bitcoin::Network::Regtest).await.unwrap();
 	let checkpoints = db.read(async |t| {
 		let row = t.query_one("
 			SELECT COUNT(*)
@@ -2823,7 +3297,7 @@ async fn check_lightning_receive_poll_interval_fallback() {
 
 	// Create a hold invoice on the server.
 	let resp = srv.start_lightning_receive(
-		payment_hash, btc(1), BlockDelta::new(18), None, None, None,
+		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None,
 	).await.unwrap();
 
 	// Create a disconnected receiver: the sender is kept alive so
@@ -2876,7 +3350,7 @@ async fn check_lightning_receive_ignores_other_payment_updates() {
 	let preimage = ark::lightning::Preimage::from(rand::random::<[u8; 32]>());
 	let payment_hash = preimage.compute_payment_hash();
 	srv.start_lightning_receive(
-		payment_hash, btc(1), BlockDelta::new(18), None, None, None,
+		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None,
 	).await.unwrap();
 
 	let (update_tx, mut update_rx) = tokio::sync::broadcast::channel::<PaymentHash>(16);
@@ -2931,13 +3405,14 @@ async fn refuse_receive_with_unlock_hash_as_payment_hash() {
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
 
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	let preimage = ark::lightning::Preimage::from([7u8; 32]);
 	plant_unlock_preimage(&db, preimage).await;
 	let payment_hash = preimage.compute_payment_hash();
 
 	let mut rpc = srv.get_public_rpc().await;
 	let err = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
+		claim_destination: None,
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: 10_000,
 		min_cltv_delta: 8,
@@ -2960,9 +3435,39 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 		cfg.invoice_expiry = Duration::from_secs(3600);
 	}).create().await;
 
+	// Refuse the old client before creating an invoice that it cannot claim
+	// under the matching coin/mailbox authorization protocol.
+	let old_hash = ark::lightning::Preimage::random().compute_payment_hash();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let subscription_count = async || db.read(async |tx| Ok(tx.query_one(
+		"SELECT count(*) FROM lightning_htlc_subscription WHERE payment_hash=$1",
+		&[&old_hash.to_string()],
+	).await?.get::<_, i64>(0))).await.unwrap();
+	let mut hold = lightning.internal.hold_client().await;
+	let native_request = hold::ListRequest {
+		constraint: Some(hold::list_request::Constraint::PaymentHash(old_hash.to_vec())),
+	};
+	assert_eq!(subscription_count().await, 0);
+	assert!(hold.list(native_request.clone()).await.unwrap().into_inner().invoices.is_empty());
+	let channel = tonic::transport::Endpoint::from_shared(srv.ark_url()).unwrap().connect().await.unwrap();
+	let mut raw = server_rpc::ArkServiceClient::new(channel);
+	let mut old_request = tonic::Request::new(protos::StartLightningReceiveRequest {
+		payment_hash: old_hash.to_vec(), amount_sat: 10_000, min_cltv_delta: 8,
+		mailbox_id: None, description: None, expiry_secs: Some(600), claim_destination: None,
+	});
+	server_rpc::RequestExt::set_pver(&mut old_request, server_rpc::pver::PROTOCOL_VERSION_OWNER_PROOF);
+	let refusal = raw.start_lightning_receive(old_request).await.expect_err("protocol6 must not create a fresh invoice");
+	assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
+	assert!(refusal.message().contains("Your client version is too old"), "unexpected refusal: {refusal}");
+	assert_eq!(subscription_count().await, 0);
+	assert!(hold.list(native_request).await.unwrap().into_inner().invoices.is_empty());
+	// The ordinary client below uses protocol7 and keeps the original invoice
+	// creation, same-hash replay and expiry-validation assertions.
+
 	let mut rpc = srv.get_public_rpc().await;
 	let mut start_for = async |payment_hash: PaymentHash, expiry_secs: Option<u64>| {
 		rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
+			claim_destination: None,
 			payment_hash: payment_hash.to_vec(),
 			amount_sat: 10_000,
 			min_cltv_delta: 8,
@@ -3013,7 +3518,7 @@ async fn refuse_send_with_unlock_hash_as_payment_hash() {
 	let bark = ctx.bark("bark-1", &srv).funded(sat(500_000)).create().await;
 	bark.board_and_confirm_and_register(&ctx, sat(200_000)).await;
 
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	let unlock_preimage = ark::lightning::Preimage::from([7u8; 32]);
 	plant_unlock_preimage(&db, unlock_preimage).await;
 
@@ -3275,6 +3780,7 @@ async fn prevent_double_pay_via_canceled_subscription_and_inflight_xpay() {
 	// 3. Register a server receive with the same payment hash H.
 	let invoice_2 = srv.get_public_rpc().await
 		.start_lightning_receive(protos::StartLightningReceiveRequest {
+			claim_destination: None,
 			payment_hash: payment_hash.to_byte_array().to_vec(),
 			amount_sat: amount.to_sat(),
 			min_cltv_delta: 6,
@@ -3291,7 +3797,7 @@ async fn prevent_double_pay_via_canceled_subscription_and_inflight_xpay() {
 		tokio::spawn(async move { eve_ln.try_pay_bolt11(invoice_2).await })
 	};
 
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	wait_for_subscription_status(&db, payment_hash, "accepted").await;
 
 	// 5. Eve never claims invoice-2. After receive_htlc_forward_timeout the
@@ -3397,6 +3903,7 @@ async fn self_payment_claim_rejected_after_sender_onchain_refund() {
 	let payment_hash = preimage.compute_payment_hash();
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
+		claim_destination: None,
 		payment_hash: payment_hash.to_vec(),
 		amount_sat: 100_000,
 		min_cltv_delta: 18,
@@ -3407,7 +3914,7 @@ async fn self_payment_claim_rejected_after_sender_onchain_refund() {
 
 	let sender_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let htlcs = cosign_htlc_send_to_pubkey(
-		&ctx, &srv, &wallet, &input_ids, sender_key.public_key(), payment_hash,
+		&ctx, &srv, &wallet, &input_ids, sender_key.public_key(), payment_hash, super::test_owner_link(&srv, &sender_key).await,
 	).await;
 	wallet.register_vtxo_transactions_with_server(&htlcs).await.unwrap();
 
@@ -3418,7 +3925,7 @@ async fn self_payment_claim_rejected_after_sender_onchain_refund() {
 		mailbox_id: None,
 		retry_for_secs: None,
 	}).await.unwrap();
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	wait_for_subscription_status(&db, payment_hash, "accepted").await;
 
 	let send_expiry = htlcs.iter()
@@ -3427,6 +3934,7 @@ async fn self_payment_claim_rejected_after_sender_onchain_refund() {
 	let receiver_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let mut grants = rpc.prepare_lightning_receive_claim(
 		protos::PrepareLightningReceiveClaimRequest {
+			owner_proof: Some(super::test_owner_link(&srv, &receiver_key).await.into()),
 			payment_hash: payment_hash.to_vec(),
 			user_pubkey: receiver_key.public_key().serialize().to_vec(),
 			htlc_recv_expiry: send_expiry.saturating_sub(srv.config().htlc_expiry_delta).into(),
@@ -3536,12 +4044,14 @@ async fn self_payment_claim_rejected_after_sender_onchain_refund() {
 	let result = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: payment_hash.to_vec(),
 		payment_preimage: preimage.to_vec(),
-		cosign_request: Some(protos::ArkoorPackageCosignRequest::from(builder.cosign_request())),
+		cosign_request: Some(super::signed_package(&srv, &[&wallet], protos::ArkoorPackageCosignRequest::from(builder.cosign_request())).await),
 	}).await;
 
 	let err = result.expect_err("claim must be refused after the sender refunded on-chain");
 	assert!(err.message().contains("too close to the current chaintip"), "unexpected error: {err:?}");
 }
+
+
 
 /// When xpay answers late, after its attempt was closed and the invoice
 /// retried, its result must not be applied to the retry.
@@ -3576,7 +4086,7 @@ async fn late_xpay_result_does_not_finalize_a_retry() {
 
 	// The first attempt is closed and the invoice retried while xpay is
 	// still running.
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let first = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await)
 		.await.unwrap().expect("open attempt");
 	db.write(async |t| t.update_lightning_payment_attempt_status(
@@ -3620,3 +4130,6 @@ async fn late_xpay_result_does_not_finalize_a_retry() {
 		tokio::time::sleep(poll_interval()).await;
 	}
 }
+
+include!("lightning_fallback.rs");
+

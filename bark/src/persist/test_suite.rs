@@ -16,6 +16,9 @@ use lightning_invoice::Bolt11Invoice;
 
 use ark::lightning::{Invoice, PaymentHash, Preimage};
 use ark::test_util::VTXO_VECTORS;
+use ark::test_util::dummy::DummyTestVtxoSpec;
+use ark::{ProtocolEncoding, Vtxo};
+use ark::vtxo::{Bare, Full};
 use ark::VtxoId;
 
 use super::BarkPersister;
@@ -59,6 +62,8 @@ macro_rules! bark_persister_tests {
 	($setup:expr) => {
 		$crate::persist::test_suite::bark_persister_tests!(@tests $setup,
 			test_init_and_read_properties,
+			test_fallback_record_is_immutable,
+			test_pending_fallback_record_never_authorizes_registration,
 			test_set_server_pubkey,
 			test_set_server_mailbox_pubkey,
 
@@ -78,7 +83,10 @@ macro_rules! bark_persister_tests {
 			test_remove_vtxo,
 			test_has_spent_vtxo,
 			test_store_vtxos_idempotent,
+			test_update_vtxo_witnesses_preserves_identity_and_state,
+			test_store_existing_vtxo_preserves_holder_discharge_and_registration,
 			test_steal_lock_to_spent,
+			test_retire_vtxo_lock,
 			test_steal_lock,
 
 			test_create_and_get_movement,
@@ -182,6 +190,7 @@ fn empty_round_state() -> RoundState {
 	RoundState {
 		done: false,
 		participation: RoundParticipation {
+			owner_proofs: Default::default(),
 			inputs: vec![],
 			outputs: vec![],
 			unblinded_mailbox_id: None,
@@ -190,6 +199,7 @@ fn empty_round_state() -> RoundState {
 		new_vtxos: vec![],
 		sent_forfeit_sigs: false,
 		movement_id: None,
+		fallback_refusal: None,
 	}
 }
 
@@ -533,6 +543,35 @@ pub async fn test_has_spent_vtxo(db: &impl BarkPersister) {
 		"an unknown vtxo is not reported as spent");
 }
 
+pub async fn test_update_vtxo_witnesses_preserves_identity_and_state(db: &impl BarkPersister) {
+	let spec = DummyTestVtxoSpec { amount: Amount::from_sat(100_000), fee: Amount::ZERO, ..Default::default() };
+	let (funding, first) = spec.build();
+	let (second_funding, second) = spec.build();
+	assert_eq!(funding, second_funding);
+	assert_eq!(first.to_bare().serialize(), second.to_bare().serialize());
+	assert_ne!(first.serialize(), second.serialize(), "fresh cosign nonces must produce different valid witness material");
+	first.validate(&funding).unwrap();
+	second.validate(&funding).unwrap();
+	assert!(!db.update_vtxo_witnesses(&second).await.unwrap());
+	let held = VtxoState::Locked { holder: Some(MovementId::new(42).into()) };
+	db.store_vtxos(&[(&first, &held)]).await.unwrap();
+	db.mark_vtxos_registered(&[first.id()]).await.unwrap();
+	assert!(db.update_vtxo_witnesses(&second).await.unwrap());
+	assert!(db.update_vtxo_witnesses(&second).await.unwrap(), "completed material replay is idempotent");
+	assert_eq!(db.get_full_vtxo(first.id()).await.unwrap().unwrap().serialize(), second.serialize());
+	let stored = db.get_wallet_vtxo(first.id()).await.unwrap().unwrap();
+	assert_eq!(stored.state, held);
+	assert!(stored.registered);
+	assert_eq!(stored.exit_depth, second.exit_depth());
+	assert_eq!(stored.exit_tx_weight.to_wu(), second.transactions().map(|step| step.tx.weight().to_wu()).sum::<u64>());
+	let wrong_bare = Vtxo::<Bare>::new(second.point(), second.policy().clone(), second.amount() + Amount::ONE_SAT,
+		second.expiry_height(), second.server_pubkey(), second.exit_delta(), second.chain_anchor());
+	let changed = Vtxo::<Full>::deserialize_with_genesis(&wrong_bare.serialize(), &second.serialize_genesis()).unwrap();
+	assert!(db.update_vtxo_witnesses(&changed).await.is_err());
+	assert_eq!(db.get_full_vtxo(first.id()).await.unwrap().unwrap().serialize(), second.serialize());
+	assert_eq!(db.get_wallet_vtxo(first.id()).await.unwrap().unwrap().state, held);
+}
+
 pub async fn test_store_vtxos_idempotent(db: &impl BarkPersister) {
 	let vtxo = &VTXO_VECTORS.board_vtxo;
 
@@ -544,6 +583,29 @@ pub async fn test_store_vtxos_idempotent(db: &impl BarkPersister) {
 	assert_eq!(stored.state, VtxoState::Spendable, "the state survives a repeated store");
 	assert_eq!(db.get_all_vtxos().await.expect("get_all_vtxos").len(), 1,
 		"a repeated store must not insert a second row");
+}
+
+/// Insert retries cannot erase an owned lock, remove a recovery registration,
+/// or resurrect a terminal coin. The original idempotency case only repeated
+/// the SAME initial state and therefore did not exercise this contract.
+pub async fn test_store_existing_vtxo_preserves_holder_discharge_and_registration(db: &impl BarkPersister) {
+	let vtxo = &VTXO_VECTORS.board_vtxo;
+	let exited = &VTXO_VECTORS.round1_vtxo;
+	db.store_vtxos(&[(vtxo, &VtxoState::Spendable), (exited, &VtxoState::Exited)]).await.unwrap();
+	db.mark_vtxos_registered(&[vtxo.id()]).await.unwrap();
+	let holder = VtxoState::Locked { holder: Some(MovementId::new(42).into()) };
+	db.update_vtxo_state_checked(vtxo.id(), holder.clone(), &[VtxoStateKind::Spendable]).await.unwrap();
+	db.store_vtxos(&[(vtxo, &VtxoState::Locked { holder: None })]).await.unwrap();
+	let stored = db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap();
+	assert_eq!(stored.state, holder, "recovery insertion cannot remove a real operation holder");
+	assert!(stored.registered, "recovery registration is monotonic");
+	assert_eq!(db.get_full_vtxo(vtxo.id()).await.unwrap().as_ref(), Some(vtxo));
+	db.update_vtxo_state_checked(vtxo.id(), VtxoState::Spent, &[VtxoStateKind::Locked]).await.unwrap();
+	db.store_vtxos(&[(vtxo, &VtxoState::Spendable), (exited, &VtxoState::Spendable)]).await.unwrap();
+	assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().state, VtxoState::Spent);
+	assert!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().registered);
+	assert_eq!(db.get_wallet_vtxo(exited.id()).await.unwrap().unwrap().state, VtxoState::Exited);
+	assert_eq!(db.get_all_vtxos().await.unwrap().len(), 2);
 }
 
 pub async fn test_steal_lock_to_spent(db: &impl BarkPersister) {
@@ -577,6 +639,22 @@ pub async fn test_steal_lock_to_spent(db: &impl BarkPersister) {
 	let unknown_id = VtxoId::from_slice(&[0u8; 36]).unwrap();
 	assert!(db.steal_lock_to_spent(&[unknown_id]).await.is_err(),
 		"steal_lock_to_spent errors on an unknown id");
+}
+
+pub async fn test_retire_vtxo_lock(db: &impl BarkPersister) {
+	let mine = &VTXO_VECTORS.round1_vtxo;
+	let foreign = &VTXO_VECTORS.round2_vtxo;
+	let holder = MovementId::new(41).into();
+	db.store_vtxos(&[
+		(mine, &VtxoState::Locked { holder: None }),
+		(foreign, &VtxoState::Locked { holder: Some(holder) }),
+	]).await.unwrap();
+	assert!(db.retire_vtxo_lock(mine.id(), None).await.unwrap());
+	assert_eq!(db.get_wallet_vtxo(mine.id()).await.unwrap().unwrap().state, VtxoState::Spent);
+	assert!(db.retire_vtxo_lock(mine.id(), None).await.unwrap());
+	assert!(!db.retire_vtxo_lock(foreign.id(), None).await.unwrap());
+	assert!(matches!(db.get_wallet_vtxo(foreign.id()).await.unwrap().unwrap().state,
+		VtxoState::Locked { holder: Some(_) }));
 }
 
 pub async fn test_steal_lock(db: &impl BarkPersister) {
@@ -739,7 +817,18 @@ pub async fn test_get_or_create_movement_for_action(db: &impl BarkPersister) {
 // ---------------------------------------------------------------------------
 
 pub async fn test_store_and_get_round_state(db: &impl BarkPersister) {
-	let state = empty_round_state();
+	let mut state = empty_round_state();
+	let server = Keypair::from_seckey_slice(&ark::SECP, &[17; 32]).unwrap();
+	let recipient = Keypair::from_seckey_slice(&ark::SECP, &[18; 32]).unwrap();
+	let coin = VTXO_VECTORS.arkoor3_user_key;
+	let link = ark::fallback::OwnerLink::new(server.public_key(),
+		ark::mailbox::MailboxIdentifier::from_pubkey(recipient.public_key()), &coin).unwrap();
+	state.participation.outputs.push(ark::VtxoRequest {
+		amount: Amount::from_sat(1_000), policy: ark::VtxoPolicy::new_pubkey(coin.public_key()),
+	});
+	state.participation.owner_proofs.insert(coin.public_key(), link);
+	state.flow = RoundFlowState::Failed { error: "diagnostic text is not a refusal code".into() };
+	state.fallback_refusal = Some(crate::FallbackRefusal::DecidedForFallback);
 
 	let id = db.store_round_state(&state).await.expect("store_round_state");
 
@@ -1116,4 +1205,41 @@ pub async fn test_exit_child_tx_roundtrip(db: &impl BarkPersister) {
 		Some((replacement_tx, ExitTxOrigin::Mempool)),
 		"store_exit_child_tx should replace the child of an existing exit",
 	);
+}
+
+/// Canonical signatures may change, but the registered destination may not.
+pub async fn test_fallback_record_is_immutable(db: &impl BarkPersister) {
+	let mailbox = Keypair::from_seckey_slice(&ark::SECP, &[7; 32]).unwrap();
+	let spk = ScriptBuf::from_hex("00141111111111111111111111111111111111111111").unwrap();
+	let record = ark::fallback::FallbackRegistration::new(Network::Regtest, spk.clone(), &mailbox).unwrap();
+	assert!(db.get_fallback_record().await.unwrap().is_none());
+	db.store_fallback_record(&record).await.unwrap();
+	let resigned = ark::fallback::FallbackRegistration::new(Network::Regtest, spk, &mailbox).unwrap();
+	db.store_fallback_record(&resigned).await.unwrap();
+	assert_eq!(db.get_fallback_record().await.unwrap().unwrap(), resigned);
+	let alternate = ScriptBuf::from_hex("00142222222222222222222222222222222222222222").unwrap();
+	let changed = ark::fallback::FallbackRegistration::new(Network::Regtest, alternate, &mailbox).unwrap();
+	assert!(db.store_fallback_record(&changed).await.is_err());
+	assert_eq!(db.get_fallback_record().await.unwrap().unwrap(), resigned);
+}
+
+/// Local signatures reserve the identity but cannot acknowledge a server write.
+pub async fn test_pending_fallback_record_never_authorizes_registration(db: &impl BarkPersister) {
+	let mailbox = Keypair::from_seckey_slice(&ark::SECP, &[7; 32]).unwrap();
+	let script = ScriptBuf::from_hex("00141111111111111111111111111111111111111111").unwrap();
+	let record = ark::fallback::FallbackRegistration::new(Network::Regtest, script, &mailbox).unwrap();
+	db.store_pending_fallback_record(&record).await.unwrap();
+	assert!(db.get_fallback_record().await.unwrap().is_none());
+	assert_eq!(db.get_pending_fallback_record().await.unwrap(), Some(record.clone()));
+	let alternate = ScriptBuf::from_hex("00142222222222222222222222222222222222222222").unwrap();
+	let changed = ark::fallback::FallbackRegistration::new(Network::Regtest, alternate, &mailbox).unwrap();
+	assert!(db.store_pending_fallback_record(&changed).await.is_err());
+	assert!(db.store_fallback_record(&changed).await.is_err());
+	assert!(db.get_fallback_record().await.unwrap().is_none());
+	db.store_fallback_record(&record).await.unwrap();
+	assert_eq!(db.get_fallback_record().await.unwrap(), Some(record.clone()));
+	assert!(db.get_pending_fallback_record().await.unwrap().is_none());
+	db.store_pending_fallback_record(&record).await.unwrap();
+	assert_eq!(db.get_fallback_record().await.unwrap(), Some(record));
+	assert!(db.get_pending_fallback_record().await.unwrap().is_none());
 }

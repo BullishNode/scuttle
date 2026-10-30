@@ -1,14 +1,18 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use anyhow::{Context, bail};
 
-use bitcoin::{Transaction, Txid};
+use bitcoin::{Network, Transaction, Txid};
+use bitcoin::secp256k1::Keypair;
 use tracing::debug;
 
-use ark::{ProtocolEncoding, ServerVtxo, Vtxo, VtxoId};
+use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId};
 use ark::vtxo::{Bare, Full};
 
 use super::model::{SpendState, VirtualTransaction};
+use super::Tx;
+use super::expiry_attribution::Attribution;
+use crate::error::OwnershipRefusal;
 
 // -- Update structs --
 
@@ -177,6 +181,7 @@ pub struct VtxoTreeUpdate {
 	tx_inserts: Vec<VirtualTransaction<'static>>,
 	vtxo_inserts: VtxoInserts,
 	vtxo_updates: VtxoUpdates,
+	private_padding: HashSet<String>,
 }
 
 impl VtxoTreeUpdate {
@@ -185,6 +190,7 @@ impl VtxoTreeUpdate {
 			tx_inserts: Vec::new(),
 			vtxo_inserts: VtxoInserts::new(),
 			vtxo_updates: VtxoUpdates::new(),
+			private_padding: HashSet::new(),
 		}
 	}
 
@@ -226,6 +232,17 @@ impl VtxoTreeUpdate {
 	}
 
 	// -- vtxo inserts --
+
+	/// Only the round persistence path can mark server-created padding.
+	pub(in crate::database) fn insert_private_padding_vtxos(
+		mut self, vtxos: impl IntoIterator<Item = ServerVtxo<Full>>,
+	) -> Self {
+		for vtxo in vtxos {
+			self.private_padding.insert(vtxo.id().to_string());
+			self.vtxo_inserts.push(&vtxo, SpendState::Unclaimed, None);
+		}
+		self
+	}
 	//
 	// Spendable/unclaimed/bare inserts are silent on conflict: re-inserting
 	// the same vtxo_id is a no-op. `insert_oor_spent_vtxos` is stricter —
@@ -448,10 +465,43 @@ impl VtxoTreeUpdate {
 /// VTXO row was written, `0` means every insert hit `ON CONFLICT DO NOTHING`
 /// (i.e. an idempotent retry of an already-applied update).
 pub async fn execute_vtxo_tree_update(
-	tx: &tokio_postgres::Transaction<'_>,
+	tx: &Tx<'_>,
 	update: VtxoTreeUpdate,
+	owners: Option<(Network, &Keypair)>,
 ) -> anyhow::Result<u64> {
 	debug_assert!(validate(&update).is_ok(), "{}", validate(&update).unwrap_err());
+	let mut customer_keys = BTreeSet::new();
+	for index in 0..update.vtxo_inserts.vtxo_ids.len() {
+		let state = update.vtxo_inserts.spend_states[index].parse::<SpendState>()?;
+		let customer_birth = match state {
+			SpendState::Spendable | SpendState::Unregistered | SpendState::Unclaimed
+				| SpendState::HtlcRecvUnclaimed => true,
+			SpendState::Spent | SpendState::Pool | SpendState::LnSpent | SpendState::RoundForfeit
+				| SpendState::OffboardForfeit | SpendState::OffboardConnector => false,
+		};
+		if !customer_birth || update.private_padding.contains(&update.vtxo_inserts.vtxo_ids[index]) { continue; }
+		let policy = ServerVtxoPolicy::deserialize(&update.vtxo_inserts.policies[index])?;
+		if let Some(key) = policy.user_pubkey() { customer_keys.insert(key); }
+	}
+	for key in customer_keys {
+		let (network, server_mailbox_key) = owners.ok_or(OwnershipRefusal::Required(key))?;
+		if !matches!(tx.expiry_owner(key, network, server_mailbox_key).await?, Attribution::Owned { .. }) {
+			return Err(OwnershipRefusal::Required(key).into());
+		}
+	}
+
+	let changes = &update.vtxo_updates;
+	let mut obligation_ids = changes.oor_spends.iter().map(|s| s.vtxo_id)
+		.chain(changes.round_spends.iter().map(|s| s.vtxo_id))
+		.chain(changes.offboard_spends.iter().map(|s| s.vtxo_id))
+		.chain(changes.round_forfeits.iter().map(|s| s.vtxo_id))
+		.chain(changes.claims.iter().copied())
+		.chain(changes.registrations.iter().copied())
+		.chain(changes.provide_signatures.iter().map(|v| v.id()))
+		.collect::<Vec<_>>();
+	obligation_ids.sort_unstable();
+	obligation_ids.dedup();
+	super::expiry_guard::guard_obligation_changes(tx, &obligation_ids).await?;
 
 	upsert_virtual_transactions(tx, &update.tx_inserts).await?;
 	let inserted = insert_vtxos(tx, &update.vtxo_inserts).await?;
@@ -801,6 +851,7 @@ async fn do_undo_round_updates(
 		UPDATE vtxo
 		SET spend_state = 'spendable', spent_in_round = NULL, oor_spent_txid = NULL, updated_at = NOW()
 		WHERE spent_in_round = ANY($1::int8[])
+			AND NOT EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=vtxo.vtxo_id)
 	", &[&round_ids]).await.context("failed to undo round spend on VTXOs")?;
 	Ok(())
 }

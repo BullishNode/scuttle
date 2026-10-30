@@ -41,6 +41,7 @@ use cln_rpc::listpays_pays::ListpaysPaysStatus;
 use crate::database;
 use crate::database::ln::{LightningNodeId, LightningPaymentAttempt, LightningPaymentStatus};
 use crate::ln::settler::HtlcSettler;
+use crate::ln::guard::PaymentGuards;
 use crate::system::RuntimeManager;
 use crate::telemetry;
 
@@ -64,6 +65,7 @@ pub(crate) struct ClnXpayClient {
 	/// [`LightningManager::wait_payment_status`]: crate::ln::node_manager::LightningManager::wait_payment_status
 	payment_update_tx: broadcast::Sender<PaymentHash>,
 	mailbox_manager: Arc<crate::mailbox_manager::MailboxManager>,
+	payment_guards: PaymentGuards,
 }
 
 impl ClnXpayClient {
@@ -77,8 +79,9 @@ impl ClnXpayClient {
 		rpc: ClnGrpcClient,
 		settler: Arc<HtlcSettler>,
 		mailbox_manager: Arc<crate::mailbox_manager::MailboxManager>,
+		payment_guards: PaymentGuards,
 	) -> Arc<Self> {
-		Arc::new(Self { db, payment_update_tx, rpc, settler, mailbox_manager })
+		Arc::new(Self { db, payment_update_tx, rpc, settler, mailbox_manager, payment_guards })
 	}
 
 	/// Calls xpay and then reconciles the attempt status against CLN.
@@ -103,16 +106,21 @@ impl ClnXpayClient {
 		max_routing_fee: Amount,
 		max_cltv_expiry_delta: BlockDelta,
 		retry_for: Duration,
-		label: Option<String>,
 	) {
 		let mut rpc = self.rpc.clone();
 		let payment_hash = invoice.payment_hash();
+		let dispatch = self.payment_guards.lock_dispatch(payment_hash).await;
+		match self.db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await).await {
+			Ok(Some(current)) if current.id == attempt_id => {},
+			Ok(_) => return,
+			Err(error) => { error!(%payment_hash, %error, "Could not check queued payment"); return; },
+		}
 		// Only place CLN says whether the route was pruned on cost or on delay.
 		// A route it never found leaves no `listpays` record either, so
 		// dropping this loses the reason entirely.
 		let pay_error = match call_xpay(
 			&mut rpc, &invoice, payment_amount, max_routing_fee, max_cltv_expiry_delta, retry_for,
-			label,
+			Some(attempt_id.to_string()),
 		).await {
 			Ok(_preimage) => {
 				// NB we don't do db stuff when it's succesful, because
@@ -134,6 +142,7 @@ impl ClnXpayClient {
 			},
 		};
 
+		drop(dispatch);
 		// A later attempt for this hash, maybe on another node, is not ours to
 		// reconcile with this node's xpay result.
 		let attempt_res = self.db
@@ -212,6 +221,7 @@ impl ClnXpayClient {
 		pay_error: Option<&str>,
 	) -> anyhow::Result<()> {
 		let payment_hash = attempt.payment_hash;
+		let Some(_dispatch) = self.payment_guards.try_lock_dispatch(payment_hash) else { return Ok(()); };
 		let error = pay_error.or(attempt.error.as_deref());
 		debug!("Lightning payment attempt ({}): with payment hash {} is being verified.",
 			attempt.id, payment_hash,
@@ -227,9 +237,11 @@ impl ClnXpayClient {
 			limit: None,
 			start: None,
 		};
-		let listpays_response = self.rpc.clone().list_pays(req).await
+		let mut listpays_response = self.rpc.clone().list_pays(req).await
 			.context("Could not fetch cln payments")?
 			.into_inner();
+		let label = attempt.id.to_string();
+		listpays_response.pays.retain(|pay| pay.label.as_deref() == Some(label.as_str()));
 		if listpays_response.pays.is_empty() {
 			match attempt.status {
 				LightningPaymentStatus::Succeeded => {
@@ -350,6 +362,7 @@ impl ClnXpay {
 		config: ClnXpayConfig,
 		settler: Arc<HtlcSettler>,
 		mailbox_manager: Arc<crate::mailbox_manager::MailboxManager>,
+		payment_guards: PaymentGuards,
 	) -> anyhow::Result<ClnXpay> {
 		let payment_idxs = db.read(async |t| t.get_lightning_payment_indexes(node_id).await).await
 			.with_context(|| format!("failed to fetch payment indices for {}", node_id))?
@@ -361,7 +374,7 @@ impl ClnXpay {
 			updated_index: payment_idxs.updated_index,
 		);
 
-		let client = ClnXpayClient::new(db.clone(), payment_update_tx, rpc, settler, mailbox_manager).await;
+		let client = ClnXpayClient::new(db.clone(), payment_update_tx, rpc, settler, mailbox_manager, payment_guards).await;
 
 		let proc = ClnXpayProcess {
 			config, db, node_id,

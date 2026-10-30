@@ -17,11 +17,12 @@ async fn get_bare_vtxo_by_id() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
 
 	let bare = db.read(async |t| t.get_bare_vtxo_by_id(vtxo.id()).await).await.unwrap();
 
@@ -55,14 +56,15 @@ async fn fix_offboard_vtxos() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	super::register_vector_owners(&db).await;
 
 	// the user vtxo that gets offboarded
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
 	let signed_txs: Vec<_> = vtxo.transactions().map(|item| item.tx).collect();
-	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_signed_tx(signed_txs)).await).await.unwrap();
+	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_signed_tx(signed_txs), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
 
 	let offboard_tx = dummy_tx(1);
 	let offboard_txid = offboard_tx.compute_txid();

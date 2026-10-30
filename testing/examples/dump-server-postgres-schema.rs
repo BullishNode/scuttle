@@ -18,7 +18,7 @@ async fn main() {
 	let db_manager = PostgresDatabaseManager::init(tmp_pg_datadir.clone()).await;
 	let db_config = db_manager.request_database("bark-server-schema-dump").await;
 
-	Db::create(&db_config).await.expect("Can initialize database");
+	Db::create(&db_config, bitcoin::Network::Regtest).await.expect("Can initialize database");
 
 	let mut cmd = process::Command::new("pg_dump");
 	cmd

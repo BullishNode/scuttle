@@ -95,6 +95,7 @@ impl Server {
 	pub async fn cosign_oor_with_builder(
 		&self,
 		builder: ArkoorPackageBuilder<ServerCanCosign>,
+		owner_links: &crate::owner_proof::OwnerLinks,
 	) -> anyhow::Result<(ArkoorPackageBuilder<ServerSigned>, u64)> {
 		let vtxo_guard = self.vtxos_in_flux.try_lock(builder.input_ids()).map_err(|e| {
 			slog!(ArkoorInputAlreadyInFlux, vtxo: e.id);
@@ -111,6 +112,7 @@ impl Server {
 			})
 			.collect::<Vec<_>>();
 
+
 		// Output user vtxos go in as `unregistered`. They become spendable
 		// once the sender uploads the signed transaction chain via
 		// register_vtxo_transactions; until then `check_spendable` rejects
@@ -120,8 +122,19 @@ impl Server {
 			.insert_oor_spent_vtxos(builder.build_unsigned_internal_vtxos())
 			.insert_unregistered_vtxos(builder.build_unsigned_vtxos().map(ServerVtxo::from))
 			.mark_vtxos_oor_spent(builder.input_spend_info());
+		let source_ids = builder.input_ids().collect::<Vec<_>>();
+		let new_lightning_send = builder.build_unsigned_vtxos()
+			.any(|v| v.policy().as_server_htlc_send().is_some());
 		let inserted = self.db.write(async |t| {
-			let inserted = t.execute_vtxo_tree_update(update).await?;
+			owner_links.verify_package(t, &builder, self.mailbox_key.leak_ref(), self.config.network).await?;
+			if new_lightning_send {
+				// A retry has already committed all the identical input spends.
+				let states = t.get_user_vtxos_by_id(&source_ids).await?;
+				if states.iter().any(|v| v.spend_state != crate::database::SpendState::Spent) {
+					crate::database::expiry_guard::guard_new_lightning_inputs(t, &source_ids).await?;
+				}
+			}
+			let inserted = t.execute_vtxo_tree_update(update, Some((self.config.network, self.mailbox_key.leak_ref()))).await?;
 			htlc_vtxo::set_htlc_vtxo_resolutions(
 				&t, &claimed_htlc_recvs, HtlcResolution::Fulfilled,
 			).await?;
@@ -138,6 +151,7 @@ impl Server {
 	pub async fn cosign_oor(
 		&self,
 		request: ArkoorPackageCosignRequest<VtxoId>,
+		owner_links: &crate::owner_proof::OwnerLinks,
 	) -> anyhow::Result<ArkoorPackageCosignResponse> {
 		let input_vtxo_ids = request.inputs().cloned().collect::<Vec<VtxoId>>();
 		let input_vtxo_states = self.db.read(async |t| t.get_user_vtxos_by_id(&input_vtxo_ids).await).await?;
@@ -189,7 +203,7 @@ impl Server {
 			v.check_spendable_for_oor(chain_tip, *spending_txid)?;
 		}
 
-		let (builder, inserted) = self.cosign_oor_with_builder(builder).await?;
+		let (builder, inserted) = self.cosign_oor_with_builder(builder, owner_links).await?;
 
 		slog!(ArkoorCosign, input_ids: input_vtxo_ids,
 			output_ids: builder.build_unsigned_vtxos().into_iter().map(|v| v.id()).collect(),

@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 
 use ark::{ProtocolEncoding, Vtxo, VtxoId};
-use ark::lightning::{PaymentHash, Preimage};
+use ark::lightning::PaymentHash;
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
 use ark::vtxo::Full;
 use ark::vtxo::policy::signing::VtxoSigner;
@@ -30,7 +30,7 @@ use server_rpc::protos::mailbox_server::MailboxMessage;
 
 use crate::{Wallet, WalletInner, SUBSCRIBE_REQUEST_TIMEOUT};
 use crate::actions::DriveMode;
-use crate::actions::lightning::pay::{ln_pay_action_id, LightningSend, Progress};
+use crate::actions::lightning::pay::{ln_pay_action_id, LightningSend};
 use crate::movement::{MovementDestination, MovementStatus};
 use crate::movement::update::MovementUpdate;
 use crate::subsystem::{ArkoorMovement, Subsystem};
@@ -612,8 +612,8 @@ impl Wallet {
 
 	/// Handle a lightning send finished notification from the mailbox.
 	///
-	/// This notification indicates that the server has completed processing
-	/// a lightning payment we initiated, either successfully or with failure.
+	/// The notification wakes the payment action. Its status query verifies
+	/// our complete HTLC set before adopting success or failure.
 	async fn handle_lightning_send_finished(
 		&self,
 		notif: protos::mailbox_server::LightningSendFinishedMessage,
@@ -621,57 +621,21 @@ impl Wallet {
 		let payment_hash = PaymentHash::try_from(notif.payment_hash)
 			.context("invalid payment hash in lightning send finished notification")?;
 
-		let known_preimage = notif.preimage
-			.and_then(|bytes| Preimage::try_from(bytes).ok());
-
-		if known_preimage.is_some() {
-			debug!("Lightning send finished notification (success): payment_hash={}", payment_hash);
-		} else {
-			debug!("Lightning send finished notification (failed): payment_hash={}", payment_hash);
-		}
+		debug!("Lightning send finished notification: payment_hash={}", payment_hash);
 
 		// Errors are logged but not propagated: we always advance the
 		// mailbox checkpoint to avoid re-processing the same
 		// notification on the next poll.
-		match self.is_invoice_paid(payment_hash).await {
-			Ok(true) => {
-				debug!("Lightning send {} already settled; ignoring notification", payment_hash);
-			},
-			Ok(false) => {
-				let action_id = ln_pay_action_id(payment_hash);
-				let lookup = self.lock_action::<LightningSend>(&action_id, LIGHTNING_SEND_LOCK_TIMEOUT).await;
-				match lookup {
-					Ok(checkpoint) => match checkpoint.get().map(|send| send.progress.clone()) {
-						Some(progress) => {
-							let result = match (progress, known_preimage) {
-								(Progress::PaymentInitiated(htlcs), Some(preimage)) => {
-									self.settle_lightning_send_with_preimage(checkpoint, htlcs, preimage).await
-								},
-								(Progress::PaymentInitiated(_), None) => {
-									self.drive_checkpoint(checkpoint, DriveMode::UntilParkOrDone).await
-								},
-								_ => {
-									debug!("Lightning send finished notification for {} but checkpoint is not PaymentInitiated; ignoring", payment_hash);
-									Ok(())
-								},
-							};
-							match result {
-								Ok(()) => info!("Processed lightning send finished for {}", payment_hash),
-								Err(e) => error!("Failed to process lightning send finished for {}: {:#}", payment_hash, e),
-							}
-						},
-						None => {
-							warn!("Lightning send finished notification for unknown payment hash {}", payment_hash);
-						},
-					},
-					Err(e) => {
-						error!("Failed to look up lightning send checkpoint for {}: {:#}", payment_hash, e);
-					},
+		let action_id = ln_pay_action_id(payment_hash);
+		match self.lock_action::<LightningSend>(&action_id, LIGHTNING_SEND_LOCK_TIMEOUT).await {
+			Ok(checkpoint) if checkpoint.get().is_some() => {
+				match self.drive_checkpoint(checkpoint, DriveMode::UntilParkOrDone).await {
+					Ok(()) => info!("Processed lightning send finished for {}", payment_hash),
+					Err(e) => error!("Failed to process lightning send finished for {}: {:#}", payment_hash, e),
 				}
 			},
-			Err(e) => {
-				error!("Failed to look up paid_invoice for {}: {:#}", payment_hash, e);
-			},
+			Ok(_) => debug!("Lightning send finished notification has no pending action for {}", payment_hash),
+			Err(e) => error!("Failed to look up lightning send checkpoint for {}: {:#}", payment_hash, e),
 		}
 
 		Ok(())

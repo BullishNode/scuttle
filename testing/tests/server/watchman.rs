@@ -1,3 +1,4 @@
+pub(super) use ark_testing::onchain::observed_payout_fee_child;
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -814,7 +815,7 @@ async fn watchman_sweeps_forfeit_with_preimage_in_ln_settlement_table() {
 
 	// Plant the cross-domain state: record the same preimage as a settled
 	// Lightning payment hash.
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	let unlock_preimage = db
 		.read(async |t| {
 			let row = t

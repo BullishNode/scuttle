@@ -225,13 +225,6 @@ impl Server {
 
 		let round_id = part.round_id.context("round participation has no round_id")?;
 		self.db.write(async |t| {
-			// Persist all signed forfeit txs in a single batch. Either all succeed or
-			// none do; on a partial failure the user retries with the same bundles.
-			t.set_forfeit_transactions(unlock_hash, &vtxo_ids, &ff_txs, &ff_txids).await
-				.context("error storing signed forfeit txs")?;
-
-			// Transition the round output vtxos from 'unclaimed' to 'spendable' and
-			// record the forfeit txid on the round inputs.
 			let round = t.get_round(round_id).await?
 				.context("round not found for participation")?;
 			// NB the round can predate the v1 hashlock clauses, so the tree's
@@ -246,12 +239,26 @@ impl Server {
 				.map(|idx| tree.build_vtxo(idx).id())
 				.collect::<Vec<_>>();
 
+			let mut guarded_ids = vtxo_ids.clone();
+			guarded_ids.extend(output_vtxo_ids.iter().copied());
+			guarded_ids.sort_unstable();
+			guarded_ids.dedup();
+			crate::database::expiry_guard::guard_obligation_changes(t, &guarded_ids).await?;
+
+			// Persist all signed forfeit txs in a single batch. Either all succeed or
+			// none do; on a partial failure the user retries with the same bundles.
+			t.set_forfeit_transactions(unlock_hash, &vtxo_ids, &ff_txs, &ff_txids).await
+				.context("error storing signed forfeit txs")?;
+
+			// Transition the round output vtxos from 'unclaimed' to 'spendable' and
+			// record the forfeit txid on the round inputs.
+
 			let update = VtxoTreeUpdate::new()
 				.upsert_signed_tx(ff_txs)
 				.insert_unspent_vtxos(ff_vtxos, SpendState::RoundForfeit)
 				.mark_vtxos_round_forfeited(input_forfeit_pairs)
 				.mark_vtxos_claimed(output_vtxo_ids);
-			t.execute_vtxo_tree_update(update).await
+			t.execute_vtxo_tree_update(update, None).await
 				.context("failed to execute vtxo tree update")?;
 			t.mark_participation_forfeited(unlock_hash).await
 				.context("failed to mark participation as forfeited")?;

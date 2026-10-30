@@ -10,7 +10,10 @@ mod config;
 mod daemon;
 mod frontier;
 mod policy;
+mod payout;
+mod recovery;
 mod signer;
+pub(crate) mod settlement;
 
 pub use self::config::Config;
 pub use self::daemon::Daemon;
@@ -46,11 +49,12 @@ use bitcoin::Txid;
 use tokio::sync::watch;
 use tracing::{info, trace, warn};
 
-use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId};
+use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 use ark::vtxo::policy::signing::VtxoSigner;
 use bitcoin_ext::{fee, BlockHeight, BlockRef, TxStatus, P2TR_DUST};
 use bitcoin_ext::bdk::{WalletExt, KEYCHAIN};
 use bitcoin_ext::cpfp::MakeCpfpFees;
+use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
 use bitcoind_async_client::Client as BitcoindClient;
 use bitcoind_async_client::traits::Reader;
 
@@ -212,8 +216,22 @@ impl Watchman {
 
 		let mut reaction_timer = tokio::time::interval(self.config.reaction_interval);
 		let mut sweep_timer = tokio::time::interval(self.config.sweep_interval);
+		// A sweep's first tick can precede the second daemon's sync ack.
+		// Readiness also needs a fresh rebuilt token after later blocks or
+		// ledger commits, independently of the configured financial sweep.
+		let mut rebuild_timer = tokio::time::interval(std::time::Duration::from_secs(1));
 		loop {
 			tokio::select! {
+				_ = rebuild_timer.tick() => {
+					// Probe the exact completed view. Rebuild only when it changed;
+					// the financial sweep still reconstructs before publication.
+					if let Err(error) = self.refresh_expiry_readiness().await {
+						warn!("Error rebuilding expiry readiness: {error:#}");
+					}
+					// The same loop serializes this with sweeps; reset coalesces
+					// slow work instead of accumulating missed timer bursts.
+					rebuild_timer.reset();
+				},
 				_ = reaction_timer.tick() => {
 					self.process_reactions_logged().await;
 					reaction_timer.reset();
@@ -384,16 +402,83 @@ impl Watchman {
 	/// Sweeps have no deadline, so this runs on the much longer
 	/// [Config::sweep_interval].
 	pub async fn process_sweeps(&self) -> anyhow::Result<()> {
-		let work = self.scan_frontier().await;
-
-		for vtxo in &work.sweeps {
-			self.update_mempool_spend(vtxo.id()).await;
+		// Expired customer backing never reaches upstream's drain-only claim
+		// builder. Only committed financial groups can authorize these spends.
+		let Some(view) = self.rebuild_expiry_state().await? else { return Ok(()); };
+		self.process_expiry_payouts(view).await?;
+		// Confiscated OffboardForfeit outputs are exclusively server-owned.
+		// Their Bare encoding needs no customer genesis or payout allocation.
+		// Use the original native claim: its miner fee comes from operator
+		// collateral, not from a customer payout or a new wallet subsidy.
+		let sweeps = self.scan_frontier().await.sweeps;
+		let ids = sweeps.iter().filter(|v| matches!(v.policy(), ServerVtxoPolicy::ServerOwned
+			| ServerVtxoPolicy::User(VtxoPolicy::Pubkey(_))))
+			.map(|v| v.id().to_string()).collect::<Vec<_>>();
+		let eligible = self.db.read(async |t| Ok(t.query(
+			"SELECT vtxo_id,spend_state::TEXT FROM vtxo WHERE vtxo_id=ANY($1) AND spend_state IN ('offboard-forfeit','pool')",
+			&[&ids]).await?.into_iter().map(|r| (r.get::<_, String>(0),r.get::<_, String>(1))).collect::<HashMap<_, _>>()
+		)).await?;
+		let mut claims = Vec::new();
+		for vtxo in sweeps {
+			let state = eligible.get(&vtxo.id().to_string()).map(String::as_str);
+			let owned = match (vtxo.policy(), state) {
+				(ServerVtxoPolicy::ServerOwned, Some("offboard-forfeit")) => true,
+				(ServerVtxoPolicy::User(VtxoPolicy::Pubkey(policy)), Some("pool")) => {
+					policy.user_pubkey == vtxo.server_pubkey() || self.db.read(async |t|
+						t.fetch_ephemeral_tweak(policy.user_pubkey).await
+					).await?.is_some()
+				},
+				_ => false,
+			};
+			if owned {
+				self.update_mempool_spend(vtxo.id()).await;
+				claims.push(vtxo);
+			}
 		}
-
-		if !work.sweeps.is_empty() {
-			self.process_claims(work.sweeps).await?;
+		if !claims.is_empty() { self.process_claims(claims).await?; }
+		let splits = self.db.read(async |t| t.pending_expiry_splits().await).await?;
+		for (txid, root) in splits {
+			view.verify(&self.bitcoind).await?;
+			let ids = [root.id()];
+			// Match the fee-payout path's wallet -> view -> coin lock order.
+			// A reorg invalidation waiting on the view cannot invert it.
+			let mut wallet = self.watchman_wallet.lock().await;
+			if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
+				warn!(vtxo_id = %root.id(), "Expiry splitting needs confirmed usable watchman funds");
+				continue;
+			}
+			let mut fee_rate = self.fee_estimator.regular();
+			self.update_mempool_spend(root.id()).await;
+			if let Some(spend) = self.get_mempool_spend(root.id()) {
+				if spend.fee_rate >= fee_rate { continue; }
+				fee_rate = fee_rate.max(saturating_add_feerates(
+					spend.fee_rate, self.config.incremental_relay_fee
+				));
+			}
+			if let Err(error) = self.db.write(async |t| {
+				// A request may outlive a later refresh, offboard or key drop.
+				// Reprove preservation and retain its sorted path locks through
+				// publication, rather than trusting the old request's txid alone.
+				if !t.request_expiry_split(view, &root).await
+					.context("expiry split request revalidation")? { return Ok(()); }
+				let current = t.query_one("
+					SELECT progress_txid FROM expiry_split_request
+					WHERE vtxo_id=$1
+				", &[&root.id().to_string()]).await.context("expiry split instruction lookup")?;
+				ensure!(
+					current.get::<_, &str>("progress_txid") == txid.to_string(),
+					"expiry split instruction changed"
+				);
+				t.lock_unallocated_watchman_inputs(&ids).await.context("expiry split input locks")?;
+				self.process_progress_tx(&mut wallet, txid, &root, fee_rate).await
+					.context("expiry split progress publication")
+			}).await {
+				warn!(vtxo_id = %ids[0], progress_txid = %txid, error = %format!("{error:#}"),
+					"Expiry split remains pending");
+			}
 		}
-
+		// Reconcile financial writes from this sweep before waiting for another timer tick.
+		self.rebuild_expiry_state().await?;
 		Ok(())
 	}
 
@@ -534,9 +619,22 @@ impl Watchman {
 		vtxos: &[ServerVtxo],
 		fee_rate: FeeRate,
 	) -> anyhow::Result<()> {
-		let tx = self.build_claim_tx(vtxos, fee_rate).await?;
+		let tx = self.build_claim_tx(vtxos, fee_rate, None).await?;
 		let txid = tx.compute_txid();
-		bcd::broadcast_tx(&self.bitcoind, &tx).await?;
+		self.db.write(async |t| {
+			t.lock_watchman_claim_inputs(vtxos).await?;
+			for vtxo in vtxos.iter().filter(|v| *v.policy() == ServerVtxoPolicy::ServerOwned) {
+				// Exclude mempool effects so our existing native RBF path can
+				// replace its own claim; canonical consumption always refuses.
+				let output = self.bitcoind.try_get_tx_out(vtxo.point(), false).await?
+					.context("operator collateral is not canonically unspent")?;
+				ensure!(output.confirmations > 0 && output.value == vtxo.amount()
+					&& output.script_pub_key.script()? == vtxo.txout().script_pubkey,
+					"operator collateral differs from its confirmed server-owned output");
+			}
+			bcd::broadcast_tx(&self.bitcoind, &tx).await?;
+			Ok(())
+		}).await?;
 
 		let total_output_value = tx.output.iter().map(|o| o.value).sum::<Amount>();
 		let total_input_value = vtxos.iter().map(|v| v.amount()).sum::<Amount>();
@@ -562,6 +660,7 @@ impl Watchman {
 		&self,
 		vtxos: &[ServerVtxo],
 		fee_rate: FeeRate,
+		payout_outputs: Option<Vec<TxOut>>,
 	) -> anyhow::Result<Transaction> {
 		let mut inputs = Vec::with_capacity(vtxos.len());
 		let mut clauses = Vec::with_capacity(vtxos.len());
@@ -610,7 +709,7 @@ impl Watchman {
 		}
 
 		let lock_time = self.sync_height().height.to_locktime()
-			.expect("valid block height");
+			.context("invalid claim locktime")?;
 
 		// Output weight (non-witness data * 4)
 		// TxOut: 8 bytes value + varint script_pubkey_len + script_pubkey
@@ -630,7 +729,7 @@ impl Watchman {
 		let fee = fee_rate.fee_wu(total_weight)
 			.context("fee computation overflow")?;
 		let output_amount = match total_input_amount.checked_sub(fee) {
-			Some(rem) if rem >= P2TR_DUST => rem,
+			Some(rem) if rem >= P2TR_DUST || payout_outputs.is_some() => rem,
 			_ => bail!("insufficient funds: input {} < fee {}", total_input_amount, fee),
 		};
 
@@ -640,10 +739,12 @@ impl Watchman {
 		};
 
 		let mut tx = Transaction {
-			version: bitcoin::transaction::Version::TWO,
+			version: if payout_outputs.is_some() {
+				bitcoin::transaction::Version::non_standard(3)
+			} else { bitcoin::transaction::Version::TWO },
 			lock_time,
 			input: inputs,
-			output: vec![output],
+			output: payout_outputs.unwrap_or_else(|| vec![output]),
 		};
 
 		// Sign all inputs
@@ -722,9 +823,12 @@ impl Watchman {
 				break;
 			}
 
-			if let Err(e) = self.process_progress_tx(
-				&mut wallet, progress_txid, &vtxo, fee_rate,
-			).await {
+			if let Err(e) = self.db.write(async |t| {
+				// Normal exit progression competes with payouts for the same
+				// physical backing too. Hold its coin locks through publication.
+				t.lock_unallocated_watchman_inputs(&[vtxo.id()]).await?;
+				self.process_progress_tx(&mut wallet, progress_txid, &vtxo, fee_rate).await
+			}).await {
 				slog!(ProgressCpfpFailure, vtxo_id: vtxo.id(), txid: progress_txid,
 					error: e.to_string(),
 				);

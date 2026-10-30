@@ -184,7 +184,7 @@ async fn external_send_settles_after_upgrade() {
 
 	// The attempt the old server stored was ported into cln_xpay as pending,
 	// and the upgraded server ended it along with the attempt.
-	let db = Db::connect(&srv.config().postgres.clone()).await.expect("connect to db");
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.expect("connect to db");
 	let xpay_status = db.read(async |t| {
 		Ok(t.query_opt(
 			"SELECT status::text FROM cln_xpay WHERE payment_hash = $1",

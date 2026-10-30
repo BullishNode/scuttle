@@ -238,6 +238,7 @@ impl LightningDHelper {
 		writeln!(file, "dev-fast-gossip").unwrap();
 		writeln!(file, "dev-bitcoind-poll=1").unwrap();
 		writeln!(file, "allow-deprecated-apis=false").unwrap();
+		writeln!(file, "xpay-slow-mode=true").unwrap();
 		writeln!(file, "log-level=debug").unwrap();
 
 		if let Some(grpc_port) = self.state.lock().await.grpc_port {
@@ -319,6 +320,34 @@ impl LightningDHelper {
 		}
 	}
 
+	async fn is_xpay_slow_mode_enabled(&self) -> bool {
+		let (docker_exec, docker_image) = Lightningd::docker();
+		let mut cmd = if let (Some(docker_exec), Some(_)) = (docker_exec, docker_image) {
+			let mut cmd = Command::new(docker_exec);
+			cmd.args([
+				"exec", &self.container_name, "lightning-cli",
+				"--lightning-dir=/data/.lightning", "--rpc-file=/tmp/lightning-rpc",
+			]);
+			cmd
+		} else if let Some(exec) = Lightningd::exec() {
+			let mut cmd = Command::new(exec.with_file_name("lightning-cli"));
+			cmd.arg("--lightning-dir").arg(&self.config.lightning_dir);
+			cmd.arg("--rpc-file").arg(self.config.lightning_dir
+				.join(&self.config.network).join("lightning-rpc"));
+			cmd
+		} else {
+			return false;
+		};
+		cmd.args(["--network", &self.config.network, "-J", "listconfigs", "xpay-slow-mode"]);
+		cmd.kill_on_drop(true);
+		let Ok(output) = cmd.output().await else { return false; };
+		if !output.status.success() { return false; }
+		let Ok(config) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+			return false;
+		};
+		config.pointer("/configs/xpay-slow-mode/value_bool").and_then(serde_json::Value::as_bool) == Some(true)
+	}
+
 	async fn is_cln_ready(&self) -> bool {
 		if let Ok(mut client) = self.try_grpc_client().await {
 			let req = cln_rpc::GetinfoRequest{};
@@ -328,6 +357,7 @@ impl LightningDHelper {
 					debug!("GetInfoResponse={:?}", resp);
 
 					resp.warning_bitcoind_sync.is_none() && resp.warning_lightningd_sync.is_none()
+						&& self.is_xpay_slow_mode_enabled().await
 				},
 				Err(_) => false,
 			}
@@ -417,6 +447,11 @@ impl Lightningd {
 			state: Arc::new(Mutex::new(LightningDHelperState::default()))
 		};
 		Daemon::wrap(inner)
+	}
+
+	/// Kill and reap this node without letting it persist a graceful shutdown.
+	pub async fn crash_stop(&self) -> anyhow::Result<()> {
+		self.stop_with_signal(nix::sys::signal::Signal::SIGKILL).await
 	}
 
 	pub async fn try_grpc_client(&self) -> anyhow::Result<NodeClient<Channel>> {

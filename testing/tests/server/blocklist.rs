@@ -104,6 +104,7 @@ async fn blocklist_board_cosign_rejected() {
 
 	let mut rpc = srv.get_public_rpc().await;
 	let err = rpc.request_board_cosign(protos::BoardCosignRequest {
+		owner_proof: Some(super::test_owner_link(&srv, &user_key).await.into()),
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
 		expiry_height: expiry_height.into(),
@@ -171,6 +172,7 @@ async fn blocklist_board_register_rejected() {
 	// An old client sends no funding tx, so the cosign has nothing to check.
 	let mut rpc = srv.get_public_rpc().await;
 	let cosign_response = rpc.request_board_cosign(protos::BoardCosignRequest {
+		owner_proof: Some(super::test_owner_link(&srv, &user_key).await.into()),
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
 		expiry_height: expiry_height.into(),

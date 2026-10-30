@@ -37,15 +37,8 @@ pub enum LightningPaymentStatus {
 	Requested,
 	#[postgres(name = "submitted")]
 	Submitted,
-	/// NB: this is NOT authoritative for settlement. The lightning node can
-	/// settle a payment without this status write committing (a lost
-	/// optimistic-lock race, or a crash between recording the preimage and
-	/// updating the status), so the status may still read `Submitted` or even
-	/// `Failed` for a payment that actually completed. Never gate a
-	/// fund-releasing decision (revocation, refund, re-issuing sender vtxos) on
-	/// this variant: use `HtlcSettler::is_settled` or the transaction's
-	/// `ensure_not_settled`, as the `htlc_settlement` table is the single source
-	/// of truth for settlement.
+	/// Recorded outcome for this attempt and its linked funding sources.
+	/// The settlement WAL retains the preimage needed for on-chain claiming.
 	#[postgres(name = "succeeded")]
 	Succeeded,
 	#[postgres(name = "failed")]

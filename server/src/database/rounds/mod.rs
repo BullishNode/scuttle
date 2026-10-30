@@ -24,7 +24,7 @@ use crate::round::InteractiveParticipation;
 
 
 impl<'t> Tx<'t> {
-	#[tracing::instrument(skip(self, unsigned_funding_tx, input_vtxos, signed_tree, interactive_participations))]
+	#[tracing::instrument(skip(self, unsigned_funding_tx, input_vtxos, signed_tree, interactive_participations, owners, padding_ids))]
 	pub async fn finish_round(
 		&self,
 		round_seq: RoundSeq,
@@ -32,7 +32,16 @@ impl<'t> Tx<'t> {
 		input_vtxos: impl IntoIterator<Item = VtxoId>,
 		signed_tree: &CachedSignedVtxoTree,
 		interactive_participations: &HashMap<UnlockHash, InteractiveParticipation>,
+		padding_ids: &[VtxoId],
+		owners: (bitcoin::Network, &bitcoin::secp256k1::Keypair),
 	) -> anyhow::Result<()> {
+		let input_vtxos = input_vtxos.into_iter().collect::<Vec<_>>();
+		crate::database::expiry_guard::guard_obligation_changes(self, &input_vtxos).await?;
+		for hash in signed_tree.spec.spec.vtxos.iter().map(|v| v.unlock_hash) {
+			if let Some(row) = self.query_opt("SELECT id FROM round_participation WHERE unlock_hash=$1", &[&hash.to_string()]).await? {
+				crate::database::expiry_guard::guard_participation(self, row.get("id")).await?;
+			}
+		}
 		let funding_txid = unsigned_funding_tx.compute_txid();
 		info!("Storing finished round with funding txid {}", funding_txid);
 
@@ -111,9 +120,12 @@ impl<'t> Tx<'t> {
 			.upsert_signed_tx(signed_tree.internal_node_txs().iter().cloned())
 			.upsert_unsigned_tx(signed_tree.unsigned_leaf_txs().iter().map(Transaction::compute_txid))
 			.insert_oor_spent_vtxos(signed_tree.internal_vtxos())
-			.insert_unclaimed_vtxos(signed_tree.output_vtxos().map(ServerVtxo::from))
+			.insert_unclaimed_vtxos(signed_tree.output_vtxos()
+				.filter(|v| !padding_ids.contains(&v.id())).map(ServerVtxo::from))
+			.insert_private_padding_vtxos(signed_tree.output_vtxos()
+				.filter(|v| padding_ids.contains(&v.id())).map(ServerVtxo::from))
 			.mark_vtxos_round_spent(input_vtxos.into_iter().map(|id| (id, round_id)));
-		tree::execute_vtxo_tree_update(&self, update).await?;
+		tree::execute_vtxo_tree_update(self, update, Some(owners)).await?;
 
 		// register the funding output vtxos directly into the frontier
 		self.add_funding_vtxos_to_frontier(funding_txid, None).await?;
@@ -271,6 +283,8 @@ impl<'t> Tx<'t> {
 			unlock_hash, inputs,
 		);
 
+		crate::database::expiry_guard::guard_obligation_changes(self, inputs).await?;
+
 		// check that all inputs are free
 		for vtxo in query::get_vtxos_by_id(&self, inputs).await? {
 			vtxo.check_spendable(chain_tip)?;
@@ -306,6 +320,11 @@ impl<'t> Tx<'t> {
 		if vtxo_ids.is_empty() {
 			return Ok(());
 		}
+
+		crate::database::expiry_guard::guard_obligation_changes(self, vtxo_ids).await?;
+		let part = self.query_opt("SELECT id FROM round_participation WHERE unlock_hash=$1", &[&unlock_hash.to_string()]).await?
+			.context("round participation disappeared before forfeit commit")?;
+		crate::database::expiry_guard::guard_participation(self, part.get("id")).await?;
 
 		let vtxo_id_strs = vtxo_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
 		let serialized = forfeits.iter().map(|ff| serialize(ff)).collect::<Vec<_>>();
@@ -424,7 +443,7 @@ impl<'t> Tx<'t> {
 		// oor_spent_txid may have been set by set_forfeit_transactions after finish_round.
 		let update = tree::VtxoTreeUpdate::new()
 			.undo_round(round_db_id);
-		tree::execute_vtxo_tree_update(&self, update).await?;
+		tree::execute_vtxo_tree_update(self, update, None).await?;
 
 		// Delete round_part_input and round_part_output before round_participation (FK).
 		let stmt = self.prepare_typed(

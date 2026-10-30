@@ -120,12 +120,12 @@ impl BlockIndex {
 		}
 
 		if self.sync_tip() == bitcoind_tip {
+			self.notify_sync_complete().await?;
 			return Ok(false);
 		}
 
-		if bitcoind_tip.height < self.sync_tip().height {
-			panic!("bitcoind chain went backward. We probably restarted. Wait for bitcoind to sync and start again");
-		}
+		// Height is not monotonic: a shorter branch can have more chainwork.
+		// Find the common ancestor instead of panicking on its height.
 
 		debug!("Discovered new tip with height={} and hash={}", bitcoind_tip.height, bitcoind_tip.hash);
 
@@ -171,7 +171,15 @@ impl BlockIndex {
 			self.add_block(block_data).await?;
 		}
 
+		self.notify_sync_complete().await?;
 		Ok(true)
+	}
+
+	async fn notify_sync_complete(&self) -> anyhow::Result<()> {
+		for listener in &self.listeners {
+			listener.on_sync_complete(self.sync_tip()).await?;
+		}
+		Ok(())
 	}
 
 	/// Handles a chain reorganization by rolling back to the given block.

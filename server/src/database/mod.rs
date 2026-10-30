@@ -8,6 +8,18 @@ mod embedded {
 	}
 }
 
+pub mod fallback;
+pub mod expiry_attribution;
+pub(crate) mod expiry_guard;
+pub mod expiry_inventory;
+pub mod expiry_chain;
+pub mod expiry_decision;
+pub mod expiry_ownership;
+pub mod expiry_payout;
+pub(crate) mod expiry_lightning;
+pub(crate) mod expiry_receive;
+pub(crate) mod expiry_geometry;
+
 mod ban;
 pub mod block;
 pub mod data_migrations;
@@ -69,7 +81,7 @@ const NOARG: &[&bool] = &[];
 
 const DEFAULT_DATABASE: &str = "postgres";
 
-/// Advisory lock keys for `pg_advisory_xact_lock`.
+/// Advisory lock keys for PostgreSQL transaction and session locks.
 ///
 /// Each variant maps to a unique lock id. Using an enum avoids
 /// computing `hashtext(...)` at runtime and makes every lock site
@@ -147,7 +159,8 @@ pub enum MailboxPayload {
 
 #[derive(Clone)]
 pub struct Db {
-	pool: Pool<ConnectionManager>
+	pool: Pool<ConnectionManager>,
+	network: bitcoin::Network,
 }
 
 impl Db {
@@ -223,16 +236,16 @@ impl Db {
 		Ok(())
 	}
 
-	pub async fn connect(config: &PostgresConfig) -> anyhow::Result<Self> {
+	pub async fn connect(config: &PostgresConfig, network: bitcoin::Network) -> anyhow::Result<Self> {
 		let pool = Self::pool_connect(&config.name, config).await?;
 
-		let db = Db { pool };
+		let db = Db { pool, network };
 		db.run_migrations().await?;
 
 		Ok(db)
 	}
 
-	pub async fn create(config: &PostgresConfig) -> anyhow::Result<Self> {
+	pub async fn create(config: &PostgresConfig, network: bitcoin::Network) -> anyhow::Result<Self> {
 		info!("Checking if a database exists...");
 		let connect = Self::raw_connect(config).await;
 
@@ -250,7 +263,7 @@ impl Db {
 			conn.execute(&statement, &[]).await?;
 		}
 
-		Self::connect(config).await
+		Self::connect(config, network).await
 	}
 
 	/// Check out a raw pooled connection, below the [Db::read]/[Db::write]
@@ -315,7 +328,7 @@ impl Db {
 			.read_only(read_only)
 			.start().await
 			.context("unable to start db tx")?;
-		let tx = Tx { inner: &pgtx };
+		let tx = Tx { inner: &pgtx, network: self.network };
 		let ret = f(&tx).await;
 		if read_only {
 			// We want to commit read queries regardless of error because it's the
@@ -351,6 +364,7 @@ impl Db {
 /// A managed postgres DB transaction
 pub struct Tx<'t> {
 	inner: &'t tokio_postgres::Transaction<'t>,
+	network: bitcoin::Network,
 }
 
 impl<'t> std::ops::Deref for Tx<'t> {
@@ -370,11 +384,12 @@ impl<'t> Tx<'t> {
 	pub async fn upsert_vtxos(
 		&self,
 		vtxos: impl IntoIterator<Item = impl Borrow<ServerVtxo<Full>>>,
+		owners: Option<(bitcoin::Network, &secp256k1::Keypair)>,
 	) -> anyhow::Result<()> {
 		let vtxos = vtxos.into_iter().map(|v| v.borrow().clone()).collect::<Vec<_>>();
 		let update = tree::VtxoTreeUpdate::new()
 			.insert_spendable_vtxos(vtxos);
-		self.execute_vtxo_tree_update(update).await?;
+		self.execute_vtxo_tree_update(update, owners).await?;
 		Ok(())
 	}
 
@@ -454,8 +469,9 @@ impl<'t> Tx<'t> {
 	pub async fn execute_vtxo_tree_update(
 		&self,
 		update: tree::VtxoTreeUpdate,
+		owners: Option<(bitcoin::Network, &secp256k1::Keypair)>,
 	) -> anyhow::Result<u64> {
-		tree::execute_vtxo_tree_update(&self, update).await
+		tree::execute_vtxo_tree_update(self, update, owners).await
 	}
 
 	/// Queries a virtual transaction by txid
@@ -478,6 +494,7 @@ impl<'t> Tx<'t> {
 		mailbox_id: MailboxIdentifier,
 		vtxos: &[Vtxo<Full>],
 	) -> anyhow::Result<Option<Checkpoint>> {
+		self.require_registered_mailbox(mailbox_id).await?;
 		if vtxos.is_empty() {
 			return Ok(None);
 		}
@@ -545,6 +562,7 @@ impl<'t> Tx<'t> {
 		checkpoint: Checkpoint,
 		limit: usize,
 	) -> anyhow::Result<Vec<MailboxEntry>> {
+		self.require_registered_mailbox(mailbox_id).await?;
 		let statement = self.prepare(&format!("
 			WITH checkpoints AS (
 				SELECT DISTINCT checkpoint FROM mailbox
@@ -711,6 +729,7 @@ impl<'t> Tx<'t> {
 		mailbox_id: MailboxIdentifier,
 		unlock_hash: UnlockHash,
 	) -> anyhow::Result<Option<Checkpoint>> {
+		self.require_registered_mailbox(mailbox_id).await?;
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
@@ -745,6 +764,7 @@ impl<'t> Tx<'t> {
 		payment_hash: &str,
 		amount: Amount,
 	) -> anyhow::Result<Option<Checkpoint>> {
+		self.require_registered_mailbox(mailbox_id).await?;
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
@@ -790,6 +810,7 @@ impl<'t> Tx<'t> {
 		preimage: Option<Preimage>,
 		failure: Option<LightningFailureKind>,
 	) -> anyhow::Result<Option<Checkpoint>> {
+		self.require_registered_mailbox(mailbox_id).await?;
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
@@ -830,6 +851,7 @@ impl<'t> Tx<'t> {
 		mailbox_id: MailboxIdentifier,
 		vtxo_ids: &[VtxoId],
 	) -> anyhow::Result<Option<Checkpoint>> {
+		self.require_registered_mailbox(mailbox_id).await?;
 		if vtxo_ids.is_empty() {
 			return Ok(None);
 		}
@@ -973,7 +995,7 @@ impl<'t> Tx<'t> {
 				&forfeit_result.connector_vtxos, SpendState::OffboardConnector
 			)
 			.mark_vtxos_offboard_spent(offboard_triples);
-		tree::execute_vtxo_tree_update(&self, update).await?;
+		tree::execute_vtxo_tree_update(self, update, None).await?;
 
 		// register the connector output vtxo directly into the frontier, so
 		// the watchman can sweep it once the input vtxos have expired

@@ -13,8 +13,8 @@ async fn checkout_clears_abandoned_transaction() {
 	let mut postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 	// One connection, so the poisoned session is the one granted next.
 	postgres_cfg.max_connections = 1;
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 
 	db.write(async |t| {
 		t.execute("CREATE TABLE poison (id INT)", &[]).await?;

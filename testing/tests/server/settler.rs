@@ -21,8 +21,8 @@ async fn receive_insert_serializes_with_settlement() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.unwrap();
-	let db = Db::connect(&postgres_cfg).await.unwrap();
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
 
 	let secp = Secp256k1::new();
 	let node_key = SecretKey::from_slice(&[7; 32]).unwrap();
@@ -84,8 +84,8 @@ async fn subscribe_drains_batches() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.unwrap();
-	let db = Db::connect(&postgres_cfg).await.unwrap();
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
 
 	let rtmgr = RuntimeManager::new();
 	let mut settler = HtlcSettler::start(db, rtmgr, Duration::from_secs(9999));
@@ -125,8 +125,8 @@ async fn cross_process_settlement() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.unwrap();
-	let db = Db::connect(&postgres_cfg).await.unwrap();
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
 
 	// Writer: poll interval irrelevant.
 	let writer = HtlcSettler::start(db.clone(), RuntimeManager::new(), Duration::from_secs(9999));
@@ -160,8 +160,8 @@ async fn concurrent_subscribers_no_missed_wakeups() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.unwrap();
-	let db = Db::connect(&postgres_cfg).await.unwrap();
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
 
 	let rtmgr = RuntimeManager::new();
 	// No background poller — any missed wake-up will hang.
@@ -201,8 +201,8 @@ async fn subscribe_survives_db_read_error() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.unwrap();
-	let db = Db::connect(&postgres_cfg).await.unwrap();
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
 
 	let settler = HtlcSettler::start(db.clone(), RuntimeManager::new(), Duration::from_secs(9999));
 	let preimage = Preimage::random();

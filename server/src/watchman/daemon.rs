@@ -73,7 +73,7 @@ impl Daemon {
 		fs::create_dir_all(&cfg.data_dir).context("can't create dir")?;
 		fs_perms::harden(&cfg.data_dir, 0o700)?;
 
-		let db = database::Db::create(&cfg.postgres).await?;
+		let db = database::Db::create(&cfg.postgres, cfg.network).await?;
 
 		// Initiate key material.
 		let seed = {
@@ -120,7 +120,7 @@ impl Daemon {
 		info!("Starting server at {}", cfg.data_dir.display());
 
 		info!("Connecting to db at {}:{}", cfg.postgres.host, cfg.postgres.port);
-		let db = database::Db::connect(&cfg.postgres)
+		let db = database::Db::connect(&cfg.postgres, cfg.network)
 			.await
 			.context("failed to connect to db")?;
 
@@ -183,6 +183,7 @@ impl Daemon {
 		let listeners: Vec<Box<dyn ChainEventListener>> = vec![
 			Box::new(watchman_wallet.clone()),
 			Box::new(frontier.clone()),
+			Box::new(database::expiry_chain::ExpiryChainListener::start(db.clone(), BlockTable::Watchmand).await?),
 		];
 
 		let sync_manager = SyncManager::start(
@@ -239,6 +240,10 @@ impl Daemon {
 			rtmgr, sync_manager, watchman_wallet, frontier, watchman_handle,
 			bitcoin_address_blocklist,
 		})
+	}
+
+	pub(crate) fn watchman_wallet(&self) -> &InstrumentedLock<PersistedWallet> {
+		&self.watchman_wallet
 	}
 
 	pub fn watchman_handle(&self) -> &WatchmanHandle {

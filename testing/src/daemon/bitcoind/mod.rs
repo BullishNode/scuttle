@@ -152,7 +152,7 @@ impl Bitcoind {
 		}
 		// NB create the client before taking the state lock:
 		// new_async_client locks the state again to read the RPC port
-		let client = self.inner.new_async_client();
+		let client = self.inner.new_async_client(None);
 		self.inner.state.lock().async_client.get_or_insert(client).clone()
 	}
 
@@ -219,9 +219,18 @@ impl Bitcoind {
 	}
 
 	async fn generate_to_address(&self, block_num: u64, address: &Address) {
-		self.async_client().call_raw::<Vec<String>>(
-			"generatetoaddress", &[block_num.into(), address.to_string().into()],
-		).await.expect("failed to generate blocks");
+		// Mining is not idempotent: a timed-out request can still be running.
+		// Use one attempt per small batch, without changing the requested block count.
+		let client = self.inner.new_async_client(Some(1));
+		let mut remaining = block_num;
+		while remaining > 0 {
+			let batch = remaining.min(100);
+			let blocks = client.call_raw::<Vec<String>>(
+				"generatetoaddress", &[batch.into(), address.to_string().into()],
+			).await.expect("failed to generate blocks");
+			assert_eq!(blocks.len() as u64, batch, "mining returned fewer blocks than requested");
+			remaining -= batch;
+		}
 	}
 
 	pub async fn create_wallet(&self, name: &str) {
@@ -336,7 +345,7 @@ impl BitcoindHelper {
 		format!("127.0.0.1:{}", self.state.lock().p2p_port.expect("A P2P port has been assigned."))
 	}
 
-	fn new_async_client(&self) -> bitcoind_async_client::Client {
+	fn new_async_client(&self, max_retries: Option<u16>) -> bitcoind_async_client::Client {
 		let auth = match self.auth() {
 			rpc::Auth::CookieFile(p) => bitcoind_async_client::Auth::CookieFile(p),
 			rpc::Auth::UserPass(u, p) => bitcoind_async_client::Auth::UserPass(u, p),
@@ -348,7 +357,7 @@ impl BitcoindHelper {
 		let timeout = timeout_str.parse::<u64>()
 			.expect("BITCOINRPC_TIMEOUT_SECS is not a number");
 
-		bitcoind_async_client::Client::new(self.rpc_url(), auth, None, None, Some(timeout))
+		bitcoind_async_client::Client::new(self.rpc_url(), auth, max_retries, None, Some(timeout))
 			.expect("failed to create bitcoind rpc client")
 	}
 
@@ -482,7 +491,7 @@ impl DaemonHelper for BitcoindHelper {
 
 		if let Some(a) = &self.add_node {
 			let sync_client = rpc::BitcoinRpcClient::new(&self.rpc_url(), self.auth())?;
-			let client = self.new_async_client();
+			let client = self.new_async_client(None);
 			let peer = a.clone();
 			async {
 				// addnode returns null, which only the sync client accepts.

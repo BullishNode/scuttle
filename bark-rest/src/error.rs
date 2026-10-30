@@ -88,6 +88,7 @@ impl BadRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BadRequestError {
 	pub message: String,
 }
@@ -136,10 +137,18 @@ pub struct InternalServerError {
 	pub message: String,
 }
 
+/// Stable native SDK refusal. Consumers select the code, never diagnostic text.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FallbackRefusalError {
+	pub code: String,
+	pub message: String,
+}
+
 // NB since we don't do any tagging, this is not deserializable
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum ErrorResponse {
+	FallbackRefusal(FallbackRefusalError),
 	Unauthorized(UnauthorizedError),
 	BadRequest(BadRequestError),
 	UnprocessableEntity(UnprocessableEntityError),
@@ -150,6 +159,7 @@ pub enum ErrorResponse {
 impl ErrorResponse {
 	pub fn status_code(&self) -> StatusCode {
 		match self {
+			Self::FallbackRefusal(_) => StatusCode::CONFLICT,
 			Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
 			Self::BadRequest(_) => StatusCode::BAD_REQUEST,
 			Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -160,6 +170,7 @@ impl ErrorResponse {
 
 	pub fn message(&self) -> &str {
 		match self {
+			Self::FallbackRefusal(e) => &e.message,
 			Self::Unauthorized(e) => &e.message,
 			Self::BadRequest(e) => &e.message,
 			Self::UnprocessableEntity(e) => &e.message,
@@ -177,7 +188,11 @@ impl fmt::Display for ErrorResponse {
 
 impl From<anyhow::Error> for ErrorResponse {
 	fn from(error: anyhow::Error) -> Self {
-		if let Some(c) = error.downcast_ref::<NotFound>() {
+		if let Some(refusal) = bark::FallbackRefusal::from_error(&error) {
+			Self::FallbackRefusal(FallbackRefusalError {
+				code: refusal.code().to_owned(), message: refusal.to_string(),
+			})
+		} else if let Some(c) = error.downcast_ref::<NotFound>() {
 			Self::NotFound(NotFoundError {
 				resources: c.resources.clone(),
 				message: format!("{:#}", error),
@@ -267,3 +282,19 @@ pub async fn route_not_found(path: String) -> (StatusCode, Json<String>) {
 
 // Convenience type alias for handlers that return anyhow::Result
 pub type HandlerResult<T> = Result<T, ErrorResponse>;
+
+#[cfg(test)]
+mod fallback_tests {
+	use super::*;
+
+	#[test]
+	fn sdk_refusals_keep_fixed_message_and_code_over_rest() {
+		for refusal in [bark::FallbackRefusal::DecidedForFallback, bark::FallbackRefusal::ExpiredNewLightning] {
+			let response = ErrorResponse::from(anyhow::Error::new(refusal).context("private operation details"));
+			assert_eq!(response.status_code(), StatusCode::CONFLICT);
+			let body = serde_json::to_value(response).unwrap();
+			assert_eq!(body["code"], refusal.code());
+			assert_eq!(body["message"], refusal.to_string());
+		}
+	}
+}

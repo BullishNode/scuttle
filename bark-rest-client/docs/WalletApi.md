@@ -11,6 +11,7 @@ Method | HTTP request | Description
 [**connected**](WalletApi.md#connected) | **GET** /api/v1/wallet/connected | Check server connection
 [**create_wallet**](WalletApi.md#create_wallet) | **POST** /api/v1/wallet/create | Create a wallet
 [**debug_info**](WalletApi.md#debug_info) | **GET** /api/v1/wallet/debug-info | Get wallet debug info
+[**fallback_registration**](WalletApi.md#fallback_registration) | **GET** /api/v1/wallet/fallback | Get fallback registration and payout address
 [**get_vtxo**](WalletApi.md#get_vtxo) | **GET** /api/v1/wallet/vtxos/{id} | Get VTXO detail
 [**get_vtxo_encoded**](WalletApi.md#get_vtxo_encoded) | **GET** /api/v1/wallet/vtxos/{id}/encoded | Get encoded VTXO
 [**history**](WalletApi.md#history) | **GET** /api/v1/wallet/history | Get wallet history (deprecated)
@@ -219,6 +220,31 @@ This endpoint does not need any parameter.
 ### Return type
 
 [**models::DebugInfo**](DebugInfo.md)
+
+### Authorization
+
+[bearer](../README.md#bearer)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## fallback_registration
+
+> models::FallbackRegistrationInfo fallback_registration()
+Get fallback registration and payout address
+
+### Parameters
+
+This endpoint does not need any parameter.
+
+### Return type
+
+[**models::FallbackRegistrationInfo**](FallbackRegistrationInfo.md)
 
 ### Authorization
 
