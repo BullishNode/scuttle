@@ -54,6 +54,14 @@ impl Tx<'_> {
 		).await?;
 		let payee = match &ownership.disposition {
 			OwnershipDisposition::Customer { user_pubkey } => {
+				// Exercise the new resolution alongside the authoritative registered
+				// destination until the coordinated fresh-store payout switch.
+				match self.derived_expiry_owner(&ownership).await? {
+					Attribution::Owned { .. } => debug!(vtxo_id = %ownership.id,
+						"Shadow expiry mailbox and Taproot destination resolved"),
+					Attribution::Unresolved => debug!(vtxo_id = %ownership.id,
+						"Shadow expiry ownership remains unresolved"),
+				}
 				match self.expiry_owner(*user_pubkey, network, server_mailbox_key).await? {
 					Attribution::Owned { mailbox_pk, spk } =>
 						Some(VerifiedPayee { mailbox: mailbox_pk, script: spk }),

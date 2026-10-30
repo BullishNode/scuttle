@@ -112,6 +112,63 @@ async fn customer_births_shadow_their_owners_once() {
 }
 
 #[tokio::test]
+async fn derived_expiry_owner_uses_the_stage_selected_key() {
+	let (_ctx, db) = test_db("derived_expiry_stage_owner").await;
+	let server = super::super::test_server_mailbox_key();
+	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
+	db.write(async |tx| tx.upsert_vtxos([coin.clone()], Some((Network::Regtest, server))).await).await.unwrap();
+	let mut proposal = OwnershipProposal {
+		id: coin.id(), gross: coin.amount(), updated_at: Local::now(), spend_state: SpendState::Spendable,
+		disposition: OwnershipDisposition::Customer { user_pubkey: coin.policy().user_pubkey().unwrap() },
+		evidence: Some(OwnershipEvidence::Pubkey), cancellations: Vec::new(),
+		has_stored_preimage: false, needs_chain_progress: false,
+	};
+	let original = Attribution::Owned { mailbox_pk: server.public_key(),
+		spk: bitcoin::ScriptBuf::new_p2tr(&ark::SECP, server.x_only_public_key().0, None) };
+	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), original);
+
+	let recipient = Keypair::from_seckey_slice(&ark::SECP, &[17; 32]).unwrap();
+	let destination = Keypair::from_seckey_slice(&ark::SECP, &[37; 32]).unwrap();
+	super::super::register_test_owners(&db, server, &recipient, &[destination]).await;
+	let expected = Attribution::Owned { mailbox_pk: recipient.public_key(),
+		spk: bitcoin::ScriptBuf::new_p2tr(&ark::SECP, recipient.x_only_public_key().0, None) };
+	assert_ne!(expected, original);
+	// Test the projection of an already selected economic stage. These are
+	// not fabricated participation/settlement receipts and authorize no payout.
+	proposal.disposition = OwnershipDisposition::Customer { user_pubkey: destination.public_key() };
+	proposal.evidence = Some(OwnershipEvidence::InputOwner);
+	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), expected);
+	proposal.evidence = Some(OwnershipEvidence::LightningReceiveClaim {
+		source: coin.id(), output: VTXO_VECTORS.arkoor2_vtxo.id(),
+	});
+	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), expected);
+	proposal.evidence = None;
+	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), Attribution::Unresolved);
+
+	proposal.disposition = OwnershipDisposition::Customer { user_pubkey: coin.policy().user_pubkey().unwrap() };
+	proposal.evidence = Some(OwnershipEvidence::Pubkey);
+	// Joint evidence was verified at admission. This shadow lookup neither
+	// rereads the old signature nor changes the authoritative registered path.
+	db.write(async |tx| Ok(tx.execute("UPDATE expiry_owner_key SET signature=$1 WHERE user_pubkey=$2",
+		&[&"00".repeat(64), &coin.policy().user_pubkey().unwrap().to_string()]).await?)).await.unwrap();
+	assert_eq!(db.read(async |tx| tx.expiry_owner(coin.policy().user_pubkey().unwrap(), Network::Regtest, server).await)
+		.await.unwrap(), Attribution::Unresolved);
+	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), original);
+	db.write(async |tx| Ok(tx.execute("UPDATE coin_owner SET mailbox_pk=$1 WHERE vtxo_id=$2",
+		&[&recipient.public_key().to_string(), &coin.id().to_string()]).await?)).await.unwrap();
+	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), Attribution::Unresolved);
+	db.write(async |tx| Ok(tx.execute("DELETE FROM coin_owner WHERE vtxo_id=$1", &[&coin.id().to_string()]).await?)).await.unwrap();
+	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), Attribution::Unresolved);
+	proposal.disposition = OwnershipDisposition::Customer { user_pubkey: Keypair::from_seckey_slice(&ark::SECP, &[38; 32]).unwrap().public_key() };
+	proposal.evidence = Some(OwnershipEvidence::InputOwner);
+	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), Attribution::Unresolved);
+	proposal.disposition = OwnershipDisposition::Customer { user_pubkey: destination.public_key() };
+	db.write(async |tx| Ok(tx.execute("UPDATE owner_key SET mailbox_pk=$1 WHERE user_pubkey=$2",
+		&[&"00".repeat(33), &destination.public_key().to_string()]).await?)).await.unwrap();
+	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), Attribution::Unresolved);
+}
+
+#[tokio::test]
 async fn supplied_duplicate_links_are_all_verified_and_batches_roll_back() {
 	let (_ctx, db) = test_db("duplicate_owner_links").await;
 	let server = super::super::test_server_mailbox_key();
