@@ -6,6 +6,8 @@ mod state;
 pub use self::selection::{FilterVtxos, RefreshStrategy, VtxoFilter};
 pub use self::state::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
+use std::time::Duration;
+
 use anyhow::Context;
 use bitcoin::secp256k1::PublicKey;
 use log::{debug, error, info, trace, warn};
@@ -58,6 +60,8 @@ pub enum ServerStatusAdoption {
 	Spendable,
 	/// The server considers the VTXO spent.
 	Spent,
+	/// Allocated customer principal awaiting independent payout verification.
+	FallbackPending,
 	/// Neither spendable nor spent: the server is still waiting on a preimage
 	/// or on the VTXO's transaction chain. No wallet state describes this, and
 	/// finishing that flow is what decides where the VTXO belongs.
@@ -73,6 +77,7 @@ impl ServerStatusAdoption {
 		Ok(match spend_state {
 			VtxoSpendState::Spendable => ServerStatusAdoption::Spendable,
 			VtxoSpendState::Spent => ServerStatusAdoption::Spent,
+			VtxoSpendState::FallbackPending => ServerStatusAdoption::FallbackPending,
 			state @ (
 				VtxoSpendState::Unclaimed
 				| VtxoSpendState::Unregistered
@@ -359,9 +364,9 @@ impl Wallet {
 	}
 
 	/// Ask the server for the status of `vtxo_id` and move the wallet's vtxo along
-	/// with it. Adoption only ever moves a vtxo towards spent or in-flight
-	/// resolution: a vtxo the wallet has as spent stays spent, even when the server
-	/// reports it spendable.
+	/// with it. An ordinary spendable reply keeps a locally spent vtxo spent.
+	/// A fallback-pending reply may restore it as awaiting settlement only after
+	/// its complete signed body has been validated against the chain.
 	///
 	/// A locked vtxo is left alone and the server isn't asked at all: returns
 	/// `Ok(None)`. Unlock the vtxo first if you want its status adopted.
@@ -396,7 +401,25 @@ impl Wallet {
 				}
 			},
 			ServerStatusAdoption::Spent => {
-				self.mark_vtxos_as_spent(&[vtxo_id]).await?;
+				self.trust_ordinary_spends(&[vtxo_id]).await?;
+			},
+			ServerStatusAdoption::FallbackPending => {
+				// An actual pending status fences previously validated principal even
+				// if the chain source is unavailable. Unvalidated spent history still
+				// requires full validation before it can acquire any positive value.
+				if stored.state == VtxoState::Spendable {
+					let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
+					let mut snapshot = self.inner.db.get_fallback_snapshot().await?;
+					if !snapshot.adopted_payout_vtxos.contains(&vtxo_id)
+						&& self.inner.db.get_wallet_vtxo(vtxo_id).await?
+							.is_some_and(|current| current.state == VtxoState::Spendable) {
+						snapshot.awaiting_settlement.insert(vtxo_id);
+						self.inner.db.store_fallback_snapshot(&snapshot).await?;
+					}
+				}
+				let coin = self.get_full_vtxo(vtxo_id).await?;
+				self.validate_vtxo(&coin).await?;
+				self.retain_fallback_pending(&[coin]).await?;
 			},
 			ServerStatusAdoption::InFlight(_) => {},
 		}

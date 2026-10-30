@@ -165,6 +165,7 @@ impl ClnNodeInfo {
 			xpay_config.clone(),
 			settler.clone(),
 			mailbox_manager.clone(),
+			payment_guards.clone(),
 		).await.context("failed to start ClnXpay")?;
 
 		let online = ClnNodeOnlineState {

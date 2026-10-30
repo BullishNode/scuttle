@@ -335,7 +335,7 @@ async fn delegated_refresh_from_legacy_hashlock_round() {
 
 	// Make sure the round was actually conducted with the legacy clauses,
 	// otherwise this test silently degrades into a regular refresh test
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let round = db.read(async |t| {
 		let id = t.get_last_round_id().await?.expect("no round in db");
 		Ok(t.get_round(id).await?.expect("round not in db"))
@@ -699,6 +699,7 @@ async fn stepwise_round() {
 	// need the chain).
 	let full_input = bark.get_full_vtxo(inputs[0].vtxo.id()).await.unwrap();
 	let participation = RoundParticipation {
+		owner_proofs: Default::default(),
 		inputs: vec![full_input],
 		outputs: vec![VtxoRequest {
 			policy: VtxoPolicy::Pubkey(PubkeyVtxoPolicy {
@@ -744,7 +745,7 @@ async fn stepwise_round() {
 				break;
 			} else {
 				if let RoundEvent::Finished(_) = event {
-					let status = ours.state_mut().sync(&bark).await.unwrap();
+					let status = ours.sync(&bark).await.unwrap();
 					panic!("Our round state says ongoing participation but we just got round \
 						finished event. status: {:?}", status,
 					);
@@ -774,7 +775,7 @@ async fn stepwise_round() {
 		let states = print_pending_rounds(&bark).await;
 		if let Some(ours) = states.into_iter().find(|s| s.id() == state_id) {
 			let mut ours = bark.lock_wait_round_state(ours.id()).await.unwrap().unwrap();
-			debug!("Result: {:#?}", ours.state_mut().sync(&bark).await);
+			debug!("Result: {:#?}", ours.sync(&bark).await);
 		} else {
 			info!("Our state is gone!");
 			break;
@@ -798,12 +799,13 @@ async fn interactive_round_redelegates_the_inputs_it_did_not_take() {
 	//! the two a round will pick. The round settles it, taking the shared
 	//! input, and the inputs it did not take are re-delegated.
 
+	require_bark_version!(> "0.7.1");
+
 	// Unlike the other round participation tests, this one drives its
 	// refreshes through the CLI, so it exercises the bark binary under test
 	// rather than the current bark-wallet crate. It needs a binary that
 	// re-delegates a participation that lost inputs instead of failing it
 	// wholesale.
-	require_bark_version!(> "0.7.1");
 
 	let ctx = TestContext::new("bark/interactive_round_redelegates_the_inputs_it_did_not_take").await;
 	let srv = ctx.captaind("server").cfg(|cfg| {

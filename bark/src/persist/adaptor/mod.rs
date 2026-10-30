@@ -61,7 +61,7 @@ use lightning_invoice::Bolt11Invoice;
 use serde::{de::DeserializeOwned, Serialize};
 
 use ark::lightning::{PaymentHash, Preimage};
-use ark::{Vtxo, VtxoId};
+use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::vtxo::Full;
 
 use crate::actions::{WalletActionCheckpoint, WalletActionId};
@@ -72,7 +72,7 @@ use crate::movement::{
 use crate::movement::update::MovementUpdate;
 use crate::persist::BarkPersister;
 use crate::persist::models::{
-	PaidInvoice, RoundStateId, SerdeExitChildTx, SerdeRoundState, SerdeVtxo, SerdeVtxoKey,
+	FallbackRegistration,	PaidInvoice, RoundStateId, SerdeExitChildTx, SerdeRoundState, SerdeVtxo, SerdeVtxoKey,
 	SettledLightningReceive, StoredExit, StoredRoundState, Unlocked, wallet_vtxo_from_full,
 };
 use crate::round::RoundState;
@@ -117,6 +117,10 @@ pub mod partition {
 	/// An index from [WalletActionId] to the movement that action owns, so a
 	/// re-driven action step reuses its movement instead of duplicating it.
 	pub const MOVEMENT_ACTION: u8 = 17;
+
+	pub const FALLBACK_RECORD: u8 = 18;
+	pub const FALLBACK_SNAPSHOT: u8 = 19;
+	pub const PENDING_FALLBACK_RECORD: u8 = 20;
 
 	pub const LAST_IDS: u8 = u8::MAX;
 }
@@ -695,6 +699,10 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		let mut lock = self.inner.write().await;
 
 		for (vtxo, state) in vtxos {
+			// BarkPersister::store_vtxos is insert-only. In particular a
+			// recovery retry must never replace a live operation's holder or
+			// resurrect a Spent row. Keep lookup+insert under this same lock.
+			if get_vtxo(&*lock, vtxo.id()).await?.is_some() { continue; }
 			let serde_vtxo = SerdeVtxo {
 				vtxo: (*vtxo).clone(),
 				states: vec![(*state).clone()],
@@ -713,6 +721,18 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			lock.put(record).await?;
 		}
 		Ok(())
+	}
+
+	async fn update_vtxo_witnesses(&self, vtxo: &Vtxo<Full>) -> anyhow::Result<bool> {
+		ensure!(vtxo.has_all_witnesses(), "replacement VTXO witnesses are incomplete");
+		let mut lock = self.inner.write().await;
+		let Some(mut record) = lock.get(partition::VTXO, &vtxo.id().to_bytes()).await? else { return Ok(false); };
+		let mut stored = record.to_data::<SerdeVtxo>()?;
+		ensure!(stored.vtxo.to_bare().serialize() == vtxo.to_bare().serialize(), "replacement VTXO changes its bare identity");
+		stored.vtxo = vtxo.clone();
+		record.data = serde_json::to_vec(&stored)?;
+		lock.put(record).await?;
+		Ok(true)
 	}
 
 	async fn get_wallet_vtxo(&self, id: VtxoId) -> anyhow::Result<Option<WalletVtxo>> {
@@ -872,6 +892,18 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		Ok(())
 	}
 
+	async fn retire_vtxo_lock(
+		&self, vtxo_id: VtxoId, holder: Option<&VtxoLockHolder>,
+	) -> anyhow::Result<bool> {
+		let mut lock = self.inner.write().await;
+		let Some(coin) = get_vtxo(&*lock, vtxo_id).await? else { return Ok(false); };
+		if coin.current_state() == Some(&VtxoState::Spent) { return Ok(true); }
+		let expected = VtxoState::Locked { holder: holder.cloned() };
+		if coin.current_state() != Some(&expected) { return Ok(false); }
+		update_vtxo_state_checked(&mut *lock, vtxo_id, VtxoState::Spent, &[VtxoStateKind::Locked]).await?;
+		Ok(true)
+	}
+
 	async fn update_vtxo_states_checked(
 		&self,
 		vtxo_ids: &[VtxoId],
@@ -979,6 +1011,50 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			None => Ok(None),
 		}
 	}
+
+	async fn get_fallback_snapshot(&self) -> anyhow::Result<crate::FallbackSnapshot> {
+		Ok(self.inner.read().await.get(partition::FALLBACK_SNAPSHOT, &[]).await?
+			.map(|record| record.to_data()).transpose()?.unwrap_or_default())
+	}
+
+	async fn store_fallback_snapshot(&self, snapshot: &crate::FallbackSnapshot) -> anyhow::Result<()> {
+		self.inner.write().await.put(Record::from_data(partition::FALLBACK_SNAPSHOT, &[], None, snapshot)?).await
+	}
+
+	async fn get_fallback_record(&self) -> anyhow::Result<Option<FallbackRegistration>> {
+		self.inner.read().await.get(partition::FALLBACK_RECORD, &[]).await?
+			.map(|r| r.to_data()).transpose()
+	}
+
+	async fn store_fallback_record(&self, record: &FallbackRegistration) -> anyhow::Result<()> {
+		let mut guard = self.inner.write().await;
+		for partition in [partition::FALLBACK_RECORD, partition::PENDING_FALLBACK_RECORD] {
+			if let Some(stored) = guard.get(partition, &[]).await? {
+				ensure!(stored.to_data::<FallbackRegistration>()?.same_binding(record), "immutable fallback record mismatch");
+			}
+		}
+		guard.put(Record::from_data(partition::FALLBACK_RECORD, &[], None, record)?).await?;
+		guard.delete(partition::PENDING_FALLBACK_RECORD, &[]).await?;
+		Ok(())
+	}
+
+	async fn get_pending_fallback_record(&self) -> anyhow::Result<Option<FallbackRegistration>> {
+		let guard = self.inner.read().await;
+		if guard.get(partition::FALLBACK_RECORD, &[]).await?.is_some() { return Ok(None); }
+		guard.get(partition::PENDING_FALLBACK_RECORD, &[]).await?.map(|r| r.to_data()).transpose()
+	}
+
+	async fn store_pending_fallback_record(&self, record: &FallbackRegistration) -> anyhow::Result<()> {
+		let mut guard = self.inner.write().await;
+		for partition in [partition::FALLBACK_RECORD, partition::PENDING_FALLBACK_RECORD] {
+			if let Some(stored) = guard.get(partition, &[]).await? {
+				ensure!(stored.to_data::<FallbackRegistration>()?.same_binding(record), "immutable fallback record mismatch");
+			}
+		}
+		if guard.get(partition::FALLBACK_RECORD, &[]).await?.is_some() { return Ok(()); }
+		guard.put(Record::from_data(partition::PENDING_FALLBACK_RECORD, &[], None, record)?).await
+	}
+
 
 	async fn get_public_key_idx(&self, public_key: &PublicKey) -> anyhow::Result<Option<u32>> {
 		match self.inner.read().await

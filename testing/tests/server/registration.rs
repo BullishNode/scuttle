@@ -25,7 +25,7 @@ async fn register_vtxo_transactions_accepts_duplicate_ids() {
 
 	// Board registration stored the fully-signed vtxo; replay it twice in
 	// one request through the real RPC.
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let blob = db.read(async |t| {
 		let row = t.query_one(
 			"SELECT vtxo FROM vtxo WHERE vtxo_id = $1", &[&vtxo_ids[0].to_string()],
@@ -104,7 +104,7 @@ async fn register_vtxo_transactions_refuses_child_of_exited_input() {
 	assert!(err.message().contains("exited onchain"), "unexpected error: {}", err.message());
 
 	// the child stays unregistered
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let state = db.read(async |t| {
 		let row = t.query_one(
 			"SELECT spend_state::TEXT FROM vtxo WHERE vtxo_id = $1",
@@ -244,7 +244,7 @@ async fn reanchoring_cannot_make_watchman_sweep_offboard_connector_early() {
 		connector_point, tip, min_expiry,
 	);
 
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let connector_expiry = db.read(async |t| {
 		let row = t.query_one(
 			"SELECT expiry FROM vtxo WHERE vtxo_id = $1", &[&connector_point.to_string()],
@@ -277,11 +277,13 @@ async fn board_output_is_bound_to_one_exit_tx() {
 	let vout = funding.output.iter().position(|o| o.script_pubkey == script).unwrap();
 	let utxo = OutPoint::new(txid, vout as u32);
 
+	let owner_proof = super::test_owner_link(&srv, &user).await;
 	let cosign = async |fee: Amount| {
 		let builder = BoardBuilder::new(
 			user.public_key(), expiry, info.server_pubkey, info.vtxo_exit_delta,
 		).set_funding_details(amount, fee, utxo).unwrap().generate_user_nonces();
 		let resp = srv.get_public_rpc().await.request_board_cosign(protos::BoardCosignRequest {
+			owner_proof: Some(owner_proof.into()),
 			amount: amount.to_sat(),
 			utxo: utxo.serialize(),
 			expiry_height: expiry.to_u32(),
@@ -303,7 +305,7 @@ async fn board_output_is_bound_to_one_exit_tx() {
 
 	// An output cosigned before the binding existed can still be registered
 	// with only one of its exits.
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let unbind = async || {
 		db.write(async |t| Ok(t.execute("DELETE FROM board_exit", &[]).await?)).await.unwrap();
 	};

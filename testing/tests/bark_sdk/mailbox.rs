@@ -82,7 +82,7 @@ async fn recovery_leaves_regular_mailbox_checkpoint_untouched() {
 	assert_eq!(target_vtxos.len(), 1, "target should hold the arkoor-received vtxo");
 	let vtxo_id = target_vtxos[0].id().to_string();
 
-	let db = Db::connect(&srv.config().postgres).await.expect("connect to captaind postgres");
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.expect("connect to captaind postgres");
 	let recovery_checkpoint: i64 = db.read(async |t| {
 		let row = t.query_one(
 			"SELECT checkpoint FROM mailbox \

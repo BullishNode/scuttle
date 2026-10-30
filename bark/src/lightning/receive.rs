@@ -238,6 +238,21 @@ impl Wallet {
 	///
 	/// See [`Bolt11InvoiceBuilder::claim_destination`] for the trust model,
 	/// and [`Self::bolt11_invoice_builder`] for more options.
+	///
+	/// Trust model: the claim arkoor is built directly against
+	/// `claim_destination`'s policy, so the funds are signed to the
+	/// destination the moment they're claimed. This wallet never holds a
+	/// key that can spend them, so it has no custodial control and cannot
+	/// redirect — a malicious or compromised caller of this method cannot
+	/// steal the payment unless they provide a different address than the
+	/// desired end user.
+	///
+	/// Mailbox delivery is a separate step that only this wallet performs.
+	/// The parked delivery action resumes automatically on restart. If
+	/// delivery does not occur, the server can pay an expired receive to
+	/// the recipient's registered on-chain fallback script without this
+	/// wallet. The Ark server verifies the destination's signed owner link
+	/// and fallback registration before it creates the invoice.
 	pub async fn bolt11_invoice_for_address(
 		&self,
 		amount: Amount,

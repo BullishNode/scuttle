@@ -585,7 +585,27 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 
 #[cfg(test)]
 mod tests {
-	use super::{CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
+	use super::{check_handshake, ConnectError, CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
+	use crate::{protos, pver};
+
+	#[test]
+	fn joint_authorization_client_requires_a_capable_server() {
+		let old_server = protos::HandshakeResponse {
+			min_protocol_version: pver::PROTOCOL_VERSION_PPM_FEE_TOTAL,
+			max_protocol_version: pver::PROTOCOL_VERSION_OWNER_PROOF,
+			..Default::default()
+		};
+		assert!(matches!(check_handshake(old_server), Err(ConnectError::ProtocolVersionMismatchServerTooOld {
+			client_min: pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF,
+			server_max: pver::PROTOCOL_VERSION_OWNER_PROOF,
+		})));
+		let capable_server = protos::HandshakeResponse {
+			min_protocol_version: pver::PROTOCOL_VERSION_PPM_FEE_TOTAL,
+			max_protocol_version: pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF,
+			..Default::default()
+		};
+		assert_eq!(check_handshake(capable_server).unwrap(), pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF);
+	}
 
 	#[test]
 	fn no_transport_backend_error_mentions_feature_selection() {

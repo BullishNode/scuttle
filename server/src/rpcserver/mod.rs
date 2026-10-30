@@ -23,7 +23,7 @@ use tracing::{trace, warn};
 
 use server_rpc::{pver, RequestExt};
 
-use crate::error::{BadArgument, NotFound, Unavailable, UnusableInputs};
+use crate::error::{BadArgument, FallbackRefusal, OwnershipRefusal, NotFound, RoundCancelledBeforeForfeit, Unavailable, UnusableInputs};
 
 
 /// The minimum protocol version supported by the server.
@@ -34,7 +34,7 @@ pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_PPM_FEE_TOTAL;
 /// The maximum protocol version supported by the server.
 ///
 /// For info on protocol versions, see [server_rpc::pver] module documentation.
-pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES;
+pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF;
 
 /// Default maximum number of remotely-reset HTTP/2 streams that may sit in a
 /// connection's accept queue before h2 closes the connection.
@@ -84,6 +84,21 @@ impl ToStatus for anyhow::Error {
 				metadata.insert("identifiers", ids);
 			}
 			tonic::Status::with_metadata(tonic::Code::NotFound, format!("{:#}", self), metadata)
+		} else if let Some(cancelled) = self.downcast_ref::<RoundCancelledBeforeForfeit>() {
+			let mut metadata = tonic::metadata::MetadataMap::new();
+			metadata.insert("abandon-reason", tonic::metadata::MetadataValue::from_static("round_cancelled_before_forfeit"));
+			metadata.insert("identifiers", cancelled.0.to_string().parse().expect("unlock hashes are ASCII"));
+			tonic::Status::with_metadata(tonic::Code::NotFound, format!("{:#}", self), metadata)
+		} else if let Some(refusal) = self.downcast_ref::<FallbackRefusal>() {
+			let mut metadata = tonic::metadata::MetadataMap::new();
+			metadata.insert("abandon-reason", tonic::metadata::MetadataValue::from_static(refusal.reason()));
+			metadata.insert("identifiers", refusal.vtxo_id().to_string().parse().expect("VTXO identifiers are ASCII"));
+			tonic::Status::with_metadata(tonic::Code::InvalidArgument, format!("{:#}", self), metadata)
+		} else if let Some(refusal) = self.downcast_ref::<OwnershipRefusal>() {
+			let mut metadata = tonic::metadata::MetadataMap::new();
+			metadata.insert("abandon-reason", tonic::metadata::MetadataValue::from_static(refusal.reason()));
+			metadata.insert("identifiers", refusal.public_key().to_string().parse().expect("public keys are ASCII"));
+			tonic::Status::with_metadata(tonic::Code::InvalidArgument, format!("{:#}", self), metadata)
 		} else if let Some(ui) = self.downcast_ref::<UnusableInputs>() {
 			// Like a bad argument, but we attach the offending VTXO ids so the
 			// client can drop exactly those inputs and retry without them.
@@ -225,3 +240,62 @@ fn validate_pver<T>(req: &tonic::Request<T>) -> Result<u64, tonic::Status> {
 	Ok(pver)
 }
 
+#[cfg(test)]
+mod fallback_tests {
+	use super::*;
+	use ::ark::test_util::VTXO_VECTORS;
+	use ::ark::tree::signed::UnlockHash;
+	use bitcoin::hashes::Hash;
+
+	#[test]
+	fn cancelled_round_metadata_binds_requested_hash_through_error_context() {
+		for hash in [UnlockHash::from_byte_array([1; 32]), UnlockHash::from_byte_array([2; 32])] {
+			let error = anyhow::Error::new(RoundCancelledBeforeForfeit(hash))
+				.context("round participation status failed");
+			let status = error.to_status();
+			assert_eq!(status.code(), tonic::Code::NotFound);
+			assert_eq!(status.metadata().get("abandon-reason").unwrap().to_str().unwrap(),
+				"round_cancelled_before_forfeit");
+			assert_eq!(status.metadata().get("identifiers").unwrap().to_str().unwrap(), hash.to_string());
+			assert_eq!(status.metadata().get_all("identifiers").iter().count(), 1);
+			assert_eq!(status.metadata().get_all("abandon-reason").iter().count(), 1);
+		}
+	}
+
+	#[test]
+	fn unknown_round_does_not_gain_cancellation_metadata_from_error_text() {
+		let hash = UnlockHash::from_byte_array([3; 32]);
+		let error = anyhow::Error::new(NotFound::new([hash], "round_cancelled_before_forfeit"))
+			.context("round participation status failed");
+		let status = error.to_status();
+		assert_eq!(status.code(), tonic::Code::NotFound);
+		assert_eq!(status.metadata().get("identifiers").unwrap().to_str().unwrap(), hash.to_string());
+		assert!(status.metadata().get("abandon-reason").is_none());
+	}
+
+	#[test]
+	fn ownership_refusal_metadata_names_actual_output_key() {
+		let key = VTXO_VECTORS.board_vtxo.user_pubkey();
+		for refusal in [OwnershipRefusal::Required(key), OwnershipRefusal::Invalid(key),
+			OwnershipRefusal::Conflicting(key), OwnershipRefusal::UnregisteredMailbox(key)] {
+			let reason = refusal.reason();
+			let status = anyhow::Error::new(refusal).context("admission refused").to_status();
+			assert_eq!(status.code(), tonic::Code::InvalidArgument);
+			assert_eq!(status.metadata().get("abandon-reason").unwrap().to_str().unwrap(), reason);
+			assert_eq!(status.metadata().get("identifiers").unwrap().to_str().unwrap(), key.to_string());
+		}
+	}
+
+	#[test]
+	fn fallback_refusal_metadata_survives_error_context() {
+		let id = VTXO_VECTORS.board_vtxo.id();
+		for refusal in [FallbackRefusal::DecidedForFallback(id), FallbackRefusal::ExpiredNewLightning(id)] {
+			let reason = refusal.reason();
+			let error = anyhow::Error::new(refusal).context("outer operation failed");
+			let status = error.to_status();
+			assert_eq!(status.code(), tonic::Code::InvalidArgument);
+			assert_eq!(status.metadata().get("abandon-reason").unwrap().to_str().unwrap(), reason);
+			assert_eq!(status.metadata().get("identifiers").unwrap().to_str().unwrap(), id.to_string());
+		}
+	}
+}

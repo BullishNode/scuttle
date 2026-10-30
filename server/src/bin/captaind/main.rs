@@ -398,7 +398,7 @@ async fn inner_main() -> anyhow::Result<()> {
 		}
 		Command::Drain { address } => {
 			info!("Running with config: {:#?}", cfg);
-			let db = server::database::Db::connect(&cfg.postgres).await?;
+			let db = server::database::Db::connect(&cfg.postgres, cfg.network).await?;
 			let bitcoind = bcd::build_client(&cfg.bitcoind.url, cfg.bitcoind.auth())?;
 
 			let seed = server::wallet::read_mnemonic_from_datadir(&cfg.data_dir)?.to_seed("");
@@ -424,7 +424,7 @@ async fn inner_main() -> anyhow::Result<()> {
 			println!("{}", server::wallet::read_mnemonic_from_datadir(&cfg.data_dir)?);
 		}
 		Command::Data { cmd } => {
-			let db = server::database::Db::connect(&cfg.postgres).await?;
+			let db = server::database::Db::connect(&cfg.postgres, cfg.network).await?;
 			match cmd {
 				DataCommand::FixBoardExpiryPolicy => {
 					let bitcoind = bcd::build_client(&cfg.bitcoind.url, cfg.bitcoind.auth())?;
@@ -447,7 +447,7 @@ async fn inner_main() -> anyhow::Result<()> {
 		}
 		Command::Integration { cmd } => {
 			info!("Running with config: {:#?}", cfg);
-			let db = server::database::Db::connect(&cfg.postgres).await?;
+			let db = server::database::Db::connect(&cfg.postgres, cfg.network).await?;
 			match cmd {
 				IntegrationCommand::Add {
 					integration_name,
@@ -606,7 +606,7 @@ async fn inner_main() -> anyhow::Result<()> {
 			}
 		},
 		Command::UndoRound { funding_txid, dangerous, force } => {
-			let db = server::database::Db::connect(&cfg.postgres).await?;
+			let db = server::database::Db::connect(&cfg.postgres, cfg.network).await?;
 			let round_id = ark::rounds::RoundId::new(funding_txid);
 
 			if !force {
@@ -689,7 +689,10 @@ async fn run_rpc(addr: &str, cmd: RpcCommand) -> anyhow::Result<()> {
 
 			let res = rpc.wallet_status(protos::Empty {}).await?.into_inner();
 			let ret = serde_json::json!({
-				"rounds": WalletStatus(res.rounds.unwrap().try_into().expect("invalid response")),
+				"rounds": res.rounds.map(rpc::WalletStatus::try_from).transpose()
+					.context("invalid rounds wallet status")?.map(WalletStatus),
+				"watchman": res.watchman.map(rpc::WalletStatus::try_from).transpose()
+					.context("invalid watchman wallet status")?.map(WalletStatus),
 			});
 			serde_json::to_writer_pretty(std::io::stdout(), &ret).unwrap();
 			println!("");

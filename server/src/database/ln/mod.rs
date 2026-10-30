@@ -219,10 +219,8 @@ impl<'t> Tx<'t> {
 	/// HTLC-send vtxos that were committed to it. Errors if there is
 	/// already an open attempt for the same payment hash.
 	///
-	/// `lightning_htlc_subscription_id` records the subscription the payment
-	/// was initiated against, making it an intra-Ark self-payment. This is
-	/// decided at initiation time and stored; it is never re-derived. It is
-	/// only cleared if that subscription refuses the payment.
+	/// `lightning_htlc_subscription_id` records the receive this attempt
+	/// successfully funded, not merely the invoice's routing destination.
 	///
 	/// `user_agent` is the raw `x-user-agent` of the initiating client
 	/// ([`crate::telemetry::current_user_agent`]), not the bucketed metric
@@ -245,6 +243,9 @@ impl<'t> Tx<'t> {
 		max_routing_fee: Option<Amount>,
 	) -> anyhow::Result<i64> {
 		let payment_hash = invoice.payment_hash();
+		let principal_msat = i64::try_from(invoice.amount_msat().unwrap_or(amount.to_msat()))
+			.context("Lightning payment principal exceeds database range")?;
+		super::expiry_guard::guard_new_lightning_inputs(self, htlc_vtxo_ids).await?;
 
 		let check_stmt = self.prepare("
 			SELECT id FROM lightning_payment_attempt
@@ -294,7 +295,7 @@ impl<'t> Tx<'t> {
 		let row = self.query_one(
 			&stmt,
 			&[
-				&node_id, &payment_hash.to_string(), &(amount.to_msat() as i64),
+				&node_id, &payment_hash.to_string(), &principal_msat,
 				&mailbox_str, &requested_status,
 				&block_height_i32, &user_fee_sat_i64, &user_agent, &retry_for_secs_i32,
 				&max_routing_fee_msat_i64,
@@ -848,18 +849,16 @@ impl<'t> Tx<'t> {
 		}
 	}
 
-	/// Retrieve the sender's mailbox ID for a lightning payment.
+	/// Retrieve the sender's mailbox ID for the existing payment attempt.
 	pub async fn get_lightning_sender_mailbox_id(
 		&self,
-		payment_hash: PaymentHash,
+		attempt_id: i64,
 	) -> anyhow::Result<Option<ark::mailbox::MailboxIdentifier>> {
 		let stmt = self.prepare(
 			"SELECT sender_mailbox_id FROM lightning_payment_attempt
-			WHERE payment_hash = $1
-			ORDER BY created_at DESC
-			LIMIT 1"
+			WHERE id = $1"
 		).await?;
-		let row = self.query_opt(&stmt, &[&payment_hash.to_string()]).await?;
+		let row = self.query_opt(&stmt, &[&attempt_id]).await?;
 
 		match row {
 			Some(row) => {
@@ -940,26 +939,28 @@ impl<'t> Tx<'t> {
 		}
 	}
 
-	/// Transition every currently-`spendable` HTLC-send vtxo linked to any
-	/// attempt for the given payment hash to `ln-spent`. Called when a
-	/// lightning send settles, so the vtxo is explicitly marked as consumed
-	/// by a paid invoice.
-	///
-	/// Returns the ids of linked vtxos left untouched because their
-	/// `spend_state` was no longer `spendable` at update time (e.g. already
-	/// `ln-spent` from a prior settlement of the same payment hash). An
-	/// empty vec means every linked vtxo transitioned.
+	/// Lock an attempt's existing source set before changing its status.
+	pub(crate) async fn lock_lightning_attempt_sources(&self, attempt_id: i64) -> anyhow::Result<()> {
+		self.query("SELECT v.vtxo_id FROM vtxo v \
+			JOIN lightning_payment_attempt_htlc_vtxo l ON l.vtxo_id=v.vtxo_id \
+			WHERE l.lightning_payment_attempt_id=$1 ORDER BY v.vtxo_id FOR UPDATE OF v", &[&attempt_id]).await?;
+		Ok(())
+	}
+
+	/// Mark only this attempt's linked, spendable sources as consumed.
+	/// Return nonspendable sources left untouched; already-ln-spent is idempotent.
 	pub async fn mark_htlc_send_vtxos_ln_spent(
 		&self,
-		payment_hash: PaymentHash,
+		attempt_id: i64,
 	) -> anyhow::Result<Vec<VtxoId>> {
+		self.lock_lightning_attempt_sources(attempt_id).await?;
 		let stmt = self.prepare("
 			WITH found AS (
 				SELECT vtxo.vtxo_id, vtxo.spend_state
 				FROM vtxo
 				JOIN lightning_payment_attempt_htlc_vtxo link ON link.vtxo_id = vtxo.vtxo_id
 				JOIN lightning_payment_attempt lpa ON lpa.id = link.lightning_payment_attempt_id
-				WHERE lpa.payment_hash = $1
+				WHERE lpa.id = $1
 			),
 			updated AS (
 				UPDATE vtxo
@@ -969,10 +970,10 @@ impl<'t> Tx<'t> {
 				RETURNING vtxo.vtxo_id
 			)
 			SELECT vtxo_id FROM found
-			WHERE vtxo_id NOT IN (SELECT vtxo_id FROM updated)
+			WHERE vtxo_id NOT IN (SELECT vtxo_id FROM updated) AND spend_state <> 'ln-spent'
 		").await?;
 
-		let rows = self.query(&stmt, &[&payment_hash.to_string()]).await
+		let rows = self.query(&stmt, &[&attempt_id]).await
 			.context("failed to mark HTLC-send vtxos as ln-spent")?;
 
 		rows.iter()
@@ -1004,6 +1005,13 @@ impl<'t> Tx<'t> {
 		} else {
 			Ok(None)
 		}
+	}
+
+	/// Serialize the final claim/refund decision with the existing settlement WAL.
+	pub async fn lock_htlc_settlements(&self) -> anyhow::Result<()> {
+		self.execute("SELECT pg_advisory_xact_lock_shared($1)",
+			&[&(super::AdvisoryLock::HtlcSettlementWrite as i64)]).await?;
+		Ok(())
 	}
 
 	/// The sole sanctioned settlement gate for any fund-releasing path

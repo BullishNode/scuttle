@@ -4,6 +4,7 @@ use bitcoin::key::Keypair;
 use bitcoin::{Address, OutPoint, Psbt};
 use log::{info, warn};
 
+use ark::fallback::OwnerLink;
 use ark::board::BoardBuilder;
 use ark::fees::validate_and_subtract_fee;
 use bitcoin_ext::BlockHeight;
@@ -260,13 +261,14 @@ impl Wallet {
 			.generate_user_nonces();
 
 		let cosign_resp = srv.client.request_board_cosign(protos::BoardCosignRequest {
+			owner_proof: Some(OwnerLink::new_joint(self.network().await?, ark_info.mailbox_pubkey, &self.mailbox_keypair(), &user_keypair)?.into()),
 			amount: amount.to_sat(),
 			utxo: bitcoin::consensus::serialize(&utxo), //TODO(stevenroose) change to own
 			expiry_height: expiry_height.into(),
 			user_pubkey: user_keypair.public_key().serialize().to_vec(),
 			pub_nonce: builder.user_pub_nonce().serialize().to_vec(),
 			funding_tx: bitcoin::consensus::serialize(&board_psbt.unsigned_tx),
-		}).await.context("error requesting board cosign")?
+		}).await.map_err(crate::FallbackRefusal::map_status).context("error requesting board cosign")?
 			.into_inner().try_into().context("invalid cosign response from server")?;
 
 		ensure!(builder.verify_cosign_response(&cosign_resp),

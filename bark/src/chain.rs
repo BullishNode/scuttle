@@ -266,6 +266,8 @@ impl ChainSource {
 		fallback_fee: Option<FeeRate>,
 		#[cfg(feature = "socks5-proxy")] proxy: Option<&str>,
 	) -> anyhow::Result<Self> {
+		#[cfg(feature = "socks5-proxy")]
+		let proxy = crate::proxy::proxy_for_url(&proxy.map(str::to_owned), spec.url())?;
 		let (inner, zmq_endpoint) = match spec {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceSpec::Bitcoind { url, auth, zmq } => {
@@ -306,7 +308,7 @@ impl ChainSource {
 				#[cfg(not(feature = "socks5-proxy"))]
 				let builder = esplora_client::Builder::new(url);
 				#[cfg(feature = "socks5-proxy")]
-				if let Some(proxy) = proxy {
+				if let Some(proxy) = proxy.as_deref() {
 					builder = builder.proxy(proxy);
 				}
 				builder.build_async()

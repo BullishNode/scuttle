@@ -67,7 +67,7 @@ async fn broadcast_hashes_do_not_authorize_round_status_queries() {
 	// the owner still completes its delegated refresh, sending its attestation
 	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
 	victim.sync().await;
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let unforfeited = db.read(async |t| {
 		let row = t.query_one(
 			"SELECT count(*) FROM round_participation \

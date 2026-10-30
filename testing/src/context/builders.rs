@@ -20,6 +20,7 @@ use tokio::fs;
 use crate::constants::BOARD_CONFIRMATIONS;
 use crate::daemon::barkd::{Barkd, BarkdChainSource};
 use crate::daemon::watchmand::Watchmand;
+use crate::onchain::AppBip84Wallet;
 use crate::{Bark, Bitcoind, Captaind, Lightningd, LightningdConfig};
 use crate::util::{poll_interval, FutureExt};
 use super::TestContext;
@@ -293,6 +294,12 @@ impl<'a> BarkdBuilder<'a> {
 		self
 	}
 
+	/// Set the chain birthday for a seed restore.
+	pub fn birthday_height(mut self, height: u32) -> Self {
+		self.birthday_height = Some(height);
+		self
+	}
+
 	/// Enable the `GET /wallet/mnemonic` endpoint, which barkd disables by
 	/// default. Needed by tests that read the seed back out of the daemon.
 	pub fn expose_mnemonic(self) -> Self {
@@ -532,6 +539,7 @@ pub struct BarkSdkBuilder<'a> {
 	board_amounts: Vec<Amount>,
 	mod_cfg: Option<Box<dyn FnOnce(&mut bark::Config)>>,
 	mnemonic: Option<bip39::Mnemonic>,
+	app_bip84: bool,
 }
 
 impl<'a> BarkSdkBuilder<'a> {
@@ -548,6 +556,7 @@ impl<'a> BarkSdkBuilder<'a> {
 			board_amounts: Vec::new(),
 			mod_cfg: None,
 			mnemonic: None,
+			app_bip84: false,
 		}
 	}
 
@@ -555,6 +564,12 @@ impl<'a> BarkSdkBuilder<'a> {
 	/// Lets a test recover into a new wallet from another wallet's seed.
 	pub fn mnemonic(mut self, mnemonic: bip39::Mnemonic) -> Self {
 		self.mnemonic = Some(mnemonic);
+		self
+	}
+
+	/// Attach an application-owned BIP84 wallet instead of the native BIP86 wallet.
+	pub fn app_bip84(mut self) -> Self {
+		self.app_bip84 = true;
 		self
 	}
 
@@ -620,15 +635,25 @@ impl<'a> BarkSdkBuilder<'a> {
 			SqliteClient::open(datadir.join("db.sqlite")).context("opening sqlite db")?,
 		);
 
-		let onchain = Arc::new(tokio::sync::RwLock::new(OnchainWallet::load_or_create(
-			network, mnemonic.to_seed(""), db.clone(),
-		).await.context("creating onchain wallet")?));
+		let (onchain, fallback_spk): (Arc<tokio::sync::RwLock<dyn OnchainWalletTrait>>, _) = if self.app_bip84 {
+			let wallet = AppBip84Wallet::load_or_create(
+				network, mnemonic.to_seed(""), db.clone(), self.ctx.bitcoind().sync_client(),
+			).await.context("creating application BIP84 wallet")?;
+			let script = wallet.fallback_script();
+			(Arc::new(tokio::sync::RwLock::new(wallet)), script)
+		} else {
+			let wallet = OnchainWallet::load_or_create(network, mnemonic.to_seed(""), db.clone())
+				.await.context("creating onchain wallet")?;
+			let script = wallet.fallback_script();
+			(Arc::new(tokio::sync::RwLock::new(wallet)), script)
+		};
 
 		let seed = WalletSeed::new_from_mnemonic(network, &mnemonic);
 		let wallet = bark::Wallet::open(network, seed, cfg, OpenWalletArgs {
 			persister: Some(db),
 			create_if_not_exists: true,
 			onchain: Some(onchain.clone()),
+			fallback_spk: Some(fallback_spk),
 			..Default::default()
 		}).await.context("creating bark wallet")?;
 

@@ -110,6 +110,7 @@ impl Wallet {
 		let keypairs = self.find_vtxo_keypairs(user_pubkeys, gap_limit).await
 			.context("error scanning the vtxo key space")?;
 
+		let mut fallback_pending = Vec::new();
 		let mut to_store = Vec::with_capacity(pending.len());
 		for vtxo in &pending {
 			let id = vtxo.id();
@@ -118,7 +119,10 @@ impl Wallet {
 				Some(keypair) => self.import_vtxo_state(vtxo, keypair, &args).await,
 			};
 			match state {
-				Ok(state) => to_store.push((*vtxo, state)),
+				Ok((state, pending)) => {
+					if pending { fallback_pending.push((**vtxo).clone()); }
+					to_store.push((*vtxo, state));
+				},
 				Err(e) => {
 					if !args.allow_partial {
 						return Err(e);
@@ -131,9 +135,13 @@ impl Wallet {
 			return Ok(ids);
 		}
 
+		self.retain_fallback_pending(&fallback_pending).await?;
 		let rows = to_store.iter().map(|(v, s)| (*v, s)).collect::<Vec<_>>();
 		self.inner.db.store_vtxos(&rows).await
 			.context("failed to store imported VTXOs")?;
+		let spent = to_store.iter().filter(|(_, state)| *state == VtxoState::Spent)
+			.map(|(vtxo, _)| vtxo.id()).collect::<Vec<_>>();
+		self.trust_ordinary_spends(&spent).await?;
 
 		for (vtxo, state) in &to_store {
 			info!("Successfully imported VTXO {} as {}", vtxo.id(), state.kind());
@@ -153,9 +161,9 @@ impl Wallet {
 		vtxo: &Vtxo<Full>,
 		keypair: &Keypair,
 		args: &ImportVtxoArgs,
-	) -> Result<VtxoState, ImportVtxoError> {
+	) -> Result<(VtxoState, bool), ImportVtxoError> {
 		if args.skip_status_check {
-			return Ok(VtxoState::Spendable);
+			return Ok((VtxoState::Spendable, false));
 		}
 
 		let id = vtxo.id();
@@ -163,8 +171,9 @@ impl Wallet {
 		let adoption = ServerStatusAdoption::from_spend_state(spend_state)
 			.with_context(|| format!("cannot decide the state of vtxo {id}"))?;
 		Ok(match adoption {
-			ServerStatusAdoption::Spendable => VtxoState::Spendable,
-			ServerStatusAdoption::Spent => VtxoState::Spent,
+			ServerStatusAdoption::Spendable => (VtxoState::Spendable, false),
+			ServerStatusAdoption::Spent => (VtxoState::Spent, false),
+			ServerStatusAdoption::FallbackPending => (VtxoState::Spendable, true),
 			ServerStatusAdoption::InFlight(state) =>
 				return Err(ImportVtxoError::InFlight { id, state }),
 		})

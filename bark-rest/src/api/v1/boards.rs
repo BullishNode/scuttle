@@ -38,6 +38,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 	request_body = bark_json::web::BoardRequest,
 	responses(
 		(status = 200, description = "Returns the board result", body = bark_json::cli::PendingBoardInfo),
+		(status = 409, description = "The server refused the operation or recipient; inspect the stable refusal code", body = error::FallbackRefusalError),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
 	description = "Moves the specified amount of bitcoin in the on-chain wallet onto the Ark \
@@ -63,6 +64,7 @@ pub async fn board_amount(
 	summary = "Board all on-chain bitcoin",
 	responses(
 		(status = 200, description = "Returns the board result", body = bark_json::cli::PendingBoardInfo),
+		(status = 409, description = "The server refused the operation or recipient; inspect the stable refusal code", body = error::FallbackRefusalError),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
 	description = "Moves all bitcoin in the on-chain wallet onto the Ark protocol. Creates and \

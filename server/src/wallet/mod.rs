@@ -279,6 +279,9 @@ impl PersistedWallet {
 		self.wallet.trusted_balance(self.min_trusted_confs)
 	}
 
+	/// Minimum confirmation depth used to trust wallet funding.
+	pub fn min_trusted_confs(&self) -> u32 { self.min_trusted_confs }
+
 	/// Check if the wallet has at least the given amount of trusted funds.
 	pub fn has_trusted_balance(&self, amount: Amount) -> bool {
 		self.balance().trusted >= amount

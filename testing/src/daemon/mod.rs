@@ -228,6 +228,10 @@ impl<T> Daemon<T>
 	}
 
 	pub async fn stop(&self) -> anyhow::Result<()> {
+		self.stop_with_signal(signal::Signal::SIGTERM).await
+	}
+
+	pub(crate) async fn stop_with_signal(&self, stop_signal: signal::Signal) -> anyhow::Result<()> {
 		trace!("Stopping {}", self.name);
 		let mut state_lock = self.daemon_state.lock().await;
 		*state_lock = DaemonState::Stopping;
@@ -235,21 +239,40 @@ impl<T> Daemon<T>
 		let mut child_lock = self.child.lock().await;
 		let child = child_lock.as_mut().expect("daemon not started yet");
 
-		if let Some(pid) = child.id() {
-			// Send SIGTERM
-			let pid = Pid::from_raw(pid as i32);
-			signal::kill(pid, signal::Signal::SIGTERM).expect("sending SIGTERM failed");
-		}
-
-		match child.wait().try_wait(wait_timeout()).await {
-			Ok(Ok(s)) => if s.success() {
-				info!("Daemon {} succesfully shut down gracefully", self.name);
-			} else {
-				warn!("Daemon {} shut down with exit status {}", self.name, s);
+		let running = stop_signal == signal::Signal::SIGTERM || match child.try_wait() {
+			Ok(None) => true,
+			Ok(Some(_)) => false,
+			Err(e) => {
+				warn!("Cannot check daemon {} before {}: {}", self.name, stop_signal, e);
+				false
 			},
-			Ok(Err(e)) => error!("Error sending TERM signal to daemon {}: {}", self.name, e),
-			Err(_) => warn!("Shutting down daemon {} timed out", self.name),
-		}
+		};
+		let signalled = if let Some(pid) = child.id().filter(|_| running) {
+			let pid = Pid::from_raw(pid as i32);
+			signal::kill(pid, stop_signal).expect("sending stop signal failed");
+			true
+		} else {
+			false
+		};
+
+		let stopped = match child.wait().try_wait(wait_timeout()).await {
+			Ok(Ok(s)) => {
+				if s.success() {
+					info!("Daemon {} stopped after {}", self.name, stop_signal);
+				} else {
+					warn!("Daemon {} shut down with exit status {}", self.name, s);
+				}
+				true
+			},
+			Ok(Err(e)) => {
+				error!("Error waiting for daemon {}: {}", self.name, e);
+				false
+			},
+			Err(_) => {
+				warn!("Shutting down daemon {} timed out", self.name);
+				false
+			},
+		};
 
 		// In case that failed, we send a SIGKILL and reap. Without the second
 		// wait callers can delete the datadir before the process has fully
@@ -273,6 +296,9 @@ impl<T> Daemon<T>
 
 		info!("Stopped {}", self.name);
 		*state_lock = DaemonState::Stopped;
+		ensure!(stop_signal == signal::Signal::SIGTERM || (signalled && stopped),
+			"Daemon {} did not stop after {} before cleanup", self.name, stop_signal,
+		);
 		Ok(())
 	}
 

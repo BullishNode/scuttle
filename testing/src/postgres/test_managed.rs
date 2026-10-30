@@ -39,4 +39,8 @@ impl TestManagedPostgres {
 	pub async fn stop(&self) -> anyhow::Result<()> {
 		self.postgresd.stop().await
 	}
+
+	pub async fn crash_stop(&self) -> anyhow::Result<()> {
+		self.postgresd.stop_with_signal(nix::sys::signal::Signal::SIGQUIT).await
+	}
 }

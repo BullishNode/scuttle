@@ -1,8 +1,12 @@
-use std::str::FromStr;
+use std::time::Duration;
+use tokio::sync::Notify;
 
-use bitcoin::secp256k1::PublicKey;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use ark::VtxoPolicy;
+use ark::{ProtocolEncoding, VtxoPolicy};
+use ark_testing::daemon::captaind::{self, ArkClient};
+use server_rpc::protos;
 use ark::address::VtxoDelivery;
 use bark::movement::MovementStatus;
 
@@ -40,37 +44,6 @@ async fn send_to_unsupported_delivery_is_refused() {
 	assert_eq!(assert_balance_consistent(&sender, false).await.spendable, sat(400_000));
 }
 
-/// An address that lists no delivery mechanism at all is the receiver's
-/// choice to pick up the VTXO out-of-band: the payment succeeds and bark
-/// never attempts a delivery.
-#[tokio::test]
-async fn send_to_address_without_delivery_succeeds() {
-	let ctx = TestContext::new("bark_sdk/send_to_address_without_delivery_succeeds").await;
-	let srv = ctx.captaind("server").create().await;
-
-	let sender = ctx.bark_sdk("bark", &srv)
-		.boarded(sat(400_000))
-		.create().await;
-
-	// A hard-coded recipient key on an address that opts out of delivery.
-	let recipient_pubkey = PublicKey::from_str(
-		"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-	).unwrap();
-	let own = sender.new_address().await.expect("new address");
-	let address = ark::Address::new(
-		own.is_testnet(),
-		own.ark_id(),
-		VtxoPolicy::new_pubkey(recipient_pubkey),
-		vec![],
-	);
-
-	sender.send_arkoor_payment(&address, sat(100_000)).await
-		.expect("send to a delivery-less address must succeed");
-
-	// The send ran to completion and only the change remains spendable.
-	assert!(sender.pending_arkoor_sends().await.unwrap().is_empty());
-	assert_eq!(assert_balance_consistent(&sender, false).await.spendable, sat(300_000));
-}
 
 /// Each arkoor send returns the movement that records it, also when two
 /// payments have the same amount and destination.
@@ -101,3 +74,5 @@ async fn send_returns_its_movement_id() {
 		assert_eq!(movement.status, MovementStatus::Successful);
 	}
 }
+
+include!("arkoor_fallback.rs");

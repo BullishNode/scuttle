@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use bitcoin::Amount;
+use bark::persist::{BarkPersister, sqlite::SqliteClient};
 use bitcoin_ext::BlockDelta;
 use server_log::RoundFinished;
 
@@ -162,3 +163,5 @@ async fn balance_sets_aside_expired_vtxos() {
 	assert_eq!(balance.spendable, AMOUNT, "refreshed: {balance:?}");
 	assert_eq!(balance.needs_refresh, Amount::ZERO, "refreshed: {balance:?}");
 }
+
+include!("balance_fallback.rs");

@@ -589,7 +589,13 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 				}
 			});
 
-			output_json(&vtxos.iter().map(WalletVtxoInfo::from).collect::<Vec<_>>());
+			let awaiting = wallet.awaiting_settlement_vtxos().await?;
+			let infos = vtxos.iter().map(|vtxo| {
+				let mut info = WalletVtxoInfo::from(vtxo);
+				info.awaiting_settlement = awaiting.contains(&vtxo.id());
+				info
+			}).collect::<Vec<_>>();
+			output_json(&infos);
 		},
 		Command::RawVtxo { vtxo_id } => {
 			let v = wallet.get_full_vtxo(vtxo_id.parse().context("invalid VTXO ID")?).await?;

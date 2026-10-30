@@ -1,8 +1,9 @@
-//! A lock on one payment hash.
+//! Separate decision and external dispatch locks on one payment hash.
 //!
-//! [`PaymentGuards::lock`] takes the lock and returns a [`PaymentGuard`]. No
-//! other task can lock the same payment hash while that guard exists. The lock
-//! is free again when the guard is dropped.
+//! [`PaymentGuards::lock`] takes a decision lock and returns a [`PaymentGuard`].
+//! Other decisions on that hash wait until the guard is dropped. Dispatch
+//! locks independently exclude another xpay or its monitor; they permit a
+//! receive decision while an external payment is pending.
 //!
 //! Each payment hash has its own lock. A payment never waits for a different
 //! payment.
@@ -27,11 +28,15 @@ use ark::lightning::PaymentHash;
 #[derive(Debug, Clone)]
 pub struct PaymentGuards {
 	locks: Arc<Locks>,
+	dispatch_locks: Arc<Locks>,
 }
 
 impl PaymentGuards {
 	pub fn new() -> PaymentGuards {
-		PaymentGuards { locks: Arc::new(Locks::default()) }
+		PaymentGuards {
+			locks: Arc::new(Locks::default()),
+			dispatch_locks: Arc::new(Locks::default()),
+		}
 	}
 
 	/// Takes the lock on the payment hash.
@@ -39,10 +44,21 @@ impl PaymentGuards {
 	/// The call waits until the current holder drops its guard. The call is
 	/// safe to cancel.
 	pub async fn lock(&self, payment_hash: PaymentHash) -> PaymentGuard {
+		Self::lock_in(&self.locks, payment_hash).await
+	}
+
+	/// Exclude another xpay or monitor while its remote result is unresolved.
+	/// Take this before the decision lock; receive decisions need not wait for
+	/// the external payment to finish. Clones share both sets of locks.
+	pub async fn lock_dispatch(&self, payment_hash: PaymentHash) -> PaymentGuard {
+		Self::lock_in(&self.dispatch_locks, payment_hash).await
+	}
+
+	async fn lock_in(locks: &Arc<Locks>, payment_hash: PaymentHash) -> PaymentGuard {
 		let mut waiting = Waiting {
-			locks: &self.locks,
+			locks,
 			payment_hash,
-			semaphore: self.locks.semaphore(payment_hash),
+			semaphore: locks.semaphore(payment_hash),
 			acquired: false,
 		};
 
@@ -56,13 +72,38 @@ impl PaymentGuards {
 		waiting.acquired = true;
 
 		PaymentGuard {
-			locks: self.locks.clone(),
+			locks: locks.clone(),
 			payment_hash,
 			semaphore: waiting.semaphore.clone(),
 		}
 	}
 
-	/// The number of payment hashes that are locked or waited for.
+	/// Take a payment lock without delaying another payment's monitor pass.
+	pub fn try_lock(&self, payment_hash: PaymentHash) -> Option<PaymentGuard> {
+		Self::try_lock_in(&self.locks, payment_hash)
+	}
+
+	/// Skip monitoring an xpay still held by any client, including one whose
+	/// node connection has since been replaced.
+	pub fn try_lock_dispatch(&self, payment_hash: PaymentHash) -> Option<PaymentGuard> {
+		Self::try_lock_in(&self.dispatch_locks, payment_hash)
+	}
+
+	fn try_lock_in(locks: &Arc<Locks>, payment_hash: PaymentHash) -> Option<PaymentGuard> {
+		let mut waiting = Waiting {
+			locks, payment_hash,
+			semaphore: locks.semaphore(payment_hash), acquired: false,
+		};
+		let permit = waiting.semaphore.try_acquire().ok()?;
+		permit.forget();
+		waiting.acquired = true;
+		Some(PaymentGuard {
+			locks: locks.clone(), payment_hash,
+			semaphore: waiting.semaphore.clone(),
+		})
+	}
+
+	/// The number of decision hashes that are locked or waited for.
 	///
 	/// For tests and diagnostics.
 	pub fn tracked(&self) -> usize {
@@ -179,6 +220,21 @@ mod tests {
 		PaymentHash::from([n; 32])
 	}
 
+	#[tokio::test]
+	async fn a_dispatch_excludes_other_clients_without_blocking_receive_decisions() {
+		let guards = PaymentGuards::new();
+		let other_client = guards.clone();
+		let dispatch = guards.lock_dispatch(hash(1)).await;
+		assert!(other_client.try_lock_dispatch(hash(1)).is_none());
+		let decision = other_client.try_lock(hash(1)).expect("a pending xpay permits a receive decision");
+		assert!(guards.try_lock(hash(1)).is_none());
+		drop(decision);
+		assert!(other_client.try_lock_dispatch(hash(1)).is_none());
+		drop(dispatch);
+		let monitor = other_client.try_lock_dispatch(hash(1)).expect("the monitor can reconcile after xpay returns");
+		drop(monitor);
+	}
+
 	/// Polls a lock one time and does not wait for it.
 	///
 	/// Returns the guard if the lock is granted. The first call puts the caller
@@ -188,6 +244,19 @@ mod tests {
 		-> Option<PaymentGuard>
 	{
 		tokio::time::timeout(Duration::ZERO, waiting).await.ok()
+	}
+
+	#[tokio::test]
+	async fn a_busy_payment_does_not_block_monitoring_another_payment() {
+		let guards = PaymentGuards::new();
+		let held = guards.lock(hash(1)).await;
+		assert!(guards.try_lock(hash(1)).is_none());
+		let other = guards.try_lock(hash(2)).expect("another payment remains available");
+		drop(other);
+		drop(held);
+		let first = guards.try_lock(hash(1)).expect("released payment is available");
+		drop(first);
+		assert_eq!(guards.tracked(), 0);
 	}
 
 	#[tokio::test]

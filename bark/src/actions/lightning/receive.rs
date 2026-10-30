@@ -26,7 +26,7 @@ use bitcoin_ext::{BlockDelta, BlockHeight};
 use server_rpc::{protos, ServerConnection};
 use server_rpc::protos::prepare_lightning_receive_claim_request::LightningReceiveAntiDos;
 
-use crate::{Config, Wallet};
+use crate::{Config, FallbackRefusal, Wallet};
 use crate::actions::{
 	abort, or_retry, Advance, AdvanceError, IntoAdvanceResult, IntoAnyhow,
 	RetryUnlessRejected, WalletAction, WalletActionCheckpoint, WalletActionId, BASE_RETRY_BACKOFF,
@@ -169,8 +169,9 @@ impl WalletAction for LightningReceive {
 				}
 			},
 			Progress::PreimageRevealed(htlcs) => {
-				// Retrying claim.
-				let claim = prepare_lightning_receive_claim(wallet, &self, htlcs).await?;
+				// Retrying a disclosed claim must never abandon its grant.
+				let claim = prepare_lightning_receive_claim(wallet, &self, htlcs).await
+					.map_err(|e| AdvanceError::Retry(e.into_anyhow()))?;
 				match claim_lightning_receive_htlcs(wallet, &self, htlcs, claim).await? {
 					None => return Ok(Advance::Done),
 					Some(delivery) => Progress::Delivering(delivery),
@@ -264,8 +265,8 @@ pub enum Progress {
 	/// movement is created. The preimage has NOT been revealed yet, so the
 	/// receive is still cancellable.
 	HtlcsReady(Htlcs),
-	/// The preimage has been revealed via the claim RPC in
-	/// exchange of pubkey VTXOs.
+	/// The claim RPC may have revealed the preimage in exchange for pubkey
+	/// VTXOs. Persisted before transmission, including a lost reply.
 	/// Past the point of no return — the receive can no longer be
 	/// cancelled. On failure we leave it pending rather than auto-exit;
 	/// the caller falls back to an on-chain exit via
@@ -341,7 +342,16 @@ pub(crate) async fn start_lightning_receive(
 	let config = wallet.config();
 
 	let fee = ark_info.fees.lightning_receive.calculate(amount).context("fee overflowed")?;
-	validate_and_subtract_fee(amount, fee)?;
+	let net_amount = validate_and_subtract_fee(amount, fee)?;
+	let network = wallet.network().await?;
+	let destination = claim_destination.as_ref().map(|destination| -> anyhow::Result<_> {
+		let link = destination.owner_link(network, ark_info.mailbox_pubkey)?
+			.ok_or(FallbackRefusal::RecipientMustUpdate)?;
+		Ok(protos::VtxoRequest {
+			amount: net_amount.to_sat(), policy: destination.policy().serialize(),
+			owner_proof: Some(link.into()),
+		})
+	}).transpose()?;
 
 	// User needs to enforce the following delta:
 	// - vtxo exit delta + htlc expiry delta (time to exit the vtxo before the htlc expires)
@@ -375,7 +385,10 @@ pub(crate) async fn start_lightning_receive(
 		mailbox_id: Some(mailbox_id.serialize()),
 		description,
 		expiry_secs: expiry.map(|e| e.as_secs()),
+		claim_destination: destination,
 	};
+
+	let (_, key_index) = wallet.derive_store_next_keypair().await?;
 
 	let resp = srv.client.start_lightning_receive(req).await?.into_inner();
 	info!("Ark Server is ready to receive LN payment to invoice: {}.", resp.bolt11);
@@ -392,8 +405,6 @@ pub(crate) async fn start_lightning_receive(
 			);
 		}
 	}
-
-	let (_, key_index) = wallet.derive_store_next_keypair().await?;
 
 	Ok(LightningReceive {
 		invoice,
@@ -532,12 +543,13 @@ async fn prepare_lightning_receive_htlcs(
 	let htlc_recv_expiry = htlc_recv_expiry(current_height, recv.htlc_recv_cltv_delta);
 	let keypair = wallet.peek_keypair(recv.key_index).await.retry()?;
 	let req = protos::PrepareLightningReceiveClaimRequest {
+		owner_proof: Some(wallet.owner_link(keypair.public_key()).await.retry()?.into()),
 		payment_hash: payment_hash.to_vec(),
 		user_pubkey: keypair.public_key().serialize().to_vec(),
 		htlc_recv_expiry: htlc_recv_expiry.into(),
 		lightning_receive_anti_dos,
 	};
-	let res = srv.client.prepare_lightning_receive_claim(req).await
+	let res = srv.client.prepare_lightning_receive_claim(req).await.map_err(crate::FallbackRefusal::map_status)
 		.retry_unless_rejected()?.into_inner();
 
 	// The server hands back this very same grant on every later request for
@@ -658,6 +670,7 @@ async fn prepare_lightning_receive_htlcs(
 struct PreparedClaim {
 	srv: ServerConnection,
 	builder: ArkoorPackageBuilder<UserGeneratedNonces>,
+	package: protos::ArkoorPackageCosignRequest,
 	keypairs: Vec<Keypair>,
 }
 
@@ -668,7 +681,7 @@ async fn prepare_lightning_receive_claim(
 	recv: &LightningReceive,
 	htlcs: &Htlcs,
 ) -> Result<PreparedClaim, AdvanceError> {
-	let (srv, _) = wallet.require_server().await.retry()?;
+	let (srv, info) = wallet.require_server().await.retry()?;
 
 	// Order inputs by vtxoid before generating nonces, then hydrate to
 	// full so the arkoor builder has the genesis chain.
@@ -698,7 +711,16 @@ async fn prepare_lightning_receive_claim(
 		.generate_user_nonces(&keypairs)
 		.context("arkoor nonce generation for claim failed").abort()?;
 
-	Ok(PreparedClaim { srv, builder, keypairs })
+	let network = wallet.network().await.retry()?;
+	let supplied = recv.claim_destination.as_ref().map(|address| {
+		let link = address.owner_link(network, info.mailbox_pubkey)?
+			.ok_or(crate::FallbackRefusal::RecipientMustUpdate)?;
+		Ok((address.policy().user_pubkey(), link))
+	}).transpose().map_err(|e: anyhow::Error| AdvanceError::Abort(e))?
+		.into_iter().collect();
+	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	wallet.attach_owner_links(&mut package, &supplied, info.mailbox_pubkey).await.abort()?;
+	Ok(PreparedClaim { srv, builder, package, keypairs })
 }
 
 /// Claiming -> done, or -> Delivering when the receive has a claim
@@ -717,15 +739,19 @@ async fn claim_lightning_receive_htlcs(
 	htlcs: &Htlcs,
 	claim: PreparedClaim,
 ) -> Result<Option<Delivery>, AdvanceError> {
-	let PreparedClaim { mut srv, builder, keypairs } = claim;
+	let PreparedClaim { mut srv, builder, package, keypairs } = claim;
 
 	info!("Claiming arkoor against payment preimage for {}", recv.payment_hash);
-	let package_cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	// A lost reply or process stop can occur after the server settles the
+	// payer. Commit that possibility under the existing action lock before
+	// any request can reveal the preimage; a restart must never abandon it.
+	let checkpoint = LightningReceive { progress: Progress::PreimageRevealed(htlcs.clone()), ..recv.clone() };
+	wallet.inner.db.upsert_wallet_action_checkpoint(&recv.id(), &checkpoint.into()).await.retry()?;
 	let resp = srv.client.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: recv.payment_hash.to_byte_array().to_vec(),
 		payment_preimage: recv.payment_preimage.to_vec(),
-		cosign_request: Some(package_cosign_request),
-	}).await.retry_unless_rejected()?.into_inner();
+		cosign_request: Some(package),
+	}).await.map_err(crate::FallbackRefusal::map_status).retry()?.into_inner();
 
 	// The preimage is out, so from here on only retry: the server's
 	// claim_lightning_receive is idempotent and hands out fresh cosign

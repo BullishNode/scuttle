@@ -12,6 +12,7 @@ mod arkoor;
 mod balance;
 mod board;
 mod exit;
+mod fallback_adoption;
 mod import;
 mod lightning;
 mod mailbox;

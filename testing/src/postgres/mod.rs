@@ -88,4 +88,12 @@ impl PostgresDatabaseManager {
 			Self::TestManaged(p) => p.stop().await,
 		}
 	}
+
+	/// Stop the owned PostgreSQL server without a shutdown checkpoint.
+	pub async fn crash_stop(&self) -> anyhow::Result<()> {
+		match self {
+			Self::ExternallyHosted(_) => anyhow::bail!("cannot crash an external PostgreSQL server"),
+			Self::TestManaged(p) => p.crash_stop().await,
+		}
+	}
 }

@@ -40,7 +40,7 @@ async fn mailbox_checkpoint_visibility_gap() {
 		cfg.postgres.max_connections = 100;
 	}).create().await;
 
-	let db = Db::connect(&srv.config().postgres).await.expect("connect to captaind's postgres");
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.expect("connect to captaind's postgres");
 
 	let mailbox_kp = Keypair::new(&SECP, &mut thread_rng());
 	let mailbox_id = MailboxIdentifier::from_pubkey(mailbox_kp.public_key());
@@ -57,9 +57,11 @@ async fn mailbox_checkpoint_visibility_gap() {
 		(kp, vtxo)
 	}).collect();
 
+	super::register_test_owners(&db, &srv.mailbox_keypair(), &mailbox_kp,
+		&vtxo_pairs.iter().map(|(key, _)| *key).collect::<Vec<_>>()).await;
 	db.write(async |t| t.upsert_vtxos(
 		vtxo_pairs.iter().map(|(_, v)| ServerVtxo::from(v.clone()))
-	).await).await.expect("upsert vtxos");
+	, Some((bitcoin::Network::Regtest, &srv.mailbox_keypair()))).await).await.expect("upsert vtxos");
 
 	let writers_done = Arc::new(AtomicBool::new(false));
 	let expiry = chrono::Local::now() + Duration::from_secs(300);
@@ -155,7 +157,7 @@ async fn mailbox_post_arkoor_requires_known_vtxos() {
 	let ctx = TestContext::new("server/mailbox_post_arkoor_requires_known_vtxos").await;
 	let srv = ctx.captaind("server").create().await;
 
-	let db = Db::connect(&srv.config().postgres).await.expect("connect to captaind's postgres");
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.expect("connect to captaind's postgres");
 	let mut rpc = srv.get_mailbox_public_rpc().await;
 
 	let mailbox_kp = Keypair::new(&SECP, &mut thread_rng());
@@ -168,7 +170,8 @@ async fn mailbox_post_arkoor_requires_known_vtxos() {
 		user_keypair: owner_kp,
 		..Default::default()
 	}.build();
-	db.write(async |t| t.upsert_vtxos([ServerVtxo::from(vtxo.clone())]).await).await
+	super::register_test_owners(&db, &srv.mailbox_keypair(), &mailbox_kp, &[owner_kp]).await;
+	db.write(async |t| t.upsert_vtxos([ServerVtxo::from(vtxo.clone())], Some((bitcoin::Network::Regtest, &srv.mailbox_keypair()))).await).await
 		.expect("upsert vtxo");
 
 	// A vtxo the server never cosigned is rejected.
@@ -368,3 +371,5 @@ async fn mailbox_lightning_send_finished() {
 	// On success the preimage must be present
 	assert!(send_finished.preimage.is_some(), "preimage should be present on successful payment");
 }
+
+include!("mailbox_fallback.rs");

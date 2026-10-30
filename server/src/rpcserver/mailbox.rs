@@ -154,8 +154,10 @@ impl rpc::server::MailboxService for crate::Server {
 		// stops a known id from being posted with doctored content that would
 		// route it into a mailbox its owner doesn't watch.
 		let vtxo_ids = vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
-		let stored = self.db.read(async |t| t.get_user_vtxos_by_id(&vtxo_ids).await)
-			.await.to_status()?;
+		let stored = self.db.read(async |t| {
+			t.require_registered_mailbox(mailbox_id).await?;
+			t.get_user_vtxos_by_id(&vtxo_ids).await
+		}).await.to_status()?;
 		for stored in &stored {
 			if stored.vtxo.user_pubkey() != vtxo_pubkey {
 				self::badarg!("vtxo {} doesn't belong to the provided vtxo pubkey", stored.vtxo_id);
@@ -249,6 +251,8 @@ impl rpc::server::MailboxService for crate::Server {
 		// Start listening for updates on the tip of the mailbox.
 		// Marking the first value as changed makes `changed()` return
 		// immediately so the loop starts with a catch-up fetch.
+		self.db.read(async |tx| tx.require_registered_mailbox(mailbox_id).await)
+			.await.to_status()?;
 		let mut mailbox_tip_rx = self.mailbox_manager.subscribe(mailbox_id, 0);
 		mailbox_tip_rx.mark_changed();
 
