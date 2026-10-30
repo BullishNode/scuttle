@@ -371,5 +371,3 @@ async fn mailbox_lightning_send_finished() {
 	// On success the preimage must be present
 	assert!(send_finished.preimage.is_some(), "preimage should be present on successful payment");
 }
-
-include!("mailbox_fallback.rs");

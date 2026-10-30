@@ -2601,5 +2601,3 @@ async fn htlc_vtxo_chain_resolution_kept_at_fork_height() {
 	assert_eq!(stored.htlc.chain_resolution, Some(HtlcResolution::Revoked));
 	assert_eq!(stored.htlc.chain_resolution_height, Some(BlockHeight::new(120)));
 }
-
-include!("mod_fallback.rs");

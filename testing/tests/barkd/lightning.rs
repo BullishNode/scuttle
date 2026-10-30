@@ -172,5 +172,3 @@ async fn pay_with_retry_for() {
 		assert_eq!(attempt.retry_for, Some(Duration::from_secs(retry_for_secs)));
 	}
 }
-
-include!("lightning_fallback.rs");

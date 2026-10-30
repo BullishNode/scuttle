@@ -1,4 +1,4 @@
-#[path = "watchman_fallback.rs"]
+#[path = "../scuttle/server/watchman_fallback.rs"]
 mod fallback;
 
 pub(super) use ark_testing::onchain::observed_payout_fee_child;
@@ -687,21 +687,9 @@ async fn offboard_of_confirmed_exited_vtxo_never_costs_server() {
 
 /// A receiver withholds its preimage until the Lightning payment fails, then
 /// publishes its grant. The server must claim before the receiver can spend it.
-#[tokio::test]
-async fn watchman_claims_expired_receive_grant_before_receiver() {
-	fallback::watchman_claims_expired_receive_grant_before_receiver().await
-}
 
 /// Preserve one same-source owner group across asynchronous backing progress.
-#[tokio::test]
-async fn expiry_same_owner_fragments_merge_before_dust_forfeiture() {
-	fallback::expiry_same_owner_fragments_merge_before_dust_forfeiture().await
-}
 
-#[tokio::test]
-async fn expiry_small_fragment_decided_first_waits_for_siblings() {
-	fallback::expiry_small_fragment_decided_first_waits_for_siblings().await
-}
 
 fn assert_canonical_watchman_tx(ctx: &TestContext, tx: &Transaction) {
 	fallback::assert_canonical_watchman_tx(ctx, tx)

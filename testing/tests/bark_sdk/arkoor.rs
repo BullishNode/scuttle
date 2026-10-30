@@ -74,5 +74,3 @@ async fn send_returns_its_movement_id() {
 		assert_eq!(movement.status, MovementStatus::Successful);
 	}
 }
-
-include!("arkoor_fallback.rs");

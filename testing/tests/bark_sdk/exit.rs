@@ -597,4 +597,4 @@ async fn finished_exit_does_not_change_on_sync() {
 	}
 }
 
-include!("exit_fallback.rs");
+include!("../scuttle/bark_sdk/exit_fallback.rs");
