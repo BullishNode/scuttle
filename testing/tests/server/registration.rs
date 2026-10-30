@@ -277,11 +277,13 @@ async fn board_output_is_bound_to_one_exit_tx() {
 	let vout = funding.output.iter().position(|o| o.script_pubkey == script).unwrap();
 	let utxo = OutPoint::new(txid, vout as u32);
 
+	let owner_proof = super::test_owner_link(&srv, &user).await;
 	let cosign = async |fee: Amount| {
 		let builder = BoardBuilder::new(
 			user.public_key(), expiry, info.server_pubkey, info.vtxo_exit_delta,
 		).set_funding_details(amount, fee, utxo).unwrap().generate_user_nonces();
 		let resp = srv.get_public_rpc().await.request_board_cosign(protos::BoardCosignRequest {
+			owner_proof: Some(owner_proof.into()),
 			amount: amount.to_sat(),
 			utxo: utxo.serialize(),
 			expiry_height: expiry.to_u32(),

@@ -397,6 +397,9 @@ mod balance;
 mod board;
 mod config;
 mod daemon;
+mod fallback;
+pub use fallback::FallbackRefusal;
+pub use fallback::payouts::FallbackSnapshot;
 mod fees;
 mod import;
 mod lightning;
@@ -765,6 +768,11 @@ pub struct OpenWalletArgs {
 	/// Default: none
 	pub onchain: Option<Arc<tokio::sync::RwLock<dyn OnchainWalletTrait>>>,
 
+	/// Immutable standard payout script selected by the app. The SDK binds
+	/// it to this seed's coin account, without imposing an onchain wallet,
+	/// seed or derivation path. A cached record may reopen without this field.
+	pub fallback_spk: Option<bitcoin::ScriptBuf>,
+
 	/// Whether to create a new wallet if no wallet exists
 	///
 	///  Default: true
@@ -796,6 +804,7 @@ impl Default for OpenWalletArgs {
 	    Self {
 			run_daemon: true,
 			onchain: None,
+			fallback_spk: None,
 			datadir: None,
 			persister: None,
 			lock_manager: None,
@@ -836,11 +845,10 @@ struct WalletInner {
 
 	/// Live connection to an Ark server for round participation and synchronization.
 	///
-	/// Lazily initialised on first use via [`Wallet::require_server`]. A
-	/// [`OnceCell`] is the right primitive here: concurrent callers on a
-	/// cold cell all await the same in-flight `connect_to_server` future
-	/// instead of each opening a fresh gRPC channel.
-	server: tokio::sync::OnceCell<ServerConnection>,
+	/// Lazily initialized by [`Wallet::require_server`]. Concurrent cold callers
+	/// share a connection only after its keys and fallback registrations pass.
+	/// An explicit refresh removes it until those checks succeed again.
+	server: tokio::sync::RwLock<Option<ServerConnection>>,
 
 	/// Onchain wallet used for boarding, exit fee-bumping, and onchain syncing.
 	///
@@ -991,7 +999,8 @@ impl Wallet {
 	pub async fn peek_next_keypair(&self) -> anyhow::Result<(Keypair, u32)> {
 		let last_revealed = self.inner.db.get_last_vtxo_key_index().await?;
 
-		let index = last_revealed.map(|i| i + 1).unwrap_or(u32::MIN);
+		self.fallback_destination().await?;
+		let index = fallback::next_key_index(last_revealed)?;
 		let keypair = self.inner.seed.derive_vtxo_keypair(index);
 
 		Ok((keypair, index))
@@ -1067,8 +1076,8 @@ impl Wallet {
 		}
 
 		// We should derive unrevealed keys, so we add one to the last key index.
-		let start_idx = self.inner.db.get_last_vtxo_key_index().await?.map(|i| i + 1).unwrap_or(0);
-		let mut frontier = start_idx.saturating_add(gap_limit);
+		let start_idx = fallback::next_key_index(self.inner.db.get_last_vtxo_key_index().await?)?;
+		let mut frontier = start_idx.saturating_add(gap_limit).min((1 << 31) - 1);
 		let mut idx = start_idx;
 		let mut gap = Vec::<(u32, PublicKey)>::new();
 		while idx <= frontier && !unrevealed.is_empty() {
@@ -1084,7 +1093,7 @@ impl Wallet {
 
 				// `frontier` is the last index the scan tests. This index matched,
 				// so the next run of unused indices starts at idx + 1.
-				frontier = idx.saturating_add(1).saturating_add(gap_limit);
+				frontier = idx.saturating_add(1).saturating_add(gap_limit).min((1 << 31) - 1);
 			} else {
 				gap.push((idx, pubkey));
 			}
@@ -1146,10 +1155,10 @@ impl Wallet {
 	///
 	/// May return an error if the address at the given index has not been derived yet.
 	pub async fn peek_address(&self, index: u32) -> anyhow::Result<ark::Address> {
+		self.fallback_destination().await?;
 		let properties = self.properties().await?;
 		let network = properties.network;
 		let keypair = self.peek_keypair(index).await?;
-		let mailbox = self.mailbox_identifier();
 
 
 		let (server_pubkey, mailbox_pubkey) =
@@ -1164,7 +1173,7 @@ impl Wallet {
 			.testnet(network != bitcoin::Network::Bitcoin)
 			.server_pubkey(server_pubkey)
 			.pubkey_policy(keypair.public_key())
-			.mailbox(mailbox_pubkey, mailbox, &keypair)
+			.mailbox_joint(network, mailbox_pubkey, &self.mailbox_keypair(), &keypair)
 			.context("failed to assign mailbox")?
 			.into_address()
 			.context("failed to build address")?)
@@ -1361,17 +1370,15 @@ impl Wallet {
 			bail!("Need to either provide esplora or bitcoind info");
 		};
 
-		#[cfg(feature = "socks5-proxy")]
-		let chain_proxy = proxy_for_url(&config.socks5_proxy, chain_source.url())?;
 		let chain_source_client = ChainSource::new(
 			chain_source, properties.network, config.fallback_fee_rate,
-			#[cfg(feature = "socks5-proxy")] chain_proxy.as_deref(),
+			#[cfg(feature = "socks5-proxy")] config.socks5_proxy.as_deref(),
 		).await?;
 		let chain = Arc::new(chain_source_client);
 		chain.require_version().await
 			.context("provided chain source doesn't meet version requirement")?;
 
-		let server = tokio::sync::OnceCell::new();
+		let server = tokio::sync::RwLock::new(None);
 
 		let notifications = NotificationDispatch::new();
 		let movements = Arc::new(MovementManager::new(db.clone(), notifications.clone()));
@@ -1385,6 +1392,10 @@ impl Wallet {
 			last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
 			round_secret_nonces: RoundSecretNonces::new(),
 		})};
+
+		// Offline creation retains a pending local identity. Coin issuance only
+		// becomes available after an authenticated registration acknowledgement.
+		ret.open_fallback(args.fallback_spk, args.create_without_server).await?;
 
 		ret.inner.exit.load().await
 			.context("error loading exit system after opening wallet")?;
@@ -1483,14 +1494,25 @@ impl Wallet {
 	}
 
 	async fn require_server(&self) -> anyhow::Result<(ServerConnection, ArkInfo)> {
-		// Connect lazily if not yet connected. `get_or_try_init` ensures
-		// concurrent callers on a cold cell all await the same in-flight
-		// connect future instead of each opening a fresh gRPC channel.
-		let conn = self.inner.server.get_or_try_init(|| async {
-			let network = self.properties().await?.network;
-			Self::connect_to_server(&self.inner.config, network).await
-				.context("You should be connected to Ark server to perform this action")
-		}).await?.clone();
+		let existing = { self.inner.server.read().await.clone() };
+		let conn = if let Some(connection) = existing {
+			connection
+		} else {
+			let mut server = self.inner.server.write().await;
+			if let Some(connection) = server.as_ref() {
+				connection.clone()
+			} else {
+				let network = self.properties().await?.network;
+				let mut connection = Self::connect_to_server(&self.inner.config, network).await
+					.context("You should be connected to Ark server to perform this action")?;
+				let ark_info = connection.ark_info().await;
+				check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
+				self.check_and_store_server_keys(&ark_info).await?;
+				self.reconcile_fallback(&mut connection).await?;
+				*server = Some(connection.clone());
+				connection
+			}
+		};
 
 		let ark_info = conn.ark_info().await;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
@@ -1500,22 +1522,23 @@ impl Wallet {
 	}
 
 	pub async fn refresh_server(&self) -> anyhow::Result<()> {
-		// If the cell is still cold, initialise it with a fresh connection.
-		// If it is already initialised, run a heartbeat against the existing
-		// one — `OnceCell` does not support replacing a stored value, but
-		// `ServerConnection` is built around a tonic `Channel` which
-		// transparently reconnects, so we don't need to swap it.
-		let srv = self.inner.server.get_or_try_init(|| async {
+		// Remove the cached connection before refreshing it. On failure or
+		// cancellation, future callers must connect and authenticate again.
+		let mut server = self.inner.server.write().await;
+		let mut connection = if let Some(connection) = server.take() {
+			connection
+		} else {
 			let properties = self.properties().await?;
-			Self::connect_to_server(&self.inner.config, properties.network).await
-				.map_err(anyhow::Error::from)
-		}).await?;
+			Self::connect_to_server(&self.inner.config, properties.network).await?
+		};
 
-		srv.check_connection().await?;
-		let ark_info = srv.ark_info().await;
+		connection.check_connection().await?;
+		let ark_info = connection.ark_info().await;
 		ark_info.fees.validate().context("invalid fee schedule")?;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
 		self.check_and_store_server_keys(&ark_info).await?;
+		self.reconcile_fallback(&mut connection).await?;
+		*server = Some(connection);
 
 		Ok(())
 	}
@@ -1567,7 +1590,8 @@ impl Wallet {
 
 	/// Return [ArkInfo] fetched on last handshake with the Ark server
 	pub async fn ark_info(&self) -> anyhow::Result<Option<ArkInfo>> {
-		match self.inner.server.get() {
+		let server = { self.inner.server.read().await.clone() };
+		match server {
 			Some(srv) => Ok(Some(srv.ark_info().await)),
 			None => Ok(None),
 		}
@@ -1775,7 +1799,13 @@ impl Wallet {
 
 	/// Returns all spendable vtxos
 	pub async fn spendable_vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
-		Ok(self.vtxos_with(&VtxoStateKind::Spendable).await?)
+		let mut vtxos = self.vtxos_with(&VtxoStateKind::Spendable).await?;
+		let snapshot = self.inner.db.get_fallback_snapshot().await?;
+		let pending = self.fallback_pending_principal(&snapshot).await?;
+		let decided = snapshot.adopted_payout_vtxos.clone();
+		vtxos.retain(|vtxo| !decided.contains(&vtxo.id()) && !snapshot.awaiting_settlement.contains(&vtxo.id())
+			&& !pending.contains_key(&vtxo.id()));
+		Ok(vtxos)
 	}
 
 	/// Returns all spendable vtxos matching the provided predicate
@@ -1837,9 +1867,13 @@ impl Wallet {
 		}
 
 		if rounds.is_err() || refresh.is_err() {
-			bail!("Maintenance encountered errors.\nprogress_rounds: {:#?}\nrefresh: {:#?}",
-				rounds, refresh,
-			);
+			let diagnostic = format!("Maintenance encountered errors.\nprogress_rounds: {:#?}\nrefresh: {:#?}", rounds, refresh);
+			let refusal = rounds.as_ref().err().and_then(FallbackRefusal::from_error)
+				.or_else(|| refresh.as_ref().err().and_then(FallbackRefusal::from_error));
+			return Err(match refusal {
+				Some(refusal) => anyhow::Error::new(refusal).context(diagnostic),
+				None => anyhow!(diagnostic),
+			});
 		}
 
 		Ok(())
@@ -1864,10 +1898,14 @@ impl Wallet {
 		}
 
 		if rounds.is_err() || refresh.is_err() {
-			bail!("Delegated maintenance encountered errors.\n\
-				progress_rounds: {:#?}\nrefresh: {:#?}",
-				rounds, refresh,
-			);
+			let diagnostic = format!("Delegated maintenance encountered errors.\n\
+				progress_rounds: {:#?}\nrefresh: {:#?}", rounds, refresh);
+			let refusal = rounds.as_ref().err().and_then(FallbackRefusal::from_error)
+				.or_else(|| refresh.as_ref().err().and_then(FallbackRefusal::from_error));
+			return Err(match refusal {
+				Some(refusal) => anyhow::Error::new(refusal).context(diagnostic),
+				None => anyhow!(diagnostic),
+			});
 		}
 
 		Ok(())
@@ -1931,7 +1969,10 @@ impl Wallet {
 		F: Fn(RoundParticipation) -> Fut,
 		Fut: Future<Output = anyhow::Result<Option<RoundStateId>>>,
 	{
+		// Online maintenance needs the server's depth limit before selecting coins.
+		self.require_server().await?;
 		let mut excluded = HashSet::new();
+		let mut last_refusal = None;
 		for _ in 0..10 {
 			let vtxos = self.get_vtxos_to_refresh_with_excluded(excluded.iter().copied()).await?;
 			match (vtxos.is_empty(), excluded.is_empty()) {
@@ -1940,6 +1981,7 @@ impl Wallet {
 				// silently reporting success.
 				(true, false) => {
 					warn!("no VTXOs to refresh after exclusions: {:?}", excluded);
+					if let Some(error) = last_refusal.take() { return Err(error); }
 					bail!("no VTXOs to refresh after excluding: {:?}", excluded);
 				},
 				// Nothing was due for refresh in the first place.
@@ -1964,6 +2006,9 @@ impl Wallet {
 					warn!("Maintenance refresh rejected {} unusable input(s) ({:?}); \
 						retrying without them", rejected.len(), rejected);
 					excluded.extend(rejected);
+					// Preserve the typed reason if the decision raced the
+					// preflight and leaves no other inputs to submit.
+					last_refusal = Some(e);
 				},
 			}
 		}
@@ -1982,6 +2027,8 @@ impl Wallet {
 	///
 	/// Returns a [RoundStatus] if a refresh occurs.
 	pub async fn maintenance_refresh(&self) -> anyhow::Result<Option<RoundStatus>> {
+		// The early empty check also depends on the server's depth limit.
+		self.require_server().await?;
 		if self.get_vtxos_to_refresh().await?.is_empty() {
 			return Ok(None);
 		}
@@ -2012,7 +2059,16 @@ impl Wallet {
 	/// Notes:
 	/// - Exits are only synced if we detect onchain activity which has force-exited our VTXO.
 	pub async fn sync(&self) {
+		if let Err(error) = self.refresh_server().await {
+			warn!("Ark server refresh failed: {:#}", error);
+		}
 		self.inner.chain.invalidate_caches().await;
+		if let Err(error) = self.sync_fallback_payouts().await {
+			warn!("Fallback chain checks await sync: {:#}", error);
+		}
+		if let Err(error) = self.reconcile_all_expired_vtxos().await {
+			warn!("Expired coins await settlement: {:#}", error);
+		}
 
 		futures::join!(
 			async {
@@ -2071,6 +2127,14 @@ impl Wallet {
 				}
 			}
 		);
+
+		// Sync tasks can learn expired coins after the initial reconciliation.
+		if let Err(error) = self.sync_fallback_payouts().await {
+			warn!("Fallback chain checks await sync: {:#}", error);
+		}
+		if let Err(error) = self.reconcile_all_expired_vtxos().await {
+			warn!("Expired coins await settlement: {:#}", error);
+		}
 	}
 
 	/// Sync the transaction status of unilateral exits
@@ -2224,8 +2288,9 @@ impl Wallet {
 		vtxos: impl IntoIterator<Item = V>,
 		height: Option<BlockHeight>,
 	) -> anyhow::Result<Option<RoundParticipation>> {
+		let selected = self.filter_expired_refresh_inputs(vtxos.into_iter().collect()).await?;
 		let (vtxos, total_amount) = {
-			let iter = vtxos.into_iter();
+			let iter = selected.into_iter();
 			let size_hint = iter.size_hint();
 			let mut vtxos = Vec::<Vtxo<Full>>::with_capacity(size_hint.1.unwrap_or(size_hint.0));
 			let mut amount = Amount::ZERO;
@@ -2283,6 +2348,7 @@ impl Wallet {
 		};
 
 		Ok(Some(RoundParticipation {
+			owner_proofs: Default::default(),
 			inputs: vtxos,
 			outputs: vec![req],
 			unblinded_mailbox_id: None,
@@ -2346,12 +2412,12 @@ impl Wallet {
 	/// This will find all VTXOs that meets must-refresh criteria. Then, if there are some VTXOs to
 	/// refresh, it will also add those that meet should-refresh criteria.
 	pub async fn get_vtxos_to_refresh(&self) -> anyhow::Result<Vec<WalletVtxo>> {
-		let vtxos = self.spendable_vtxos_with(&RefreshStrategy::should_refresh_if_must(
-			self,
-			self.inner.chain.tip().await?,
-			self.inner.chain.fee_rates().await.fast,
-		)).await?;
-		Ok(vtxos)
+		// Include previously awaiting coins so a later positive status can
+		// release them; ordinary spend selection intentionally excludes them.
+		let mut vtxos = self.vtxos_with(&VtxoStateKind::Spendable).await?;
+		RefreshStrategy::should_refresh_if_must(self, self.inner.chain.tip().await?,
+			self.inner.chain.fee_rates().await.fast).filter_vtxos(&mut vtxos).await?;
+		self.filter_expired_refresh_inputs(vtxos).await
 	}
 
 	/// Similar to [Wallet::get_vtxos_to_refresh] but it allows VTXOs to be excluded from the

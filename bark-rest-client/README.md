@@ -83,6 +83,7 @@ Class | Method | HTTP request | Description
 *WalletApi* | [**connected**](docs/WalletApi.md#connected) | **GET** /api/v1/wallet/connected | Check server connection
 *WalletApi* | [**create_wallet**](docs/WalletApi.md#create_wallet) | **POST** /api/v1/wallet/create | Create a wallet
 *WalletApi* | [**debug_info**](docs/WalletApi.md#debug_info) | **GET** /api/v1/wallet/debug-info | Get wallet debug info
+*WalletApi* | [**fallback_registration**](docs/WalletApi.md#fallback_registration) | **GET** /api/v1/wallet/fallback | Get fallback registration and payout address
 *WalletApi* | [**get_vtxo**](docs/WalletApi.md#get_vtxo) | **GET** /api/v1/wallet/vtxos/{id} | Get VTXO detail
 *WalletApi* | [**get_vtxo_encoded**](docs/WalletApi.md#get_vtxo_encoded) | **GET** /api/v1/wallet/vtxos/{id}/encoded | Get encoded VTXO
 *WalletApi* | [**history**](docs/WalletApi.md#history) | **GET** /api/v1/wallet/history | Get wallet history (deprecated)
@@ -219,6 +220,8 @@ Class | Method | HTTP request | Description
  - [ExitTxStatusOneOf4](docs/ExitTxStatusOneOf4.md)
  - [ExitVtxoAlreadySpentState](docs/ExitVtxoAlreadySpentState.md)
  - [ExitVtxoSweptState](docs/ExitVtxoSweptState.md)
+ - [FallbackRefusalError](docs/FallbackRefusalError.md)
+ - [FallbackRegistrationInfo](docs/FallbackRegistrationInfo.md)
  - [FeeEstimateQuery](docs/FeeEstimateQuery.md)
  - [FeeEstimateResponse](docs/FeeEstimateResponse.md)
  - [FeeInfo](docs/FeeInfo.md)

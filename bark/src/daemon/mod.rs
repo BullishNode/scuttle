@@ -393,7 +393,7 @@ impl DaemonProcess {
 		if let Err(ref e) = result {
 			warn!("Ark server refresh failed: {:#}", e);
 		}
-		let connected = wallet.inner.server.initialized();
+		let connected = result.is_ok();
 		self.connected.store(connected, Ordering::Relaxed);
 
 		if !self.manual_sync {

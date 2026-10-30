@@ -11,6 +11,8 @@ import "core.proto";
 service ArkService {
 	rpc Handshake(HandshakeRequest) returns (HandshakeResponse) {}
 	rpc GetArkInfo(core.Empty) returns (ArkInfo) {}
+	// Register an authenticated immutable mailbox/payout binding.
+	rpc SetFallback(SetFallbackRequest) returns (SetFallbackResponse) {}
 	rpc GetOffboardFeeRate(core.Empty) returns (OffboardFeeRateResponse) {}
 
 	rpc GetVtxo(GetVtxoRequest) returns (GetVtxoResponse) {}
@@ -217,6 +219,9 @@ enum VtxoSpendState {
 	VTXO_SPEND_STATE_UNREGISTERED = 4;
 	// The VTXO's preimage haven't been revealed yet
 	VTXO_SPEND_STATE_HTLC_RECV_UNCLAIMED = 5;
+	// Customer principal allocated for fallback. The client verifies the
+	// canonical payment before it retires this claim.
+	VTXO_SPEND_STATE_FALLBACK_PENDING = 6;
 }
 
 message GetVtxoStatusRequest {
@@ -295,6 +300,15 @@ message RecoverVtxosByXpubResponse {
 
 // boarding
 
+// Versioned coin and mailbox authorization of a server-specific link.
+message OwnerProof {
+	bytes blinded_mailbox_id = 1;
+	reserved 2;
+	bytes signature = 3;
+	uint32 version = 4;
+	bytes mailbox_signature = 5;
+}
+
 message BoardCosignRequest {
 	uint64 amount = 1;
 	bytes utxo = 2;
@@ -302,6 +316,7 @@ message BoardCosignRequest {
 	bytes user_pubkey = 4;
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
+	OwnerProof owner_proof = 7;
 }
 
 message BoardCosignResponse {
@@ -324,11 +339,13 @@ message RegisterVtxoTransactionsRequest {
 message VtxoRequest {
 	uint64 amount = 1;
 	bytes policy = 2;
+	OwnerProof owner_proof = 3;
 }
 
 message ArkoorDestination {
 	uint64 total_amount = 1;
 	bytes policy = 2;
+	OwnerProof owner_proof = 3;
 }
 
 message ArkoorCosignRequest {
@@ -376,6 +393,8 @@ message InitiateLightningPaymentRequest {
 message CheckLightningPaymentRequest {
 	bytes hash = 1;
 	bool wait = 2;
+	// Complete HTLC input set of the payment attempt being checked.
+	repeated bytes htlc_vtxo_ids = 3;
 }
 
 message PaymentSuccessStatus {
@@ -390,6 +409,8 @@ message LightningPaymentStatus {
 		// unchanged and an older peer still matches the `failed` arm.
 		core.LightningPaymentFailure failed = 3;
 	};
+	// Input scope validated against the server's recorded payment attempt.
+	repeated bytes htlc_vtxo_ids = 4;
 }
 
 message FetchBolt12InvoiceRequest {
@@ -407,9 +428,11 @@ message StartLightningReceiveRequest {
 	uint32 min_cltv_delta = 3;
 	optional bytes mailbox_id = 4;
 	optional string description = 5;
+	// Point-in-time check for an explicit recipient before invoice creation.
+	VtxoRequest claim_destination = 6;
 	// Seconds until the invoice expires. Defaults to the server's invoice
 	// expiry, which is also the longest it accepts.
-	optional uint64 expiry_secs = 6;
+	optional uint64 expiry_secs = 7;
 }
 
 message StartLightningReceiveResponse {
@@ -429,6 +452,7 @@ message PrepareLightningReceiveClaimRequest {
 		InputVtxo input_vtxo = 4;
 		string token = 5;
 	};
+	OwnerProof owner_proof = 6;
 }
 
 message PrepareLightningReceiveClaimResponse {
@@ -784,4 +808,13 @@ message WalletStatusResponse {
 
 message LightningNodeUri {
 	string uri = 1;
+}
+
+// The record uses ark-lib's bounded mailbox-only v4 FallbackRegistration encoding.
+message SetFallbackRequest {
+	bytes mailbox_pk = 1;
+	bytes record = 2;
+}
+message SetFallbackResponse {
+	bytes record = 1;
 }

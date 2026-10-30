@@ -530,6 +530,11 @@ impl Server {
 		let user_fee_sat = user_fee.to_sat();
 		if let Err(e) = self.db.write(async |t| t.register_offboard(&vtxo_refs, &signed_tx, &forfeit_txs, user_fee_sat).await).await {
 			error!("Failed to register offboard {} in db: {:#}", offboard_txid, e);
+			// Preserve the narrow refusal without exposing transaction bytes
+			// from arbitrary registration-error context to the caller.
+			if let Some(refusal) = e.downcast_ref::<crate::error::FallbackRefusal>() {
+				return Err((*refusal).into());
+			}
 			bail!("failed to register offboard in db, please start over");
 		}
 

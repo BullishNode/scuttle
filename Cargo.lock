@@ -167,6 +167,7 @@ dependencies = [
  "futures",
  "lazy_static",
  "libc",
+ "lightning",
  "log",
  "nix",
  "parking_lot",

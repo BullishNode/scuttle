@@ -975,9 +975,10 @@ async fn bark_should_exit_a_pending_htlc_out_that_server_refuse_to_revoke() {
 
 		async fn check_lightning_payment(
 			&self, _upstream: &mut ArkClient,
-			_req: protos::CheckLightningPaymentRequest,
+			req: protos::CheckLightningPaymentRequest,
 		) -> Result<protos::LightningPaymentStatus, tonic::Status> {
 			Ok(protos::LightningPaymentStatus {
+				htlc_vtxo_ids: req.htlc_vtxo_ids,
 				payment_status: Some(lightning_payment_status::PaymentStatus::Pending(protos::Empty {})),
 			})
 		}

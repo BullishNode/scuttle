@@ -9,7 +9,7 @@ use bdk_wallet::Wallet as BdkWallet;
 use bdk_wallet::coin_selection::DefaultCoinSelectionAlgorithm;
 use bdk_wallet::{Balance, KeychainKind, LocalOutput, TxBuilder, TxOrdering};
 use bitcoin::{
-	Address, Amount, FeeRate, Network, Psbt, Script, Sequence, Transaction, TxOut,
+	Address, Amount, FeeRate, Network, Psbt, Script, ScriptBuf, Sequence, Transaction, TxOut,
 	Txid, Weight, bip32, psbt,
 };
 use log::{debug, error, info, trace, warn};
@@ -177,8 +177,23 @@ impl OnchainWallet {
 				.create_wallet_no_persist()?,
 		};
 
-		Ok(Self { inner: wallet, db })
+		let mut ret = Self { inner: wallet, db };
+		ret.reserve_fallback_address().await?;
+		Ok(ret)
 	}
+	/// A stable destination the native app can explicitly register with Ark.
+	/// External onchain wallets choose their own destination through the same
+	/// OpenWalletArgs field; the core wallet never derives it from the Ark seed.
+	pub fn fallback_script(&self) -> ScriptBuf {
+		self.inner.peek_address(KeychainKind::External, 0).address.script_pubkey()
+	}
+
+	async fn reserve_fallback_address(&mut self) -> anyhow::Result<()> {
+		self.inner.reveal_addresses_to(KeychainKind::External, 0).for_each(drop);
+		self.inner.mark_used(KeychainKind::External, 0);
+		self.persist().await
+	}
+
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -617,5 +632,26 @@ impl OnchainWallet {
 			let _ = self.inner.take_staged();
 		}
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod fallback_tests {
+	use crate::persist::adaptor::StorageAdaptorWrapper;
+	use super::*;
+
+	#[tokio::test]
+	async fn fixed_index_zero_remains_reserved_after_reload() {
+		let db = Arc::new(StorageAdaptorWrapper::new_memory());
+		let seed = [17; 64];
+		let mut wallet = OnchainWallet::load_or_create(Network::Regtest, seed, db.clone()).await.unwrap();
+		let reserved = wallet.inner.peek_address(KeychainKind::External, 0).address.script_pubkey();
+		assert_eq!(reserved, wallet.fallback_script());
+		for _ in 0..30 { assert_ne!(wallet.address().await.unwrap().script_pubkey(), reserved); }
+		drop(wallet);
+		let mut wallet = OnchainWallet::load_or_create(Network::Regtest, seed, db).await.unwrap();
+		assert_ne!(wallet.inner.next_unused_address(KeychainKind::External).address.script_pubkey(), reserved);
+		assert_ne!(wallet.address().await.unwrap().script_pubkey(), reserved);
+		assert_eq!(wallet.fallback_script(), reserved);
 	}
 }

@@ -93,6 +93,8 @@ async fn board_board() {
 	bark.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	let vtxos = bark.vtxo_ids().await;
 	assert_eq!(vtxos.len(), 1);
+	let [boarded] = bark.vtxos_no_sync().await.try_into().expect("one boarded vtxo");
+	assert_eq!(boarded.vtxo.id, vtxos[0]);
 
 	let movement = bark.history().await.last().cloned().unwrap();
 	assert_eq!(movement.status, MovementStatus::Successful);
@@ -113,11 +115,23 @@ async fn board_board() {
 	let metadata = movement.metadata.as_ref().unwrap();
 
 	let onchain_fee_sat = metadata.get("onchain_fee_sat").map(|f| serde_json::from_value::<Amount>(f.clone()).unwrap());
-	assert_eq!(onchain_fee_sat, Some(sat(772)));
-	assert_eq!(
-		metadata.get("chain_anchor").map(|ca| serde_json::from_value::<OutPoint>(ca.clone()).unwrap()).is_some(),
-		true,
-	);
+	let chain_anchor = metadata.get("chain_anchor")
+		.map(|ca| serde_json::from_value::<OutPoint>(ca.clone()).unwrap()).unwrap();
+	assert_eq!(chain_anchor, boarded.vtxo.chain_anchor);
+	let funding = ctx.bitcoind().await_transaction(chain_anchor.txid).await;
+	assert_eq!(funding.compute_txid(), chain_anchor.txid);
+	assert_eq!(funding.output[chain_anchor.vout as usize].value, sat(100_000));
+
+	// Resolve the signed funding fee independently of descriptor and signature size.
+	let mut input_value = sat(0);
+	for input in &funding.input {
+		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
+		input_value += previous.output[input.previous_output.vout as usize].value;
+	}
+	let output_value = funding.output.iter().map(|output| output.value).sum::<Amount>();
+	let actual_fee = input_value.checked_sub(output_value).expect("funding outputs exceed inputs");
+	assert!(actual_fee > sat(0), "the funded board must pay a miner fee");
+	assert_eq!(onchain_fee_sat, Some(actual_fee));
 }
 
 #[tokio::test]
@@ -388,10 +402,18 @@ async fn movement_offboard() {
 	let vtxos = bark.vtxos().await;
 	assert_eq!(vtxos.len(), 3);
 	let addr = bark.get_onchain_address().await;
+	let rate_quote = srv.get_public_rpc().await
+		.get_offboard_fee_rate(server_rpc::protos::Empty {}).await.unwrap().into_inner();
+	let fee_rate = <bitcoin::FeeRate as bitcoin_ext::FeeRateExt>::from_sat_per_kvb_ceil(
+		rate_quote.sat_vkb,
+	);
+	// The fixture charges no base/expiry fee and 100 additional vbytes.
+	// Include the BIP84 or BIP86 destination script in the quoted size.
+	let charged_weight = bitcoin::Weight::from_vb(100 + addr.script_pubkey().len() as u64).unwrap();
+	let offboard_fee = fee_rate.checked_mul_by_weight(charged_weight).unwrap();
 	let offb_vtxo = vtxos.first().unwrap();
 	let offboard_txid = bark.offboard_vtxo(offb_vtxo.id, &addr).await;
 
-	let offboard_fee = sat(938);
 
 	// With 0 required confirmations, the movement completes immediately
 	let movement = bark.history().await.last().cloned().unwrap();
@@ -484,13 +506,20 @@ async fn movement_send_onchain() {
 	// 1 consumed VTXO and 1 change VTXO
 	let vtxos_pre_send = bark.vtxo_ids().await;
 	let addr = bark.get_onchain_address().await;
+	let rate_quote = srv.get_public_rpc().await
+		.get_offboard_fee_rate(server_rpc::protos::Empty {}).await.unwrap().into_inner();
+	let fee_rate = <bitcoin::FeeRate as bitcoin_ext::FeeRateExt>::from_sat_per_kvb_ceil(
+		rate_quote.sat_vkb,
+	);
+	// The fixture charges no base/expiry fee and 100 additional vbytes.
+	// Include the BIP84 or BIP86 destination script in the quoted size.
+	let charged_weight = bitcoin::Weight::from_vb(100 + addr.script_pubkey().len() as u64).unwrap();
+	let offboard_fee = fee_rate.checked_mul_by_weight(charged_weight).unwrap();
 	let amount = sat(50_000);
 	let offboard_txid = bark.send_onchain(&addr, amount).await;
 	ctx.generate_blocks(2).await;
 	bark.maintain().await;
 	let vtxos_post_send = bark.vtxo_ids().await;
-
-	let offboard_fee = sat(938);
 
 	let movement = bark.history().await.last().cloned().unwrap();
 	assert_eq!(movement.status, MovementStatus::Successful);

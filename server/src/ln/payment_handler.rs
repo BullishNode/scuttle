@@ -17,6 +17,7 @@ use crate::telemetry;
 /// so that every payment-attempt status change is consistently followed by
 /// a broadcast and (for final states) a mailbox notification.
 pub(crate) struct PaymentAttemptHandler<'a> {
+	network: bitcoin::Network,
 	db: &'a database::Db,
 	mailbox_manager: &'a crate::mailbox_manager::MailboxManager,
 	payment_update_tx: &'a broadcast::Sender<PaymentHash>,
@@ -27,8 +28,9 @@ impl<'a> PaymentAttemptHandler<'a> {
 		db: &'a database::Db,
 		mailbox_manager: &'a crate::mailbox_manager::MailboxManager,
 		payment_update_tx: &'a broadcast::Sender<PaymentHash>,
+		network: bitcoin::Network,
 	) -> Self {
-		Self { db, mailbox_manager, payment_update_tx }
+		Self { db, mailbox_manager, payment_update_tx, network }
 	}
 
 	/// Mark a lightning payment attempt as failed.
@@ -82,7 +84,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 			let failure = LightningFailureKind::classify(error.or(attempt.error.as_deref()));
 
 			self.post_lightning_send_finished(
-				attempt.payment_hash, None, Some(failure),
+				attempt, None, Some(failure),
 			).await;
 
 			// Attempted amount (not final_amount_msat) so failed/succeeded
@@ -136,6 +138,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 		}
 
 		let updated = self.db.write(async |t| {
+			t.lock_lightning_attempt_sources(attempt.id).await?;
 			let updated = t.verify_and_update_payment_attempt(
 				attempt, status, payment_error, final_amount_msat
 			).await?;
@@ -159,7 +162,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 			// optimistic-lock race would otherwise leave the vtxos flagged
 			// ln-spent for an attempt we did not transition.
 			if updated && preimage.is_some() {
-				let not_spendable = t.mark_htlc_send_vtxos_ln_spent(attempt.payment_hash).await?;
+				let not_spendable = t.mark_htlc_send_vtxos_ln_spent(attempt.id).await?;
 				if !not_spendable.is_empty() {
 					warn!(
 						"Lightning payment attempt ({}): HTLC-send vtxos for payment hash {} \
@@ -186,7 +189,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 
 			if status.is_final() {
 				self.post_lightning_send_finished(
-					attempt.payment_hash, preimage, failure,
+					attempt, preimage, failure,
 				).await;
 			}
 
@@ -229,12 +232,13 @@ impl<'a> PaymentAttemptHandler<'a> {
 	/// Post a lightning send finished notification to the sender's mailbox.
 	async fn post_lightning_send_finished(
 		&self,
-		payment_hash: PaymentHash,
+		attempt: &LightningPaymentAttempt,
 		preimage: Option<Preimage>,
 		failure: Option<LightningFailureKind>,
 	) {
+		let payment_hash = attempt.payment_hash;
 		let mailbox_id = match self.db.read(async |t|
-			t.get_lightning_sender_mailbox_id(payment_hash).await
+			t.get_lightning_sender_mailbox_id(attempt.id).await
 		).await {
 			Ok(Some(id)) => id,
 			Ok(None) => return,
@@ -245,7 +249,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 		};
 
 		match self.db.write(async |t|
-			t.store_lightning_send_finished(mailbox_id, payment_hash, preimage, failure).await
+			t.store_lightning_send_finished(mailbox_id, payment_hash, preimage, failure, self.network).await
 		).await {
 			Ok(Some(checkpoint)) => {
 				self.mailbox_manager.notify(mailbox_id, checkpoint);
@@ -276,7 +280,7 @@ async fn end_xpay(
 	let ended = xpay::end_pending_xpay_by_payment_hash(&**tx, attempt.payment_hash, outcome)
 		.await?;
 	if ended.is_none() {
-		// A pre-V75 attempt never had one; anything else has two writers
+		// A pre-V76 attempt never had one; anything else has two writers
 		// disagreeing on which attempt is open, which the attempt's own
 		// optimistic lock should have prevented.
 		warn!("Lightning payment attempt ({}): no pending cln_xpay row to end for \

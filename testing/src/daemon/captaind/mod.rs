@@ -152,6 +152,15 @@ impl Captaind {
 		self.inner.cfg.lock()
 	}
 
+	/// Derive the test server's mailbox key for independent link verification.
+	pub fn mailbox_keypair(&self) -> bitcoin::secp256k1::Keypair {
+		let cfg = self.config();
+		let seed = server::wallet::read_mnemonic_from_datadir(&cfg.data_dir).unwrap().to_seed("");
+		let master = bitcoin::bip32::Xpriv::new_master(cfg.network, &seed).unwrap();
+		let path = bitcoin::bip32::DerivationPath::from_str("m/2'/1'").unwrap();
+		master.derive_priv(&ark::SECP, &path).unwrap().to_keypair(&ark::SECP)
+	}
+
 	pub fn config_mut(&self) -> parking_lot::MutexGuard<'_, Config> {
 		self.inner.cfg.lock()
 	}

@@ -1,0 +1,4 @@
+- Fix Lightning sends that remain pending after all payment parts fail
+  The pinned Core Lightning build clears completed routing work so the normal
+  refund flow can proceed after the last live part fails.
+  [#60](https://github.com/BullishNode/scuttle/pull/60)

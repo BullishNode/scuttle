@@ -27,12 +27,37 @@ async fn board_all_barkd() {
 
 	let board = barkd.board_all().await;
 
-	// board_all drains the onchain wallet; the gross board amount is the
-	// funded amount minus the onchain tx fee. With deterministic regtest
-	// fees the resulting net amount (after Ark fees) is fixed:
-	// 99,443 - base (100) - ceil(994.43) = 98,348
-	let expected_net = sat(98_348);
+	let funding = ctx.bitcoind().await_transaction(board.funding_tx.txid).await;
+	assert_eq!(funding.compute_txid(), board.funding_tx.txid);
+	assert!(funding.input.iter().all(|input|
+		!input.witness.is_empty() || !input.script_sig.is_empty()), "Core must see the signed funding transaction");
+	// The response can carry the unsigned PSBT transaction; bind its complete shape to Core.
+	let mut core_shape = funding.clone();
+	let mut response_shape = board.funding_tx.tx.clone();
+	for input in &mut core_shape.input { input.witness.clear(); }
+	for input in &mut response_shape.input { input.witness.clear(); }
+	assert_eq!(core_shape, response_shape);
+	let vtxo = barkd.get_vtxo(&board.vtxos.first().expect("board VTXO").to_string()).await;
+	assert_eq!(vtxo.vtxo.id, board.vtxos[0]);
+	assert_eq!(vtxo.vtxo.amount, board.amount);
+	let anchor = vtxo.vtxo.chain_anchor;
+	assert_eq!(anchor.txid, funding.compute_txid());
+	let gross = funding.output[anchor.vout as usize].value;
+	let mut input_value = Amount::ZERO;
+	for input in &funding.input {
+		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
+		input_value += previous.output[input.previous_output.vout as usize].value;
+	}
+	let output_value = funding.output.iter().map(|output| output.value).sum::<Amount>();
+	assert_eq!(input_value, sat(100_000));
+	assert_eq!(output_value, gross, "board_all must drain into its funding output");
+	let miner_fee = input_value.checked_sub(output_value).expect("funding outputs exceed inputs");
+	assert!(miner_fee > Amount::ZERO);
+	// Apply the declared base and ceiling-rounded 1% to the gross funding value.
+	let ark_fee = sat(100 + gross.to_sat().div_ceil(100));
+	let expected_net = gross.checked_sub(ark_fee).expect("Ark fee exceeds gross board value");
 	assert_eq!(board.amount, expected_net, "board_all net amount should match expected");
+	assert_eq!(input_value, miner_fee + ark_fee + board.amount);
 
 	let balance_after = barkd.bark_balance().await;
 	assert_eq!(balance_after.pending_board, board.amount, "pending board should match board amount");

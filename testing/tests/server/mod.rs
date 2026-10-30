@@ -1,7 +1,51 @@
+mod expiry_test;
+mod expiry_partial_conflict_reorg;
+mod expiry_failed_swap;
+mod offboard_restart;
+mod expiry_internal_terminal_return;
+mod expiry_view_service;
+mod expiry_admission;
+mod expiry_races;
+mod expiry_refresh_completion;
+mod expiry_replacement_transfer;
+mod expiry_operation_races;
+mod expiry_transfer_refresh;
+mod expiry_ownership;
+mod expiry_dispatch;
+mod expiry_lightning_terminal;
+mod expiry_lightning_native_status;
+mod expiry_internal_replan;
+mod expiry_internal_reclaim_reorg;
+mod expiry_internal_partial_terminal;
+mod expiry_internal_batched_terminal;
+mod expiry_internal_reserved_batched_terminal;
+mod expiry_hash_provenance;
+mod expiry_payout_flow;
+mod expiry_split;
+mod expiry_send_claim;
+mod expiry_send_claim_receipts;
+mod expiry_reorg;
+mod expiry_conflict;
+mod expiry_independent_payouts;
+mod lightning_dispatch_reply_loss;
+mod lightning_forwarded_ack;
+mod lightning_forwarded_reopen;
+mod expiry_oversize;
+mod lightning_receive_fallback;
+mod lightning_receive_unmaterialized;
+mod expiry_cold_backup;
+mod lightning_cold_backup;
+mod offboard_reply_restore;
+mod expiry_tiny_payout_grouping;
+mod expiry_dust_later_receipt;
+mod expiry_three_owner_forwarding;
+mod expiry_script_dust_boundaries;
 mod ban;
 mod blocklist;
 mod block_index;
 mod forfeit;
+mod fallback;
+mod expiry_attribution;
 mod lightning;
 mod mailbox;
 mod nursery;
@@ -13,6 +57,7 @@ mod registration;
 mod round_status_privacy;
 mod settler;
 mod watchman;
+mod watchman_wallet;
 
 use std::iter;
 use std::str::FromStr;
@@ -38,6 +83,7 @@ use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::attestations::ArkoorCosignAttestation;
 use ark::attestations::VtxoStatusAttestation;
+use ark::fallback::{FallbackRegistration, OwnerLink};
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
 use ark::rounds::{Challenge, RoundAttemptAttestation, RoundEvent, RoundSeq};
 use ark::test_util::dummy::{DummyTestVtxoSpec, DUMMY_USER_KEY};
@@ -61,7 +107,8 @@ use ark_testing::exit::complete_exit;
 use server_rpc::protos::mailbox_server::mailbox_message::Message;
 
 lazy_static::lazy_static! {
-	static ref RANDOM_PK: PublicKey = "02c7ef7d49b365974cd219f7036753e1544a3cdd2120eb7247dd8a94ef91cf1e49".parse().unwrap();
+	static ref RANDOM_KEY: Keypair = Keypair::from_seckey_slice(&SECP, &[42; 32]).unwrap();
+	static ref RANDOM_PK: PublicKey = RANDOM_KEY.public_key();
 }
 
 #[tokio::test]
@@ -794,13 +841,21 @@ async fn max_vtxo_exit_depth() {
 #[tokio::test]
 async fn wallet_skips_vtxos_at_exit_depth_limit() {
 	let ctx = TestContext::new("server/wallet_skips_vtxos_at_exit_depth_limit").await;
+	let lightning = Box::pin(ctx.new_lightning_setup("lightningd")).await;
 
-	let srv = ctx.captaind("server").cfg(|cfg| {
+	let srv = Box::pin(ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| {
 		cfg.max_vtxo_exit_depth = 10;
-	}).create().await;
+		cfg.max_arkoor_fanout = 4;
+		cfg.nb_round_nonces = 3;
+		cfg.vtxopool.max_vtxo_exit_depth = 9;
+		cfg.vtxopool.vtxo_targets = vec!["1000sat:10".parse().unwrap(), "10000sat:10".parse().unwrap()];
+		cfg.round_interval = Duration::from_secs(3600);
+	}).create()).await;
 	ctx.fund_captaind(&srv, btc(10)).await;
+	assert!(srv.config().vtxopool.vtxo_targets.iter().map(|target| target.count).sum::<usize>() <= 64);
 
-	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
+	let bark1 = Box::pin(ctx.bark("bark1", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
+		.funded(sat(1_000_000)).create()).await;
 
 	bark1.board_and_confirm_and_register(&ctx, sat(800_000)).await;
 
@@ -818,6 +873,47 @@ async fn wallet_skips_vtxos_at_exit_depth_limit() {
 		err.contains("Insufficient money"),
 		"expected insufficient money, got: {err}",
 	);
+
+	let client = bark1.client().await;
+	let before = client.spendable_vtxos().await.unwrap();
+	assert_eq!(before.len(), 1);
+	assert_eq!(before[0].exit_depth, 11);
+	let old = before[0].id();
+	let (refreshed, _) = tokio::join!(client.maintenance_refresh(), async {
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		srv.trigger_round().await;
+	});
+	assert!(refreshed.unwrap().expect("depth maintenance must join a round").is_success());
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	client.sync().await;
+	let replacement = client.spendable_vtxos().await.unwrap();
+	assert_eq!(replacement.iter().map(|vtxo| vtxo.amount()).sum::<Amount>(), sat(800_000));
+	assert!(replacement.iter().all(|vtxo| vtxo.id() != old && vtxo.exit_depth < 10));
+	assert_eq!(client.get_vtxo_by_id(old).await.unwrap().state, bark::vtxo::VtxoState::Spent);
+	drop(client);
+
+	let receiver = ctx.bark("receiver", &srv).create().await;
+	bark1.send_oor(&receiver.address().await, sat(10_000)).await;
+	receiver.sync().await;
+	assert_eq!(receiver.offchain_balance().await.spendable, sat(10_000));
+	lightning.sync().await;
+	let invoice = lightning.external.invoice(Some(sat(20_000)), "after-depth-refresh", "refreshed payment").await;
+	bark1.pay_lightning_wait(&invoice, None).await;
+	lightning.external.wait_invoice_paid("after-depth-refresh").await;
+	bark1.sync().await;
+	let balance = bark1.offchain_balance().await;
+	assert_eq!(balance.spendable, sat(770_000));
+	assert_eq!(balance.needs_refresh, sat(0));
+	assert_eq!(balance.pending_lightning_send, sat(0));
+	let invoice: bark::lightning_invoice::Bolt11Invoice = invoice.parse().unwrap();
+	let hash = ark::lightning::PaymentHash::from(&invoice);
+	let pays = lightning.internal.grpc_client().await.list_pays(cln_rpc::ListpaysRequest {
+		payment_hash: Some(hash.to_vec()), ..Default::default()
+	}).await.unwrap().into_inner().pays;
+	assert_eq!(pays.len(), 1);
+	assert_eq!(pays[0].status(), cln_rpc::listpays_pays::ListpaysPaysStatus::Complete);
+	assert_eq!(pays[0].amount_msat.as_ref().unwrap().msat, 20_000_000);
+	assert_eq!(pays[0].amount_sent_msat.as_ref().unwrap().msat, 20_000_000);
 }
 
 #[tokio::test]
@@ -1164,9 +1260,10 @@ async fn double_spend_arkoor() {
 		protos::ArkoorPackageCosignRequest::from(cosign_request)
 	};
 
-	let req1 = sign_cosign_request(builder1);
-	let req2 = sign_cosign_request(builder2);
-	let req3 = sign_cosign_request(builder3);
+	test_owner_link(&srv, &RANDOM_KEY).await;
+	let req1 = signed_package(&srv, &[&bark_client], sign_cosign_request(builder1)).await;
+	let req2 = signed_package(&srv, &[&bark_client], sign_cosign_request(builder2)).await;
+	let req3 = signed_package(&srv, &[&bark_client], sign_cosign_request(builder3)).await;
 
 	// Create 3 rpc-clients so we can send 3 requests in paralel
 	let mut rpc1 = srv.get_public_rpc().await;
@@ -1234,6 +1331,9 @@ async fn reject_expired_arkoor_cosign() {
 	let cosign_request = protos::ArkoorPackageCosignRequest::from(
 		builder.generate_user_nonces(&[vtxo_keypair]).unwrap().cosign_request(),
 	);
+
+	test_owner_link(&srv, &RANDOM_KEY).await;
+	let cosign_request = signed_package(&srv, &[&bark_client], cosign_request).await;
 
 	// Let the vtxo expire before the server sees the request.
 	let height = ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32() + 1).await;
@@ -1443,6 +1543,7 @@ async fn bad_round_input() {
 		input_vtxos: vec![],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
 			vtxo: Some(protos::VtxoRequest {
+				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
 			}),
@@ -1491,6 +1592,7 @@ async fn bad_round_input() {
 		input_vtxos: vec![fake_input],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
 			vtxo: Some(protos::VtxoRequest {
+				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
 			}),
@@ -1614,6 +1716,7 @@ async fn reject_overlong_board_cosign() {
 
 	let mut rpc = srv.get_public_rpc().await;
 	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
+		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
 		amount: sat(100_000).to_sat(),
 		utxo: OutPoint::null().serialize(),
 		expiry_height,
@@ -1670,6 +1773,7 @@ async fn request_board_cosign_with_funding_tx(
 
 	let mut rpc = srv.get_public_rpc().await;
 	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
+		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
 		amount: amount.to_sat(),
 		utxo: utxo.serialize(),
 		expiry_height: tip + ark_info.vtxo_lifetime.to_u32(),
@@ -2517,6 +2621,7 @@ async fn test_register_board() {
 
 	// Request server to cosign the board
 	let cosign_request = protos::BoardCosignRequest {
+		owner_proof: Some(test_owner_link(&srv, &client_cosign_keypair).await.into()),
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
 		expiry_height: expiry_height.into(),
@@ -2772,6 +2877,89 @@ async fn board_exit_tx_prevents_registration() {
 	assert_eq!(balance, Amount::ZERO, "spendable balance should be zero since board was not registered");
 }
 
+/// Authenticate synthetic database coins through the same signature verifier as issuance.
+async fn register_test_owners(
+	db: &server::database::Db, server_key: &bitcoin::secp256k1::Keypair,
+	mailbox_key: &bitcoin::secp256k1::Keypair, coin_keys: &[bitcoin::secp256k1::Keypair],
+) {
+	let network = bitcoin::Network::Regtest;
+	let spk = bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox_key.x_only_public_key().0, None);
+	let record = FallbackRegistration::new(network, spk, mailbox_key).unwrap();
+	let mailbox = MailboxIdentifier::from_pubkey(mailbox_key.public_key());
+	db.write(async |tx| {
+		tx.set_fallback(mailbox_key.public_key(), &record, network).await?;
+		for key in coin_keys {
+			let link = OwnerLink::new_joint(network, server_key.public_key(), mailbox_key, key).unwrap();
+			tx.verify_owner_link(server_key, key.public_key(), &link, network).await?;
+		}
+		Ok(())
+	}).await.unwrap();
+}
+
+fn test_server_mailbox_key() -> &'static bitcoin::secp256k1::Keypair {
+	static KEY: std::sync::OnceLock<bitcoin::secp256k1::Keypair> = std::sync::OnceLock::new();
+	KEY.get_or_init(|| bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[251; 32]).unwrap())
+}
+
+async fn register_vector_owners(db: &server::database::Db) {
+	// Private keys from the canonical transaction-vector generator.
+	let keys = [
+		"fab9e598081a3e74b2233d470c4ad87bcc285b6912ed929568e62ac0e9409879",
+		"33b6f3ede430a1a53229f55da7117242d8392cbfc64a57249ba70731dba71408",
+		"fcc43a4f03356092a945ca1d7218503156bed3f94c2fa224578ce5b158fbf5a6",
+		"0a832e9574070c94b5b078600a18639321c880c830c5ba2f2a96850c7dcc4725",
+		"c0b645b01cac427717a18b30c7c9238dee2b3885f659930144fbe05061ad6166",
+		"ad12595bdbdab56cb61d1f60ccc46ff96b11c5d6fe06ae7ba03d3a5f4347440f",
+	].iter().map(|key| Keypair::from_str(key).unwrap()).collect::<Vec<_>>();
+	let server = test_server_mailbox_key();
+	register_test_owners(db, server, server, &keys).await;
+}
+
+/// Standalone protocol actors authenticate their real key and destination.
+async fn test_owner_link(srv: &Captaind, key: &Keypair) -> OwnerLink {
+	let config = srv.config().postgres.clone();
+	let db = server::database::Db::connect(&config).await.unwrap();
+	let server = srv.mailbox_keypair();
+	register_test_owners(&db, &server, key, &[*key]).await;
+	OwnerLink::new_joint(bitcoin::Network::Regtest, server.public_key(), key, key).unwrap()
+}
+
+/// Carry real evidence through hand-built financial requests. Wallet outputs
+/// sign from their keystores; custom actors copy their previously signed link.
+async fn signed_package(
+	srv: &Captaind, wallets: &[&Wallet], mut package: protos::ArkoorPackageCosignRequest,
+) -> protos::ArkoorPackageCosignRequest {
+	let server = srv.ark_info().await.mailbox_pubkey;
+	let config = srv.config().postgres.clone();
+	let db = server::database::Db::connect(&config).await.unwrap();
+	let mut links = std::collections::BTreeMap::new();
+	for output in package.parts.iter().flat_map(|part| part.outputs.iter().chain(&part.isolated_outputs)) {
+		let key = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
+		if links.contains_key(&key) { continue; }
+		let mut link = None;
+		for wallet in wallets {
+			if wallet.pubkey_keypair(&key).await.unwrap().is_some() {
+				link = Some(wallet.owner_link(key).await.unwrap());
+				break;
+			}
+		}
+		if link.is_none() {
+			link = db.read(async |tx| Ok(tx.query_opt("SELECT joint_proof FROM expiry_owner_key WHERE user_pubkey=$1",
+				&[&key.to_string()]).await?.and_then(|row| row.get::<_, Option<&str>>("joint_proof")
+					.map(|proof| OwnerLink::deserialize_hex(proof).unwrap())))).await.unwrap();
+		}
+		let link = link.unwrap_or_else(|| panic!("hand-built output {key} needs its real signing key"));
+		assert!(link.is_joint());
+		link.verify_joint(bitcoin::Network::Regtest, &srv.mailbox_keypair(), key).unwrap();
+		links.insert(key, link);
+	}
+	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		let key = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
+		output.owner_proof = Some(links[&key].into());
+	}
+	package
+}
+
 #[tokio::test]
 async fn scheduled_height_must_not_poison_round_loading() {
 	let ctx = TestContext::new("server/scheduled_height_round_loading").await;
@@ -2845,12 +3033,14 @@ async fn confirmed_exit_during_signing_does_not_stop_round_coordinator() {
 	let attestation = RoundAttemptAttestation::new(
 		challenge, input_id, &[request.clone()], &input_key,
 	);
+	let mut request = protos::SignedVtxoRequest::from(request);
+	request.vtxo.as_mut().unwrap().owner_proof = Some(wallet.owner_link(input.user_pubkey()).await.unwrap().into());
 	rpc.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: vec![protos::InputVtxo {
 			vtxo_id: input_id.to_bytes().to_vec(),
 			attestation: attestation.serialize(),
 		}],
-		vtxo_requests: vec![request.into()],
+		vtxo_requests: vec![request],
 		#[allow(deprecated)]
 		offboard_requests: vec![],
 		unblinded_mailbox_id: None,

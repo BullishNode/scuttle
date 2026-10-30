@@ -65,6 +65,16 @@
               }
             }
           },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -103,6 +113,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/PendingBoardInfo"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
                 }
               }
             }
@@ -1384,6 +1404,16 @@
               }
             }
           },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -1461,6 +1491,16 @@
               }
             }
           },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -1480,7 +1520,7 @@
           "lightning"
         ],
         "summary": "Create a BOLT11 invoice for an Ark address",
-        "description": "Generates a new BOLT11 invoice. When paid, the wallet claims the Lightning receive and forwards the resulting Ark VTXO to the supplied Ark address mailbox. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.",
+        "description": "Generates a new BOLT11 invoice. When paid, the wallet app claims the Lightning receive and forwards the resulting Ark VTXO to the specified Ark address mailbox. The address must carry a valid signed mailbox link. The server verifies the link and the recipient's immutable fallback registration before it accepts the destination output. Missing or invalid ownership evidence at expiry leaves the bitcoin held; it never makes that bitcoin the provider's or operator's. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.",
         "operationId": "generate_invoice_for_address",
         "requestBody": {
           "content": {
@@ -1509,6 +1549,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
                 }
               }
             }
@@ -2452,6 +2502,16 @@
               }
             }
           },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -2526,6 +2586,16 @@
               }
             }
           },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -2560,6 +2630,47 @@
           },
           "500": {
             "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallet/fallback": {
+      "get": {
+        "tags": [
+          "wallet"
+        ],
+        "summary": "Get fallback registration and payout address",
+        "operationId": "fallback_registration",
+        "responses": {
+          "200": {
+            "description": "Authenticated fallback registration, if present",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRegistrationInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No wallet is loaded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Registration cannot be authenticated",
             "content": {
               "application/json": {
                 "schema": {
@@ -2821,6 +2932,16 @@
               }
             }
           },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -2883,6 +3004,16 @@
               }
             }
           },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -2904,6 +3035,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/PendingRoundInfo"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
                 }
               }
             }
@@ -2946,6 +3087,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
                 }
               }
             }
@@ -3012,6 +3163,16 @@
               }
             }
           },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -3070,6 +3231,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
                 }
               }
             }
@@ -3161,6 +3332,16 @@
               }
             }
           },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -3199,6 +3380,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/OffboardResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
                 }
               }
             }
@@ -3246,6 +3437,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/MailboxSyncResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The server refused the operation or recipient; inspect the stable refusal code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackRefusalError"
                 }
               }
             }
@@ -3623,6 +3824,7 @@
         "type": "object",
         "description": "The different balances of a Bark wallet.\n\n`spendable_sat` counts the spendable VTXOs, `needs_refresh_sat` the ones\nthat have to be refreshed before they can be sent again, and every other\nfield what an operation in progress holds, so the fields never overlap.\n\nSee [BalanceSummary] for the totals to show a user.\n\nAll amounts are in sats.",
         "required": [
+          "awaiting_settlement_sat",
           "spendable_sat",
           "needs_refresh_sat",
           "pending_lightning_send_sat",
@@ -3634,6 +3836,12 @@
           "pending_exit_sat"
         ],
         "properties": {
+          "awaiting_settlement_sat": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Owned value awaiting settlement; included in pending, never spendable.",
+            "minimum": 0
+          },
           "claimable_lightning_receive_sat": {
             "type": "integer",
             "format": "int64",
@@ -5740,6 +5948,40 @@
           }
         }
       },
+      "FallbackRefusalError": {
+        "type": "object",
+        "description": "Stable native SDK refusal. Consumers select the code, never diagnostic text.",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "FallbackRegistrationInfo": {
+        "type": "object",
+        "description": "The app-selected fallback destination authenticated by this wallet.",
+        "required": [
+          "registered"
+        ],
+        "properties": {
+          "payout_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "registered": {
+            "type": "boolean"
+          }
+        }
+      },
       "FeeEstimateQuery": {
         "type": "object",
         "description": "Query parameters for fee estimates that only require an amount.",
@@ -7651,6 +7893,10 @@
               "state"
             ],
             "properties": {
+              "awaiting_settlement": {
+                "type": "boolean",
+                "description": "The expired coin is excluded from new operations pending an\nauthoritative server decision or in-flight operation settlement."
+              },
               "state": {
                 "$ref": "#/components/schemas/VtxoStateInfo",
                 "description": "The current state of this VTXO in the wallet."

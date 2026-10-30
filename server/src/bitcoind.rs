@@ -12,8 +12,9 @@
 //! Emitter loop inside `tokio::task::spawn_blocking`.
 
 use std::borrow::Borrow;
+use std::collections::BTreeSet;
 
-use anyhow::{bail, Context};
+use anyhow::{bail, ensure, Context};
 use bitcoin::consensus::encode;
 use bitcoin::{Amount, BlockHash, FeeRate, Network, OutPoint, Transaction, TxOut, Txid, Weight};
 use bitcoind_async_client::Client;
@@ -208,6 +209,30 @@ pub async fn submit_package<T: Borrow<Transaction>>(
 	client.call_raw("submitpackage", &[hexes.into()]).await
 }
 
+/// RPC transport success does not mean Core admitted the package. Require an
+/// error-free result for every submitted transaction before recording its
+/// publication. Core can already hold another valid witness for the same txid;
+/// confirmation still requires separate canonical chain proof.
+pub(crate) fn require_package_acceptance(
+	result: &SubmitPackageResult, transactions: &[&Transaction],
+) -> anyhow::Result<()> {
+	ensure!(result.package_msg == "success", "Core rejected payout package: {}", result.package_msg);
+	ensure!(!transactions.is_empty() && result.tx_results.len() == transactions.len(),
+		"Core did not report the complete payout package");
+	let mut ids = BTreeSet::new();
+	for transaction in transactions {
+		let txid = transaction.compute_txid();
+		ensure!(ids.insert(txid), "payout package repeats a transaction");
+		let accepted = result.tx_results.get(&transaction.compute_wtxid())
+			.context("Core omitted the submitted payout transaction")?;
+		ensure!(accepted.txid == txid, "Core payout result identifies a different transaction");
+		if let Some(error) = &accepted.error {
+			bail!("Core rejected payout transaction {txid}: {error}");
+		}
+	}
+	Ok(())
+}
+
 pub async fn test_mempool_accept(
 	client: &Client, txs: &[&Transaction],
 ) -> Result<Vec<rpc::json::TestMempoolAcceptResult>, ClientError> {
@@ -242,6 +267,59 @@ pub async fn require_version(client: &Client) -> anyhow::Result<()> {
 #[cfg(test)]
 mod test {
 	use super::*;
+	use bitcoin::hashes::Hash;
+	use serde_json::json;
+
+	// The gate checks Core's publication receipt, not transaction validity.
+	// Distinct consensus encodings make omission/substitution observable.
+	fn package_transactions() -> [Transaction; 2] {
+		[0, 1].map(|height| Transaction {
+			version: bitcoin::transaction::Version::non_standard(3),
+			lock_time: bitcoin::absolute::LockTime::from_consensus(height),
+			input: Vec::new(), output: Vec::new(),
+		})
+	}
+
+	fn package_receipt(transactions: &[Transaction]) -> Value {
+		let results = transactions.iter().map(|tx| (tx.compute_wtxid().to_string(),
+			json!({"txid":tx.compute_txid()}))).collect::<serde_json::Map<_, _>>();
+		json!({"package_msg":"success", "tx-results":results})
+	}
+
+	#[test]
+	fn payout_package_acceptance_requires_all_exact_signed_results() {
+		let transactions = package_transactions();
+		let expected = transactions.iter().collect::<Vec<_>>();
+		let receipt: SubmitPackageResult = serde_json::from_value(package_receipt(&transactions)).unwrap();
+		// Already-known successful results may omit fee details entirely.
+		require_package_acceptance(&receipt, &expected).unwrap();
+		assert!(require_package_acceptance(&receipt, &[]).is_err());
+		assert!(require_package_acceptance(&receipt, &[&transactions[0], &transactions[0]]).is_err());
+		let mut missing = package_receipt(&transactions);
+		missing["tx-results"].as_object_mut().unwrap().remove(&transactions[1].compute_wtxid().to_string());
+		assert!(require_package_acceptance(&serde_json::from_value(missing).unwrap(), &expected).is_err());
+		let mut substituted = package_receipt(&transactions);
+		let rows = substituted["tx-results"].as_object_mut().unwrap();
+		let row = rows.remove(&transactions[1].compute_wtxid().to_string()).unwrap();
+		rows.insert(bitcoin::Wtxid::all_zeros().to_string(), row);
+		assert!(require_package_acceptance(&serde_json::from_value(substituted).unwrap(), &expected).is_err());
+		let mut foreign = package_receipt(&transactions);
+		foreign["tx-results"][transactions[1].compute_wtxid().to_string()]["txid"] = json!(bitcoin::Txid::all_zeros());
+		assert!(require_package_acceptance(&serde_json::from_value(foreign).unwrap(), &expected).is_err());
+	}
+
+	#[test]
+	fn payout_package_rpc_success_cannot_hide_partial_rejection() {
+		let transactions = package_transactions();
+		let expected = transactions.iter().collect::<Vec<_>>();
+		let mut rejected = package_receipt(&transactions);
+		rejected["package_msg"] = json!("transaction failed");
+		rejected["tx-results"][transactions[1].compute_wtxid().to_string()]["error"] = json!("bad-txns-inputs-missingorspent");
+		assert!(require_package_acceptance(&serde_json::from_value(rejected.clone()).unwrap(), &expected).is_err());
+		// A top-level success alone cannot discharge a transaction-level error.
+		rejected["package_msg"] = json!("success");
+		assert!(require_package_acceptance(&serde_json::from_value(rejected).unwrap(), &expected).is_err());
+	}
 
 	#[test]
 	fn mempool_entry_parses_chunk_fields() {

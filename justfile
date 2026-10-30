@@ -407,6 +407,43 @@ generate-bark-rest-client: dump-bark-rest-openapi-schema
 	# users of this feature install a ring provider themselves. Added before
 	# cargo add, which resolves the workspace and bark-cli needs the feature.
 	echo 'rustls-no-provider = ["reqwest/rustls-no-provider"]' >> {{BARK_REST_CLIENT_DIR}}/Cargo.toml
+	# Untagged error enums must try required code+message before message-only errors.
+	python3 - <<'PY_REFUSALS'
+	import json
+	from pathlib import Path
+	import re
+
+	schema = json.loads(Path("{{BARK_OPENAPI_SCHEMA_PATH}}").read_text())
+	responses = [operation["responses"] for path in schema["paths"].values()
+	    for operation in path.values() if isinstance(operation, dict) and "responses" in operation]
+	refusal = {"$ref": "#/components/schemas/FallbackRefusalError"}
+	declared = [response for response in responses
+	    if response.get("409", {}).get("content", {}).get("application/json", {}).get("schema") == refusal]
+	found = changed = 0
+	variant = "    Status409(models::FallbackRefusalError),\n"
+	bad_request = "    Status400(models::BadRequestError),\n"
+	allowed = {bad_request, "    Status404(models::NotFoundError),\n"}
+	def prefer_refusal(match):
+	    global found, changed
+	    header, body, end = match.groups()
+	    if variant not in body:
+	        return match.group(0)
+	    lines = body.splitlines(keepends=True)
+	    assert lines.count(variant) == 1, "unsupported generated refusal variant"
+	    found += 1
+	    index = lines.index(variant)
+	    assert set(lines[:index]) <= allowed, "unsupported error before refusal"
+	    if bad_request in lines[:index]:
+	        lines.insert(0, lines.pop(index))
+	        changed += 1
+	    return header + "".join(lines) + end
+	for path in Path("{{BARK_REST_CLIENT_DIR}}/src/apis").glob("*_api.rs"):
+	    source = path.read_text()
+	    source = re.sub(r"(pub enum \w+Error \{\n)((?:    [^\n]+\n)*)(\})", prefer_refusal, source)
+	    path.write_text(source)
+	assert found == len(declared), "generated refusal count differs from OpenAPI"
+	assert changed == sum("400" in response for response in declared), "generated bad-request shape changed"
+	PY_REFUSALS
 	cargo add --package bark-rest-client --path bark-json
 	cargo add --package bark-rest-client --path bark-rest --no-default-features
 	rm {{BARK_REST_CLIENT_DIR}}/src/models/*.rs

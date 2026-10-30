@@ -153,6 +153,7 @@ impl ClnNodeInfo {
 			sync_manager.clone(),
 			mailbox_manager.clone(),
 			payment_guards.clone(),
+			expected_network,
 		).await.context("failed to start ClnHold")?;
 
 		let xpay = ClnXpay::start(
@@ -165,6 +166,8 @@ impl ClnNodeInfo {
 			xpay_config.clone(),
 			settler.clone(),
 			mailbox_manager.clone(),
+			payment_guards.clone(),
+			expected_network,
 		).await.context("failed to start ClnXpay")?;
 
 		let online = ClnNodeOnlineState {

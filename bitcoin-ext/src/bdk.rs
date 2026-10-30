@@ -392,6 +392,21 @@ pub trait WalletExt: BorrowMut<Wallet> {
 		tx: &Transaction,
 		fees: MakeCpfpFees,
 	) -> Result<Transaction, CpfpInternalError> {
+		self.make_signed_p2a_cpfp_replacing(
+			tx, fees, &[], DefaultCoinSelectionAlgorithm::default(), None,
+		)
+	}
+
+	/// Reuse the confirmed funding of a verified orphaned child when BDK still
+	/// considers those inputs spent. The caller must verify availability in Core.
+	fn make_signed_p2a_cpfp_replacing<Cs: CoinSelectionAlgorithm + Clone>(
+		&mut self,
+		tx: &Transaction,
+		fees: MakeCpfpFees,
+		excluded: &[OutPoint],
+		coin_selection: Cs,
+		replacement: Option<Txid>,
+	) -> Result<Transaction, CpfpInternalError> {
 		let wallet = self.borrow_mut();
 		let (fee_anchor_point, fee_anchor_txout) = tx.fee_anchor()
 			.ok_or_else(|| CpfpInternalError::NoFeeAnchor(tx.compute_txid()))?;
@@ -407,13 +422,20 @@ pub trait WalletExt: BorrowMut<Wallet> {
 		// We will loop, constructing the transaction and signing it until we exceed the effective
 		// fee rate and meet any minimum fee requirements
 		let mut final_child_weight = Weight::ZERO;
-		let mut fee_needed = extra_fee_needed;
+		let mut fee_needed = replacement.and_then(|id| wallet.tx_graph().get_tx(id))
+			.map(|child| fees.package_fee(parent_weight, child.weight())).unwrap_or(extra_fee_needed);
 		for i in 0..100 {
 			// The change is this transaction's only output, so use a coin selection that
 			// guarantees it stays above the dust limit.
-			let mut b = wallet.build_tx()
-				.coin_selection(WithGuaranteedChange(DefaultCoinSelectionAlgorithm::default()));
+			let builder = match replacement {
+				Some(id) => wallet.build_fee_bump(id)
+					.map_err(|e| CpfpInternalError::General(e.to_string()))?,
+				None => wallet.build_tx(),
+			};
+			let mut b = builder.coin_selection(WithGuaranteedChange(coin_selection.clone()));
+			b.set_recipients(Vec::new());
 			b.only_witness_utxo();
+			b.unspendable(excluded.to_vec());
 			b.exclude_unconfirmed();
 			b.version(3); // for 1p1c package relay, all inputs must be confirmed
 			b.add_fee_anchor_spend(fee_anchor_point, fee_anchor_txout);
@@ -468,8 +490,9 @@ mod test {
 
 	use bdk_wallet::KeychainKind;
 	use bdk_wallet::chain::BlockId;
+	use bdk_wallet::coin_selection::LargestFirstCoinSelection;
 	use bdk_wallet::test_utils::{
-		get_test_wpkh, insert_checkpoint, receive_output, receive_output_in_latest_block,
+		get_test_tr_single_sig_xprv, get_test_wpkh, insert_checkpoint, receive_output, receive_output_in_latest_block,
 		ReceiveTo,
 	};
 	use bitcoin::Network;
@@ -485,6 +508,105 @@ mod test {
 		let op1 = receive_output_in_latest_block(&mut wallet, Amount::from_sat(1_000));
 		receive_output_in_latest_block(&mut wallet, Amount::from_sat(1_001));
 		(wallet, op1)
+	}
+
+	#[test]
+	fn cpfp_largest_first_uses_large_confirmed_funding() {
+		let mut wallet = Wallet::create_single(get_test_tr_single_sig_xprv())
+			.network(Network::Regtest).create_wallet_no_persist().unwrap();
+		insert_checkpoint(&mut wallet, BlockId { height: 1_000, hash: BlockHash::all_zeros() });
+		for _ in 0..100 {
+			receive_output_in_latest_block(&mut wallet, Amount::from_sat(600));
+		}
+		let funding = wallet.list_unspent().collect::<Vec<_>>();
+		assert_eq!(funding.len(), 100);
+		assert_eq!(funding.iter().map(|utxo| utxo.outpoint).collect::<HashSet<_>>().len(), 100);
+		assert!(funding.iter().all(|utxo|
+			utxo.txout.value == Amount::from_sat(600) && utxo.chain_position.is_confirmed()));
+		let parent = Transaction {
+			version: bitcoin::transaction::Version::non_standard(3),
+			lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![bitcoin::TxIn {
+				witness: Witness::from_slice(&[vec![0; 64], vec![0; 137], vec![0; 33]]),
+				..bitcoin::TxIn::default()
+			}],
+			output: vec![TxOut {
+				value: Amount::from_sat(100_000),
+				script_pubkey: wallet.peek_next_address().address.script_pubkey(),
+			}, crate::fee::fee_anchor()],
+		};
+		assert_eq!(parent.weight().to_wu(), 668, "fixed script-spend parent geometry");
+		let original = serialize(&parent);
+		let target = FeeRate::from_sat_per_vb(8).unwrap();
+		let fragmented = wallet.make_signed_p2a_cpfp_replacing(
+			&parent, MakeCpfpFees::Effective(target), &[], LargestFirstCoinSelection, None,
+		).unwrap();
+		assert!(fragmented.vsize() > 1_000, "fragmented signed child must exceed the package limit");
+		wallet.mark_output_keys_unused(&fragmented);
+
+		let large = receive_output_in_latest_block(&mut wallet, Amount::from_sat(100_000));
+		let excluded = receive_output_in_latest_block(&mut wallet, Amount::from_sat(200_000));
+		let unconfirmed = receive_output(&mut wallet, Amount::from_sat(1_000_000), ReceiveTo::Mempool(1));
+		let child = wallet.make_signed_p2a_cpfp_replacing(
+			&parent, MakeCpfpFees::Effective(target), &[excluded], LargestFirstCoinSelection, None,
+		).unwrap();
+		assert!(child.vsize() <= 1_000);
+		assert_eq!(child.input.len(), 2);
+		assert!(child.input.iter().any(|input| input.previous_output == large));
+		assert!(child.input.iter().any(|input| input.previous_output == OutPoint::new(parent.compute_txid(), 1)));
+		assert!(!child.input.iter().any(|input| input.previous_output == excluded || input.previous_output == unconfirmed));
+		let fee = Amount::from_sat(100_000) - child.output.iter().map(|output| output.value).sum::<Amount>();
+		assert!(fee >= target * (parent.weight() + child.weight()));
+		assert_eq!(serialize(&parent), original);
+	}
+
+	#[test]
+	fn cpfp_excludes_unavailable_funding_without_changing_parent() {
+		let (mut wallet, confirmed, unconfirmed) = mixed_confirmation_wallet();
+		let excluded = confirmed[0];
+		let parent = Transaction {
+			version: bitcoin::transaction::Version::non_standard(3),
+			lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![bitcoin::TxIn::default()],
+			output: vec![crate::fee::fee_anchor()],
+		};
+		let original = serialize(&parent);
+		let child = wallet.make_signed_p2a_cpfp_replacing(&parent,
+			MakeCpfpFees::Effective(FeeRate::from_sat_per_vb(1).unwrap()), &[excluded], DefaultCoinSelectionAlgorithm::default(), None).unwrap();
+		assert_eq!(serialize(&parent), original);
+		assert!(!child.input.iter().any(|input| input.previous_output == excluded));
+		assert!(child.input.iter().any(|input| input.previous_output.txid == parent.compute_txid()));
+		assert!(child.input.iter().any(|input| input.previous_output.txid != parent.compute_txid()));
+		assert_eq!(child.input.len(), 2);
+		assert!(child.input.iter().any(|input| input.previous_output == confirmed[1]));
+		assert!(child.input.iter().any(|input| input.previous_output == OutPoint::new(parent.compute_txid(), 0)));
+		assert!(!child.input.iter().any(|input| input.previous_output == unconfirmed));
+
+		// The unconfirmed coin remains available in the wallet, but cannot
+		// replace the confirmed funding excluded by the caller.
+		assert!(matches!(wallet.make_signed_p2a_cpfp_replacing(&parent,
+			MakeCpfpFees::Effective(FeeRate::from_sat_per_vb(1).unwrap()), &confirmed, DefaultCoinSelectionAlgorithm::default(), None),
+			Err(CpfpInternalError::InsufficientConfirmedFunds(_))));
+		let all = wallet.list_unspent().map(|utxo| utxo.outpoint).collect::<Vec<_>>();
+		assert!(wallet.make_signed_p2a_cpfp_replacing(&parent,
+			MakeCpfpFees::Effective(FeeRate::from_sat_per_vb(1).unwrap()), &all, DefaultCoinSelectionAlgorithm::default(), None).is_err());
+
+		let child = wallet.make_signed_p2a_cpfp(&parent,
+			MakeCpfpFees::Effective(FeeRate::from_sat_per_vb(1).unwrap())).unwrap();
+		assert!(child.input.iter().all(|input| confirmed.contains(&input.previous_output)
+			|| input.previous_output == OutPoint::new(parent.compute_txid(), 0)));
+		assert_eq!(serialize(&parent), original);
+
+		// The default empty exclusion list must preserve the same confirmed-only rule.
+		let mut only_unconfirmed = Wallet::create_single(get_test_wpkh())
+			.network(Network::Regtest).create_wallet_no_persist().unwrap();
+		let pending = receive_output(&mut only_unconfirmed, Amount::from_sat(50_000), ReceiveTo::Mempool(1));
+		assert!(only_unconfirmed.list_unspent().any(|utxo| utxo.outpoint == pending));
+		assert!(only_unconfirmed.list_unspent().all(|utxo| !utxo.chain_position.is_confirmed()));
+		assert!(matches!(only_unconfirmed.make_signed_p2a_cpfp(&parent,
+			MakeCpfpFees::Effective(FeeRate::from_sat_per_vb(1).unwrap())),
+			Err(CpfpInternalError::InsufficientConfirmedFunds(_))));
+		assert_eq!(serialize(&parent), original);
 	}
 
 	/// Build the drain-only tx shape of a CPFP child: one mandatory input, an absolute fee it

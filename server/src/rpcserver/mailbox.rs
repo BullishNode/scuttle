@@ -154,8 +154,10 @@ impl rpc::server::MailboxService for crate::Server {
 		// stops a known id from being posted with doctored content that would
 		// route it into a mailbox its owner doesn't watch.
 		let vtxo_ids = vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
-		let stored = self.db.read(async |t| t.get_user_vtxos_by_id(&vtxo_ids).await)
-			.await.to_status()?;
+		let stored = self.db.read(async |t| {
+			t.require_registered_mailbox(mailbox_id, self.config.network).await?;
+			t.get_user_vtxos_by_id(&vtxo_ids).await
+		}).await.to_status()?;
 		for stored in &stored {
 			if stored.vtxo.user_pubkey() != vtxo_pubkey {
 				self::badarg!("vtxo {} doesn't belong to the provided vtxo pubkey", stored.vtxo_id);
@@ -167,6 +169,7 @@ impl rpc::server::MailboxService for crate::Server {
 				MailboxType::ArkoorReceive,
 				mailbox_id,
 				vtxos.as_slice(),
+				self.config.network,
 			).await
 		}).await.to_status()?;
 
@@ -202,7 +205,7 @@ impl rpc::server::MailboxService for crate::Server {
 		}
 		let limit = self.config.max_read_mailbox_items;
 		let entries_by_checkpoint = self.db.read(async |t| {
-			t.get_mailbox_messages(mailbox_id, req.checkpoint, limit).await
+			t.get_mailbox_messages(mailbox_id, req.checkpoint, limit, self.config.network).await
 		}).await.to_status()?;
 
 		let response = protos::mailbox_server::MailboxMessages {
@@ -243,12 +246,15 @@ impl rpc::server::MailboxService for crate::Server {
 		}
 
 		let db = self.db.clone();
+		let network = self.config.network;
 		let starting_checkpoint = Checkpoint::from(req.checkpoint.max(0));
 		let ret_limit = self.config.max_read_mailbox_items;
 
 		// Start listening for updates on the tip of the mailbox.
 		// Marking the first value as changed makes `changed()` return
 		// immediately so the loop starts with a catch-up fetch.
+		self.db.read(async |tx| tx.require_registered_mailbox(mailbox_id, network).await)
+			.await.to_status()?;
 		let mut mailbox_tip_rx = self.mailbox_manager.subscribe(mailbox_id, 0);
 		mailbox_tip_rx.mark_changed();
 
@@ -272,7 +278,7 @@ impl rpc::server::MailboxService for crate::Server {
 
 				'fetching:
 				loop {
-					match db.read(async |tx| { tx.get_mailbox_messages(mailbox_id, processed_cp, ret_limit).await }).await {
+					match db.read(async |tx| { tx.get_mailbox_messages(mailbox_id, processed_cp, ret_limit, network).await }).await {
 						Ok(entries) => {
 							let done = entries.len() < ret_limit;
 							for entry in entries {
@@ -337,6 +343,7 @@ impl rpc::server::MailboxService for crate::Server {
 				MailboxType::RecoveryVtxoId,
 				mailbox_id,
 				vtxo_ids.as_slice(),
+				self.config.network,
 			).await
 		}).await.to_status()?;
 

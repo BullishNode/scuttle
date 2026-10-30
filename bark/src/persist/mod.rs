@@ -37,7 +37,7 @@ use lightning_invoice::Bolt11Invoice;
 #[cfg(feature = "onchain-bdk")]
 use bdk_wallet::ChangeSet;
 
-use ark::{Vtxo, VtxoId};
+use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::lightning::{PaymentHash, Preimage};
 use ark::vtxo::Full;
 
@@ -340,6 +340,16 @@ pub trait BarkPersister: Send + Sync + 'static {
 		vtxos: &[(&Vtxo<Full>, &VtxoState)],
 	) -> anyhow::Result<()>;
 
+	/// Replace only the witness material of an existing VTXO. The caller must
+	/// first fully validate the completed body against its actual chain anchor.
+	/// Preserve the exact bare serialization, state history, holder and recovery
+	/// registration. Return false when the row does not exist; never insert it.
+	async fn update_vtxo_witnesses(&self, vtxo: &Vtxo<Full>) -> anyhow::Result<bool> {
+		let Some(stored) = self.get_full_vtxo(vtxo.id()).await? else { return Ok(false); };
+		ensure!(stored.serialize() == vtxo.serialize(), "this persister does not support VTXO witness updates");
+		Ok(true)
+	}
+
 	/// Fetch a wallet [Vtxo] with its current state by ID.
 	///
 	/// Parameters:
@@ -451,6 +461,29 @@ pub trait BarkPersister: Send + Sync + 'static {
 			self.store_vtxo_key(*index, *public_key).await?;
 		}
 		Ok(())
+	}
+
+	/// Local ownership retained while a reported spend is verified.
+	async fn get_fallback_snapshot(&self) -> anyhow::Result<crate::FallbackSnapshot>;
+
+	/// Atomically replace local recovery ownership.
+	async fn store_fallback_snapshot(&self, snapshot: &crate::FallbackSnapshot) -> anyhow::Result<()>;
+
+	/// Read the immutable signed fallback destination.
+	async fn get_fallback_record(&self) -> anyhow::Result<Option<ark::fallback::FallbackRegistration>>;
+
+	/// Adopt canonical signatures only when the immutable binding is unchanged.
+	async fn store_fallback_record(&self, record: &ark::fallback::FallbackRegistration) -> anyhow::Result<()>;
+
+	/// An authenticated local destination which has not received a server acknowledgement.
+	/// It must not authorize coin issuance or be reported as registered.
+	async fn get_pending_fallback_record(&self) -> anyhow::Result<Option<ark::fallback::FallbackRegistration>> {
+		Ok(None)
+	}
+
+	/// Keep the exact local binding immutable while registration is unavailable.
+	async fn store_pending_fallback_record(&self, _record: &ark::fallback::FallbackRegistration) -> anyhow::Result<()> {
+		bail!("persister does not support pending fallback registration")
 	}
 
 	/// Get the last revealed/used [Vtxo] key index.
@@ -683,6 +716,18 @@ pub trait BarkPersister: Send + Sync + 'static {
 		vtxo_id: VtxoId,
 		holder: Option<&VtxoLockHolder>,
 	) -> anyhow::Result<()>;
+
+	/// Retire precisely `holder`'s lock directly to Spent, without making the
+	/// coin temporarily Spendable. Return false for any foreign holder/state;
+	/// already Spent is idempotent. Implementations must compare and write
+	/// atomically; an unsupported persister must leave the coin untouched.
+	async fn retire_vtxo_lock(
+		&self,
+		_vtxo_id: VtxoId,
+		_holder: Option<&VtxoLockHolder>,
+	) -> anyhow::Result<bool> {
+		bail!("this persister does not support atomic locked-coin retirement")
+	}
 
 	/// Transition multiple VTXOs to `new_state` atomically: either every
 	/// vtxo's state changes or none does. A failure must not affect any

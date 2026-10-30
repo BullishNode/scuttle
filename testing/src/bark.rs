@@ -563,17 +563,35 @@ impl Bark {
 			return balance;
 		}
 
-		let vtxos = self.vtxos_no_sync().await;
-		let spendable_vtxos = vtxos.iter()
-			.filter(|v| v.state == VtxoStateInfo::Spendable)
-			.map(|v| v.amount)
-			.sum::<Amount>();
-		let locked_vtxos = vtxos.iter()
-			.filter(|v| matches!(v.state, VtxoStateInfo::Locked { .. }))
-			.map(|v| v.amount)
-			.sum::<Amount>();
+		let vtxos = serde_json::from_str::<Vec<WalletVtxoInfo>>(
+			&self.run(["vtxos", "--all", "--no-sync"]).await,
+		).expect("retained vtxos");
 
-		assert_eq!(balance.spendable + balance.needs_refresh, spendable_vtxos,
+		let awaiting = vtxos.iter().filter(|coin| coin.awaiting_settlement)
+			.map(|coin| coin.id).collect::<std::collections::HashSet<_>>();
+		let mut paths = Vec::new();
+		if !awaiting.is_empty() {
+			for coin in &vtxos {
+				if coin.state != VtxoStateInfo::Spent {
+					paths.push((coin.id, self.raw_vtxo(coin.id).await.ancestor_ids()));
+				}
+			}
+		}
+		let principal = crate::balance::retained_principal(&vtxos, &awaiting, &paths);
+		let spendable_vtxos = vtxos.iter().filter(|coin| principal.contains_key(&coin.id)
+			&& coin.state == VtxoStateInfo::Spendable)
+			.map(|coin| principal[&coin.id]).sum::<Amount>();
+		let awaiting_vtxos = vtxos.iter().filter(|coin| principal.contains_key(&coin.id)
+			&& (coin.state == VtxoStateInfo::Spendable && awaiting.contains(&coin.id)))
+			.map(|coin| principal[&coin.id]).sum::<Amount>();
+		let locked_vtxos = vtxos.iter().filter(|coin| principal.contains_key(&coin.id)
+			&& matches!(coin.state, VtxoStateInfo::Locked { .. }))
+			.map(|coin| principal[&coin.id]).sum::<Amount>();
+
+		assert_eq!(balance.awaiting_settlement, awaiting_vtxos,
+			"{}: unpaid owned principal stays awaiting settlement: {balance:?}", self.name,
+		);
+		assert_eq!(balance.spendable + balance.needs_refresh + balance.awaiting_settlement, spendable_vtxos,
 			"{}: spendable and needs_refresh must equal the spendable VTXOs: {balance:?}",
 			self.name,
 		);
@@ -588,7 +606,7 @@ impl Bark {
 			self.name,
 		);
 		let summary = json::cli::BalanceSummary::from(&balance);
-		assert_eq!(summary.pending, pending_locked + balance.pending_exit,
+		assert_eq!(summary.pending, pending_locked + balance.pending_exit + balance.awaiting_settlement,
 			"{}: the summary's pending must be the sum of the pending fields: {balance:?}", self.name,
 		);
 		assert_eq!(summary.total, balance.spendable + balance.needs_refresh + summary.pending,

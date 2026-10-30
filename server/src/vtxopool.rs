@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Context;
 use bdk_wallet::coin_selection::SingleRandomDraw;
 use bitcoin::secp256k1::{rand, Keypair};
-use bitcoin::{Amount, OutPoint, Transaction};
+use bitcoin::{Amount, OutPoint};
 use futures::{stream, StreamExt, TryStreamExt};
 use tracing::{debug, error, info, warn};
 
@@ -303,6 +303,8 @@ impl VtxoPool {
 		// This ensures we spend the smallest vtxos first and
 		// we don't have any vtxo that serves as change
 		input_vtxos.sort_by(|v1, v2| v1.amount().cmp(&v2.amount()));
+		ensure!(input_vtxos.iter().all(|v| v.expiry_height() > srv.chain_tip().height),
+			"pool coin expired before the new Lightning grant");
 
 		// Validate that the inputs are still usable and unlocked
 		let _vtxo_guard = srv.vtxos_in_flux.try_lock(&input_ids).map_err(|e| {
@@ -386,7 +388,8 @@ impl VtxoPool {
 			.collect::<Vec<_>>();
 
 		srv.db.write(async |t| {
-			t.execute_vtxo_tree_update(update).await?;
+			crate::database::expiry_guard::guard_new_lightning_inputs(t, &input_ids).await?;
+			t.execute_vtxo_tree_update(update, Some((srv.config.network, srv.mailbox_key.leak_ref()))).await?;
 			htlc_vtxo::create_htlc_vtxos(&t, &htlc_recvs, HtlcDirection::Outgoing).await?;
 			t.mark_vtxopool_vtxos_spent(inputs.iter().map(|v| v.0)).await
 				.context("failed to mark vtxopool vtxos as spent")?;
@@ -628,6 +631,21 @@ impl Process {
 		// finish and broadcast the tx
 		let tx = wallet.finish_tx(funding_psbt).context("error finishing tree funding tx")?;
 
+		// The cached tree still holds unsigned hArk leaf transactions. The
+		// finalized VTXOs above carry their signatures AND preimage;
+		// persist that full path before handing any pool coin to a receive.
+		// Deduplicate shared ancestors so one INSERT cannot update one txid twice.
+		let mut signed_txs = BTreeMap::new();
+		for vtxo in &vtxos {
+			vtxo.validate(&tx).context("finalized pool VTXO has an invalid signed path")?;
+			for step in vtxo.transactions() {
+				let txid = step.tx.compute_txid();
+				if let Some(old) = signed_txs.insert(txid, step.tx.clone()) {
+					ensure!(old == step.tx, "finalized pool paths disagree on a shared transaction");
+				}
+			}
+		}
+
 		// Create the vtxos and virtual transactions in the database
 		// before committing the funding tx to the wallet. The funding tx
 		// is handed to the nursery in the same db tx, so that once the
@@ -636,15 +654,14 @@ impl Process {
 		let confirm_target = self.srv.nursery_confirm_target();
 		let update = VtxoTreeUpdate::new()
 			.upsert_funding_tx(&tx)
-			.upsert_signed_tx(tree.internal_node_txs().iter().cloned())
-			.upsert_unsigned_tx(tree.unsigned_leaf_txs().iter().map(Transaction::compute_txid))
+			.upsert_signed_tx(signed_txs.into_values())
 			.insert_oor_spent_vtxos(tree.internal_vtxos())
 			.insert_unspent_vtxos(
-				tree.output_vtxos().map(ServerVtxo::from),
+				vtxos.iter().cloned().map(ServerVtxo::from),
 				database::SpendState::Pool,
 			);
 		self.srv.db.write(async |t| {
-			t.execute_vtxo_tree_update(update).await?;
+			t.execute_vtxo_tree_update(update, None).await?;
 			t.upsert_nursery_tx(&tx, NurseryTxKind::VtxoPool, confirm_target).await
 		}).await?;
 

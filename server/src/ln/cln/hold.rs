@@ -114,9 +114,10 @@ impl ClnHold {
 		sync_manager: Arc<SyncManager>,
 		mailbox_manager: Arc<crate::mailbox_manager::MailboxManager>,
 		payment_guards: PaymentGuards,
+		network: bitcoin::Network,
 	) -> anyhow::Result<ClnHold> {
 		let proc = ClnHoldProcess {
-			config, db, payment_update_tx, node_id,
+			config, db, payment_update_tx, node_id, network,
 			hold_rpc,
 			sync_manager,
 			mailbox_manager,
@@ -174,6 +175,7 @@ enum TrackAllStreamState {
 }
 
 struct ClnHoldProcess {
+	network: bitcoin::Network,
 	config: ClnHoldConfig,
 	db: database::Db,
 	payment_update_tx: broadcast::Sender<PaymentHash>,
@@ -188,7 +190,7 @@ struct ClnHoldProcess {
 
 impl ClnHoldProcess {
 	fn payment_handler(&self) -> PaymentAttemptHandler<'_> {
-		PaymentAttemptHandler::new(&self.db, &self.mailbox_manager, &self.payment_update_tx)
+		PaymentAttemptHandler::new(&self.db, &self.mailbox_manager, &self.payment_update_tx, self.network)
 	}
 
 	/// Takes the payment lock for a subscription.
@@ -490,7 +492,7 @@ impl ClnHoldProcess {
 			// Post mailbox notification so the client knows to come online and claim
 			let payment_hash = PaymentHash::from(*htlc_subscription.invoice.payment_hash());
 			post_lightning_receive_notification(
-				&self.db, &self.mailbox_manager, payment_hash, htlc_subscription.amount(),
+				&self.db, &self.mailbox_manager, payment_hash, htlc_subscription.amount(), self.network,
 			).await;
 		}
 

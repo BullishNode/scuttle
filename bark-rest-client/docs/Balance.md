@@ -4,6 +4,7 @@
 
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
+**awaiting_settlement_sat** | **i64** | Owned value awaiting settlement; included in pending, never spendable. | 
 **claimable_lightning_receive_sat** | **i64** | Sats in HTLC VTXOs of an incoming Lightning payment whose preimage has been revealed but which have not been swapped for spendable VTXOs yet. A payment that can still be cancelled is not counted. | 
 **needs_refresh_sat** | **i64** | Sats in VTXOs that can no longer be sent in an arkoor payment because they have expired or their exit depth has reached the server's limit. They can still be offboarded, exited or refreshed, but are not part of `spendable_sat` until maintenance has refreshed them. | 
 **pending_arkoor_send_sat** | **i64** | Sats locked in an outgoing arkoor payment that has not completed yet: the whole input amount, until the send finalizes and the change comes back as spendable. | 

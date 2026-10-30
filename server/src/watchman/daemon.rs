@@ -183,6 +183,7 @@ impl Daemon {
 		let listeners: Vec<Box<dyn ChainEventListener>> = vec![
 			Box::new(watchman_wallet.clone()),
 			Box::new(frontier.clone()),
+			Box::new(database::expiry_chain::ExpiryChainListener::start(db.clone(), BlockTable::Watchmand).await?),
 		];
 
 		let sync_manager = SyncManager::start(
@@ -239,6 +240,10 @@ impl Daemon {
 			rtmgr, sync_manager, watchman_wallet, frontier, watchman_handle,
 			bitcoin_address_blocklist,
 		})
+	}
+
+	pub(crate) fn watchman_wallet(&self) -> &InstrumentedLock<PersistedWallet> {
+		&self.watchman_wallet
 	}
 
 	pub fn watchman_handle(&self) -> &WatchmanHandle {

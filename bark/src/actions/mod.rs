@@ -380,7 +380,8 @@ impl<T> RetryUnlessRejected<T> for Result<T, tonic::Status> {
 impl<T> RetryUnlessRejected<T> for anyhow::Result<T> {
 	fn retry_unless_rejected(self) -> Result<T, AdvanceError> {
 		self.map_err(|e| {
-			if let Some(s) = e.downcast_ref::<tonic::Status>() && s.is_rejection() {
+			if crate::FallbackRefusal::from_error(&e).is_some()
+				|| e.downcast_ref::<tonic::Status>().is_some_and(|s| s.is_rejection()) {
 				AdvanceError::Abort(e.into())
 			} else {
 				AdvanceError::Retry(e.into())

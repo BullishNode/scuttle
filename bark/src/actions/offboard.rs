@@ -232,6 +232,11 @@ impl WalletAction for Offboard {
 	}
 
 	async fn advance(self, wallet: &Wallet) -> Result<Advance<Self>, AdvanceError> {
+		if let Progress::OffboardTxPrepared { ref offboard_vtxo_ids, movement_id, .. } = self.progress {
+			if reconcile_fallback_payout(wallet, &self, offboard_vtxo_ids, movement_id).await.retry()? {
+				return Ok(Advance::Failed(crate::FallbackRefusal::DecidedForFallback.into()));
+			}
+		}
 		let new_progress = match self.progress {
 			Progress::Start => {
 				lock_vtxos(wallet, &self).await?
@@ -394,7 +399,19 @@ impl WalletAction for Offboard {
 				or_retry!(self, fail_offboard_movement(wallet, &self).await);
 				Advance::Failed(error)
 			},
-			Progress::OffboardTxPrepared { offboard_vtxo_ids, offboard_tx, .. } => {
+			Progress::OffboardTxPrepared { offboard_vtxo_ids, offboard_tx, movement_id, .. } => {
+				if crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback) {
+					// The requested offboard did not complete. Its pending debit
+					// must not duplicate the fallback receipt's eventual debit.
+					or_retry!(self, cancel_superseded_movement(wallet, *movement_id).await);
+					// This is an admission fence, not proof of payment or
+					// a lost session. Retain the full checkpoint and its holder
+					// while returning the refusal to the caller.
+					return Advance::Park {
+						state: self, wake_after: Some(CONFIRMATION_POLL_INTERVAL),
+						error: Some(error),
+					};
+				}
 				// The server no longer holds a session for this offboard
 				// (finish sessions only survive the server's session
 				// timeout). Either our finish went through and we lost the
@@ -440,6 +457,7 @@ pub(crate) async fn start_offboard(
 	destination: bitcoin::Address,
 	spec: StartOffboardSpec,
 ) -> anyhow::Result<Offboard> {
+	wallet.fallback_destination().await?;
 	let (srv, ark) = wallet.require_server().await?;
 	let offboard_feerate = srv.offboard_feerate().await?;
 	let tip = wallet.inner.chain.tip().await?;
@@ -575,7 +593,7 @@ async fn arkoor_split_offboard(
 	};
 
 	let arkoor = wallet.create_checkpointed_arkoor_with_vtxos(
-		split_destination, inputs.into_iter(), change_keypair, change_pieces.clone(),
+		split_destination, inputs.into_iter(), change_keypair, change_pieces.clone(), None,
 	).await.retry_unless_rejected()?;
 
 	// From here on only retry: aborting would release inputs the server considers spent.
@@ -690,7 +708,7 @@ async fn prepare_offboard(
 			.map(|id| id.to_bytes().to_vec())
 			.collect(),
 		attestation,
-	}).await.retry_unless_rejected()?.into_inner();
+	}).await.map_err(crate::FallbackRefusal::map_status).retry_unless_rejected()?.into_inner();
 
 	// A replayed prepare returns the same response, so a response we can't
 	// use aborts: nothing of ours is forfeited before finish, so `abort`
@@ -785,7 +803,7 @@ async fn finish_offboard(
 		partial_signatures: sigs.partial_signatures.iter()
 			.map(|s| s.serialize().to_vec())
 			.collect(),
-	}).await.retry_unless_rejected()?.into_inner();
+	}).await.map_err(crate::FallbackRefusal::map_status).retry_unless_rejected()?.into_inner();
 
 	// The server holds our forfeits by now, so a response we can't use
 	// retries: the session is still intact and the server replays its
@@ -1065,4 +1083,50 @@ async fn fail_offboard_movement(
 		MovementUpdate::new().effective_balance(SignedAmount::ZERO),
 	).await.context("failed to mark offboard movement as failed").retry()?;
 	Ok(())
+}
+
+
+/// A refused offboard is a failed intent even while its input's financial
+/// claim still needs protection. Cancelling its history entry releases no lock.
+async fn cancel_superseded_movement(wallet: &Wallet, movement: MovementId) -> anyhow::Result<()> {
+	let current = wallet.inner.db.get_movement_by_id(movement).await?;
+	if current.status == MovementStatus::Canceled && current.effective_balance == SignedAmount::ZERO
+		&& current.offchain_fee == Amount::ZERO
+		&& current.metadata.get("superseded_by_fallback") == Some(&serde_json::Value::Bool(true)) { return Ok(()); }
+	wallet.inner.movements.finish_movement_with_update(
+		movement, MovementStatus::Canceled,
+		MovementUpdate::new().effective_balance(SignedAmount::ZERO).fee(Amount::ZERO)
+			.metadata([("superseded_by_fallback".into(), serde_json::Value::Bool(true))]),
+	).await.context("failed to reconcile the superseded offboard movement")
+}
+
+/// Retire this action only when the same canonical transaction consumed all
+/// its inputs and paid the registered destination.
+async fn reconcile_fallback_payout(
+	wallet: &Wallet, action: &Offboard, inputs: &[VtxoId], movement: MovementId,
+) -> anyhow::Result<bool> {
+	if inputs.is_empty() { return Ok(false); }
+	let Some(record) = wallet.fallback_registration().await? else { return Ok(false); };
+	let mut coins = Vec::new();
+	for id in inputs { coins.push(wallet.get_full_vtxo(*id).await?); }
+	let paid = wallet.confirmed_fallback_vtxos(&coins, &record.spk).await?;
+	if !inputs.iter().all(|id| paid.contains(id)) { return Ok(false); }
+	let _guard = wallet.lock_fallback_history(CONFIRMATION_POLL_INTERVAL).await?;
+	let holder = VtxoLockHolder::Action { id: action.id.clone() };
+	let mut snapshot = wallet.inner.db.get_fallback_snapshot().await?;
+	for id in inputs {
+		let coin = wallet.inner.db.get_wallet_vtxo(*id).await?.context("offboard input is unavailable")?;
+		ensure!(coin.state == (VtxoState::Locked { holder: Some(holder.clone()) })
+			|| (coin.state == VtxoState::Spent && snapshot.adopted_payout_vtxos.contains(id)),
+			"fallback output cannot retire another operation's holder");
+	}
+	snapshot.adopted_payout_vtxos.extend(inputs.iter().copied());
+	wallet.inner.db.store_fallback_snapshot(&snapshot).await?;
+	for id in inputs {
+		wallet.inner.db.release_vtxo_lock(*id, Some(&holder)).await?;
+		wallet.inner.db.update_vtxo_state_checked(*id, VtxoState::Spent,
+			&[VtxoStateKind::Spendable, VtxoStateKind::Spent]).await?;
+	}
+	cancel_superseded_movement(wallet, movement).await?;
+	Ok(true)
 }

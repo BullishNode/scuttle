@@ -13,7 +13,7 @@ use crate::database::Db;
 /// Backfill the cln_hold table from the existing lightning_htlc_subscription
 /// rows.
 ///
-/// V76 could not port these rows itself: the invoice expiry and the final
+/// V77 could not port these rows itself: the invoice expiry and the final
 /// CLTV delta live inside the bolt11 string, which SQL cannot decode. This
 /// decodes them and writes one cln_hold row per subscription that has none
 /// yet, so it can run again after a partial run.

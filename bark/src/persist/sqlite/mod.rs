@@ -229,6 +229,14 @@ impl BarkPersister for SqliteClient {
 		Ok(())
 	}
 
+	async fn update_vtxo_witnesses(&self, vtxo: &Vtxo<Full>) -> anyhow::Result<bool> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		let updated = query::update_vtxo_witnesses(&tx, vtxo)?;
+		tx.commit()?;
+		Ok(updated)
+	}
+
 	async fn get_wallet_vtxo(&self, id: VtxoId) -> anyhow::Result<Option<WalletVtxo>> {
 		let conn = self.connect()?;
 		query::get_wallet_vtxo_by_id(&conn, id)
@@ -285,6 +293,39 @@ impl BarkPersister for SqliteClient {
 		let tx = conn.transaction().context("Failed to start transaction")?;
 		query::store_vtxo_keys(&tx, keys)?;
 		tx.commit().context("Failed to commit transaction")
+	}
+
+	async fn get_fallback_snapshot(&self) -> anyhow::Result<crate::FallbackSnapshot> {
+		use rusqlite::OptionalExtension;
+		let bytes: Option<Vec<u8>> = self.connect()?.query_row(
+			"SELECT snapshot FROM bark_fallback_snapshot WHERE id = 1", [], |row| row.get(0),
+		).optional()?;
+		Ok(bytes.map(|bytes| serde_json::from_slice(&bytes)).transpose()?.unwrap_or_default())
+	}
+
+	async fn store_fallback_snapshot(&self, snapshot: &crate::FallbackSnapshot) -> anyhow::Result<()> {
+		let bytes = serde_json::to_vec(snapshot)?;
+		self.connect()?.execute(
+			"INSERT INTO bark_fallback_snapshot (id, snapshot) VALUES (1, ?1)
+			ON CONFLICT (id) DO UPDATE SET snapshot = excluded.snapshot", [&bytes],
+		)?;
+		Ok(())
+	}
+
+	async fn get_fallback_record(&self) -> anyhow::Result<Option<ark::fallback::FallbackRegistration>> {
+		query::get_fallback_record(&self.connect()?)
+	}
+
+	async fn store_fallback_record(&self, record: &ark::fallback::FallbackRegistration) -> anyhow::Result<()> {
+		query::store_fallback_record(&self.connect()?, record)
+	}
+
+	async fn get_pending_fallback_record(&self) -> anyhow::Result<Option<ark::fallback::FallbackRegistration>> {
+		query::get_pending_fallback_record(&self.connect()?)
+	}
+
+	async fn store_pending_fallback_record(&self, record: &ark::fallback::FallbackRegistration) -> anyhow::Result<()> {
+		query::store_pending_fallback_record(&self.connect()?, record)
 	}
 
 	async fn get_last_vtxo_key_index(&self) -> anyhow::Result<Option<u32>> {
@@ -450,6 +491,13 @@ impl BarkPersister for SqliteClient {
 		query::release_vtxo_lock(&conn, vtxo_id, holder)
 	}
 
+	async fn retire_vtxo_lock(
+		&self, vtxo_id: VtxoId, holder: Option<&VtxoLockHolder>,
+	) -> anyhow::Result<bool> {
+		let conn = self.connect()?;
+		query::retire_vtxo_lock(&conn, vtxo_id, holder)
+	}
+
 	async fn update_vtxo_states_checked(
 		&self,
 		vtxo_ids: &[VtxoId],
@@ -518,6 +566,34 @@ mod test {
 	use crate::persist::test_suite::bark_persister_tests;
 
 	use super::*;
+
+	#[test]
+	fn fallback_tables_reopen_without_changing_wallet_records() {
+		let (path, conn) = in_memory_db();
+		let db = SqliteClient::open(&path).unwrap();
+		let history = conn.prepare("SELECT id,value,created_at FROM migrations ORDER BY id").unwrap()
+			.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
+			.unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+		assert!(!history.is_empty());
+		// These are persistence sentinels, not authenticated financial proofs.
+		conn.execute_batch("INSERT INTO bark_fallback_record (id,record,spk) VALUES (1,X'01',X'02');
+			INSERT INTO bark_fallback_snapshot (id,snapshot) VALUES (1,X'04');
+			INSERT INTO bark_properties (id,network,fingerprint) VALUES ('control','regtest','deadbeef');").unwrap();
+		assert_eq!(conn.query_row("SELECT registered FROM bark_fallback_record", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+		conn.execute("UPDATE bark_fallback_record SET registered=0 WHERE id=1", []).unwrap();
+		drop(db);
+		let _reopened = SqliteClient::open(&path).unwrap();
+		let after = conn.prepare("SELECT id,value,created_at FROM migrations ORDER BY id").unwrap()
+			.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
+			.unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+		assert_eq!(after, history);
+		assert_eq!(conn.query_row("SELECT record,spk,registered FROM bark_fallback_record", [],
+			|row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?)))
+			.unwrap(), (vec![1], vec![2], 0));
+		assert_eq!(conn.query_row("SELECT snapshot FROM bark_fallback_snapshot", [], |row| row.get::<_, Vec<u8>>(0)).unwrap(), vec![4]);
+		assert_eq!(conn.query_row("SELECT network,fingerprint FROM bark_properties WHERE id='control'", [],
+			|row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).unwrap(), ("regtest".to_owned(), "deadbeef".to_owned()));
+	}
 
 	#[tokio::test]
 	async fn test_add_and_retrieve_vtxos() {

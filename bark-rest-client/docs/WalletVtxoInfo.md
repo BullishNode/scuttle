@@ -13,6 +13,7 @@ Name | Type | Description | Notes
 **policy_type** | **String** | The spending policy that governs this VTXO. | 
 **server_pubkey** | **String** | The Ark server's public key used to co-sign transactions involving this VTXO. | 
 **user_pubkey** | **String** | The owner's public key. Only the holder of the corresponding private key can spend this VTXO. | 
+**awaiting_settlement** | Option<**bool**> | The expired coin is excluded from new operations pending an authoritative server decision or in-flight operation settlement. | [optional]
 **state** | [**models::VtxoStateInfo**](VtxoStateInfo.md) | The current state of this VTXO in the wallet. | 
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)

@@ -1,6 +1,5 @@
 
 use bitcoin::Amount;
-use bitcoin_ext::P2TR_DUST_SAT;
 
 use bark_json::movements::{MovementDestination, PaymentMethod};
 
@@ -131,10 +130,18 @@ async fn bark_send_onchain() {
 	// board vtxo
 	let send_amount = sat(300_000);
 	let addr = bark2.get_onchain_address().await;
+	let rate_quote = srv.get_public_rpc().await
+		.get_offboard_fee_rate(server_rpc::protos::Empty {}).await.unwrap().into_inner();
+	let fee_rate = <bitcoin::FeeRate as bitcoin_ext::FeeRateExt>::from_sat_per_kvb_ceil(
+		rate_quote.sat_vkb,
+	);
+	// The fixture charges no base/expiry fee and 100 additional vbytes.
+	// Include the BIP84 or BIP86 destination script in the quoted size.
+	let charged_weight = bitcoin::Weight::from_vb(100 + addr.script_pubkey().len() as u64).unwrap();
+	let offboard_fee = fee_rate.checked_mul_by_weight(charged_weight).unwrap();
 	bark1.send_onchain(&addr, send_amount).await;
 	ctx.generate_blocks(2).await;
 
-	let offboard_fee = sat(938);
 	// bark > 0.6.1 splits change in two
 	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 };
 	let change_vtxos = bark1.vtxos().await;
@@ -201,7 +208,15 @@ async fn bark_rejects_offboarding_dust_amount() {
 
 	let addr = bark2.get_onchain_address().await;
 
-	let err = bark1.try_send_onchain(&addr, sat(P2TR_DUST_SAT - 1)).await.unwrap_err();
+	let dust = addr.script_pubkey().minimal_non_dust();
+	let below_dust = dust.checked_sub(sat(1)).unwrap();
+	assert!(below_dust > Amount::ZERO);
+	let before_vtxos = bark1.vtxos_no_sync().await;
+	let before_balance = bark1.spendable_balance_no_sync().await;
+	let before_history = bark1.history().await;
+
+	// Standard dust depends on the real BIP84 or BIP86 destination script.
+	let err = bark1.try_send_onchain(&addr, below_dust).await.unwrap_err();
 	let err = err.to_alt_string();
 	assert!(
 		// current wallet
@@ -210,4 +225,8 @@ async fn bark_rejects_offboarding_dust_amount() {
 		|| err.contains("it doesn't make sense to send dust"),
 		"err: {err}",
 	);
+
+	bark1.assert_unchanged_after_refusal(before_balance).await;
+	assert_eq!(bark1.vtxos_no_sync().await, before_vtxos);
+	assert_eq!(bark1.history().await, before_history, "dust refusal must precede a payment movement");
 }

@@ -173,6 +173,10 @@ pub struct WalletVtxoInfo {
 	pub vtxo: VtxoInfo,
 	/// The current state of this VTXO in the wallet.
 	pub state: VtxoStateInfo,
+	/// The expired coin is excluded from new operations pending an
+	/// authoritative server decision or in-flight operation settlement.
+	#[serde(default)]
+	pub awaiting_settlement: bool,
 }
 
 impl<'a> From<&'a bark::WalletVtxo> for WalletVtxoInfo {
@@ -190,6 +194,7 @@ impl<'a> From<&'a bark::WalletVtxo> for WalletVtxoInfo {
 				exit_depth: Some(v.exit_depth),
 			},
 			state: VtxoStateInfo::from(&v.state),
+			awaiting_settlement: false,
 		}
 	}
 }

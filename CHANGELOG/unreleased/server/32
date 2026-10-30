@@ -1,0 +1,5 @@
+- Pay expired customer claims to their signed, registered destinations
+  Resolve current ownership, hold unresolved contracts, and fund immutable payout
+  parents with separate fee children. Bind Lightning outcomes to their actual sources.
+  [#32](https://github.com/BullishNode/abandon-ship-bark/pull/32), [#33](https://github.com/BullishNode/abandon-ship-bark/pull/33), [#46](https://github.com/BullishNode/abandon-ship-bark/pull/46), [#49](https://github.com/BullishNode/abandon-ship-bark/pull/49)
+  - **BREAKING:** Use fresh stores and protocol version 6; customer issuance and mailbox use require registration.
