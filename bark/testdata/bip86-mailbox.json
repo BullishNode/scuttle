@@ -1,0 +1,20 @@
+[
+  {
+    "mailbox": "03cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115",
+    "network": "bitcoin",
+    "output_key": "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c",
+    "script": "5120a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c"
+  },
+  {
+    "mailbox": "0255355ca83c973f1d97ce0e3843c85d78905af16b4dc531bc488e57212d230116",
+    "network": "signet",
+    "output_key": "3b82b2b2a9185315da6f80da5f06d0440d8a5e1457fa93387c2d919c86ec8786",
+    "script": "51203b82b2b2a9185315da6f80da5f06d0440d8a5e1457fa93387c2d919c86ec8786"
+  },
+  {
+    "mailbox": "0255355ca83c973f1d97ce0e3843c85d78905af16b4dc531bc488e57212d230116",
+    "network": "regtest",
+    "output_key": "3b82b2b2a9185315da6f80da5f06d0440d8a5e1457fa93387c2d919c86ec8786",
+    "script": "51203b82b2b2a9185315da6f80da5f06d0440d8a5e1457fa93387c2d919c86ec8786"
+  }
+]
