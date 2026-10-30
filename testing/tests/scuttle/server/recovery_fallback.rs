@@ -46,7 +46,9 @@ async fn recovery_pending_customer_uses_immutable_mailbox_after_allocation_order
 	}).await.unwrap();
 	let expected = [Some(protos::VtxoSpendState::FallbackPending), Some(protos::VtxoSpendState::FallbackPending),
 		Some(protos::VtxoSpendState::Spent), Some(protos::VtxoSpendState::Spent), Some(protos::VtxoSpendState::Spent), None];
-	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected).await;
+	let owner_mailboxes = [Some(mailbox.public_key()), Some(mailbox.public_key()), Some(foreign.public_key()),
+		Some(mailbox.public_key()), Some(mailbox.public_key()), None];
+	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected, &owner_mailboxes).await;
 
 	// An older matching customer must not beat a later active operator.
 	let replacement = db.write(async |tx| {
@@ -59,10 +61,10 @@ async fn recovery_pending_customer_uses_immutable_mailbox_after_allocation_order
 		Ok(replacement)
 	}).await.unwrap();
 	let spent = [Some(protos::VtxoSpendState::Spent); 5].into_iter().chain([None]).collect::<Vec<_>>();
-	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &spent).await;
+	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &spent, &owner_mailboxes).await;
 	// Confirmed customer ownership wins even over that newer active row.
 	db.write(async |tx| { tx.execute("UPDATE expiry_allocation SET status='confirmed' WHERE id=$1", &[&allocation]).await?; Ok(()) }).await.unwrap();
-	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected).await;
+	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected, &owner_mailboxes).await;
 	// Without a confirmed row, active outranks newer inactive ownership.
 	db.write(async |tx| {
 		tx.execute("UPDATE expiry_allocation SET status='conflicted' WHERE id=$1", &[&allocation]).await?;
@@ -70,27 +72,35 @@ async fn recovery_pending_customer_uses_immutable_mailbox_after_allocation_order
 		tx.execute("UPDATE expiry_allocation_coin SET active=TRUE WHERE allocation_id=$1", &[&allocation]).await?;
 		Ok(())
 	}).await.unwrap();
-	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected).await;
+	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected, &owner_mailboxes).await;
 	// Equal confirmation/active ranks choose the newest allocation, including
 	// an operator; filtering to customer matches before ordering is unsafe.
 	db.write(async |tx| { tx.execute("UPDATE expiry_allocation_coin SET active=FALSE WHERE allocation_id=$1", &[&allocation]).await?; Ok(()) }).await.unwrap();
-	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &spent).await;
+	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &spent, &owner_mailboxes).await;
 }
 
 async fn assert_pending_statuses(
 	srv: &ark_testing::Captaind, xpriv: &Xpriv, coins: &[Vtxo<Full>], keys: &[Keypair],
-	expected: &[Option<protos::VtxoSpendState>],
+	expected: &[Option<protos::VtxoSpendState>], owner_mailboxes: &[Option<PublicKey>],
 ) {
 	let mut rpc = srv.get_public_rpc().await;
 	let mut queries = Vec::new();
-	for ((coin, key), expected) in coins.iter().zip(keys).zip(expected) {
+	for (((coin, key), expected), owner) in coins.iter().zip(keys).zip(expected).zip(owner_mailboxes) {
+		let owner = owner.map(|key| key.serialize().to_vec()).unwrap_or_default();
+		let full = rpc.get_vtxo(protos::GetVtxoRequest { vtxo_id: coin.id().to_bytes().to_vec() }).await.unwrap().into_inner();
+		assert_eq!(full.vtxo, coin.serialize(), "foreign ownership must not hide unilateral-exit data");
+		assert_eq!(full.owner_mailbox, owner);
 		let query = protos::VtxoStatusQuery { vtxo_id: coin.id().to_bytes().to_vec(),
 			attestation: VtxoStatusAttestation::new(coin.id(), key).serialize() };
 		let response = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
 			vtxo_id: query.vtxo_id.clone(), attestation: query.attestation.clone(),
 		}).await;
 		match expected {
-			Some(state) => assert_eq!(response.unwrap().into_inner().spend_state, *state as i32),
+			Some(state) => {
+				let response = response.unwrap().into_inner();
+				assert_eq!(response.spend_state, *state as i32);
+				assert_eq!(response.owner_mailbox, owner);
+			},
 			None => assert_eq!(response.unwrap_err().code(), tonic::Code::NotFound),
 		}
 		queries.push(query);
@@ -98,11 +108,23 @@ async fn assert_pending_statuses(
 	let batch = rpc.get_vtxos_status_by_ids(protos::GetVtxosStatusByIdsRequest { vtxos: queries }).await.unwrap().into_inner();
 	let recovered = rpc.recover_vtxos_by_xpub(xpub_request(xpriv, srv.ark_info().await.server_pubkey, 0))
 		.await.unwrap().into_inner();
-	for (coin, expected) in coins.iter().zip(expected) {
+	let mut ids = coins.iter().map(|coin| coin.id().to_bytes().to_vec()).collect::<Vec<_>>();
+	ids.push(ids[0].clone());
+	let full = rpc.get_vtxos_by_ids(protos::GetVtxosByIdsRequest { vtxo_ids: ids }).await.unwrap().into_inner();
+	assert_eq!(full.vtxos.len(), coins.len() + 1);
+	assert_eq!(full.owners.len(), owner_mailboxes.iter().flatten().count());
+	for ((coin, expected), owner) in coins.iter().zip(expected).zip(owner_mailboxes) {
+		let owner = owner.map(|key| key.serialize().to_vec()).unwrap_or_default();
+		assert_eq!(full.owners.iter().find(|entry| entry.vtxo_id == coin.id().to_bytes().to_vec())
+			.map(|entry| entry.owner_mailbox.clone()).unwrap_or_default(), owner);
 		assert_eq!(batch.vtxos.iter().find(|entry| entry.vtxo_id == coin.id().to_bytes().to_vec()).map(|entry| entry.spend_state),
 			expected.map(|state| state as i32));
 		assert_eq!(recovered.vtxos.iter().find(|entry| Vtxo::<Full>::deserialize(&entry.vtxo).unwrap().id() == coin.id())
 			.map(|entry| entry.spend_state), expected.map(|state| state as i32));
 		assert_eq!(batch.missing_vtxo_ids.contains(&coin.id().to_bytes().to_vec()), expected.is_none());
+		if expected.is_some() {
+			assert_eq!(batch.vtxos.iter().find(|entry| entry.vtxo_id == coin.id().to_bytes().to_vec()).unwrap().owner_mailbox, owner);
+			assert_eq!(recovered.vtxos.iter().find(|entry| Vtxo::<Full>::deserialize(&entry.vtxo).unwrap().id() == coin.id()).unwrap().owner_mailbox, owner);
+		}
 	}
 }

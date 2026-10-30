@@ -154,11 +154,13 @@ impl rpc::server::ArkService for Server {
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 
-		let vtxo_state = self.db.read(async |t| t.get_server_vtxo_by_id(id).await).await
-			.to_status()?;
+		let (vtxo_state, owners) = self.db.read(async |t| Ok((
+			t.get_server_vtxo_by_id(id).await?, t.coin_owner_mailboxes(&[id]).await?,
+		))).await.to_status()?;
 
 		let response = protos::GetVtxoResponse {
 			vtxo: vtxo_state.vtxo.serialize(),
+			owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
 		};
 
 		Ok(tonic::Response::new(response))
@@ -175,11 +177,11 @@ impl rpc::server::ArkService for Server {
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 		let attestation = VtxoStatusAttestation::from_bytes(&req.attestation)?;
 
-		let (vtxo_state, fallback) = self.db.read(async |t| {
+		let (vtxo_state, fallback, owners) = self.db.read(async |t| {
 			let state = t.get_server_vtxo_by_id(id).await?;
 			let keys = state.vtxo.policy().user_pubkey().map(|key| (id, key)).into_iter().collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
-			Ok((state, fallback))
+			Ok((state, fallback, t.coin_owner_mailboxes(&[id]).await?))
 		}).await.to_status()?;
 
 		let spend_state = vtxo_state.spend_state;
@@ -199,6 +201,7 @@ impl rpc::server::ArkService for Server {
 
 		Ok(tonic::Response::new(protos::GetVtxoStatusResponse {
 			spend_state: spend_state as i32,
+			owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
 		}))
 	}
 
@@ -219,8 +222,9 @@ impl rpc::server::ArkService for Server {
 
 		// Unknown ids are reported, not an error, so one bad id does not
 		// cost the client the whole batch.
-		let found = self.db.read(async |t| t.get_existing_server_vtxos_by_id(&ids).await).await
-			.to_status()?;
+		let (found, owners) = self.db.read(async |t| Ok((
+			t.get_existing_server_vtxos_by_id(&ids).await?, t.coin_owner_mailboxes(&ids).await?,
+		))).await.to_status()?;
 
 		let mut missing = Vec::new();
 		for id in &ids {
@@ -234,6 +238,7 @@ impl rpc::server::ArkService for Server {
 				.filter_map(|id| found.get(id).map(|v| v.vtxo.serialize()))
 				.collect(),
 			missing_vtxo_ids: missing.iter().map(|id| id.to_bytes().to_vec()).collect(),
+			owners: super::convert::owner_mailboxes(&owners),
 		}))
 	}
 
@@ -257,12 +262,12 @@ impl rpc::server::ArkService for Server {
 			.collect::<Result<Vec<_>, tonic::Status>>()?;
 
 		let ids = queries.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-		let (states, fallback) = self.db.read(async |t| {
+		let (states, fallback, owners) = self.db.read(async |t| {
 			let states = t.get_existing_server_vtxos_by_id(&ids).await?;
 			let keys = states.iter().filter_map(|(id, state)| state.vtxo.policy().user_pubkey().map(|key| (*id, key)))
 				.collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
-			Ok((states, fallback))
+			Ok((states, fallback, t.coin_owner_mailboxes(&ids).await?))
 		}).await.to_status()?;
 
 		// An id without a client-visible user vtxo is reported as missing,
@@ -292,6 +297,7 @@ impl rpc::server::ArkService for Server {
 			vtxos.push(protos::VtxoStatus {
 				vtxo_id: id.to_bytes().to_vec(),
 				spend_state: *spend_state as i32,
+				owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
 			});
 		}
 
@@ -354,13 +360,17 @@ impl rpc::server::ArkService for Server {
 		// server-internal state is left out, as GetVtxoStatus reports it as
 		// not found.
 		let keys = res.vtxos.iter().map(|v| (v.vtxo.id(), v.vtxo.user_pubkey())).collect::<Vec<_>>();
-		let fallback = self.db.read(async |t| t.fallback_customer_vtxos(&keys).await).await.to_status()?;
+		let ids = keys.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+		let (fallback, owners) = self.db.read(async |t| Ok((
+			t.fallback_customer_vtxos(&keys).await?, t.coin_owner_mailboxes(&ids).await?,
+		))).await.to_status()?;
 		let vtxos = res.vtxos.into_iter().filter_map(|v| {
 			Some(protos::RecoveredVtxo {
 				spend_state: client_spend_state(v.spend_state,
 					fallback.contains(&v.vtxo.id()))? as i32,
 				vtxo: v.vtxo.serialize(),
 				derivation_index: v.derivation_index,
+				owner_mailbox: owners.get(&v.vtxo.id()).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
 			})
 		}).collect();
 

@@ -145,6 +145,22 @@ CREATE TABLE coin_owner (
 	mailbox_pk TEXT NOT NULL CHECK (length(mailbox_pk) = 66)
 );
 
+-- Installed in shadow mode; the deferred trigger is activated only by the
+-- coordinated fresh-store ownership switch, after every birth supplies rows.
+CREATE FUNCTION require_customer_coin_owner() RETURNS TRIGGER
+LANGUAGE plpgsql AS $$
+BEGIN
+	IF NEW.spend_state IN ('spendable', 'unregistered', 'unclaimed', 'htlc-recv-unclaimed')
+		AND NOT (NEW.spend_state = 'unclaimed' AND NEW.policy =
+			decode('0002dfa52f6690299d2d6a08323083e290597b56fee125063e5f4e2957731639c42c', 'hex'))
+		AND NOT EXISTS (SELECT 1 FROM scuttle.coin_owner WHERE vtxo_id=NEW.vtxo_id)
+	THEN
+		RAISE EXCEPTION 'customer VTXO has no coin_owner' USING ERRCODE='23514';
+	END IF;
+	RETURN NEW;
+END;
+$$;
+
 CREATE TABLE expiry_hold (
 	vtxo_id TEXT PRIMARY KEY REFERENCES public.vtxo(vtxo_id),
 	reason TEXT NOT NULL,

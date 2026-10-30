@@ -186,6 +186,7 @@ message GetVtxoRequest {
 
 message GetVtxoResponse {
 	bytes vtxo = 1;
+	bytes owner_mailbox = 1000;
 }
 
 message GetVtxosByIdsRequest {
@@ -199,6 +200,8 @@ message GetVtxosByIdsResponse {
 	repeated bytes vtxos = 1;
 	// Requested ids the server does not know, each once.
 	repeated bytes missing_vtxo_ids = 2;
+	// Keyed by ID, independent of duplicate request IDs or response order.
+	repeated core.VtxoOwner owners = 1000;
 }
 
 // Client-relevant spend state for a user-owned VTXO.
@@ -233,6 +236,7 @@ message GetVtxoStatusRequest {
 
 message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
+	bytes owner_mailbox = 1000;
 }
 
 message VtxoStatusQuery {
@@ -249,6 +253,7 @@ message GetVtxosStatusByIdsRequest {
 message VtxoStatus {
 	bytes vtxo_id = 1;
 	VtxoSpendState spend_state = 2;
+	bytes owner_mailbox = 1000;
 }
 
 message GetVtxosStatusByIdsResponse {
@@ -282,6 +287,7 @@ message RecoveredVtxo {
 	// xpub/derivation_index.
 	uint32 derivation_index = 2;
 	VtxoSpendState spend_state = 3;
+	bytes owner_mailbox = 1000;
 }
 
 message RecoverVtxosByXpubResponse {

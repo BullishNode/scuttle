@@ -333,8 +333,47 @@ fn point_to_pubkey(point: &[u8; 64]) -> PublicKey {
 #[cfg(test)]
 mod test {
 	use std::time::Duration;
+	use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+	use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 	use bitcoin::secp256k1::rand;
+	use bitcoin_ext::KeypairExt;
 	use super::*;
+
+	#[test]
+	fn mailbox_authorization_cannot_authorize_a_taproot_input() {
+		let mut secret = [0; 32];
+		secret[31] = 6;
+		let mailbox = Keypair::from_seckey_slice(&SECP, &secret).unwrap();
+		assert_eq!(mailbox.public_key().serialize()[0], 3, "exercise an odd full mailbox point");
+		let expiry = 1_800_000_000;
+		let authorization = MailboxAuthorization {
+			id: MailboxIdentifier::from_pubkey(mailbox.public_key()), expiry,
+			sig: SECP.sign_schnorr_no_aux_rand(&MailboxAuthorization::signable_message(expiry), &mailbox),
+		};
+		assert!(authorization.verify());
+		let prevout = TxOut { value: Amount::from_sat(10_000),
+			script_pubkey: ScriptBuf::new_p2tr(&SECP, mailbox.x_only_public_key().0, None) };
+		let mut spend = Transaction {
+			version: bitcoin::transaction::Version::TWO, lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![TxIn { previous_output: OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+				script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() }],
+			output: vec![TxOut { value: Amount::from_sat(9_000), script_pubkey: prevout.script_pubkey.clone() }],
+		};
+		let sighash: Message = SighashCache::new(&spend).taproot_key_spend_signature_hash(
+			0, &Prevouts::All(&[prevout]), TapSighashType::Default,
+		).unwrap().into();
+		let signing_key = mailbox.for_keyspend_only(&SECP);
+		let signature = SECP.sign_schnorr_no_aux_rand(&sighash, &signing_key);
+		spend.input[0].witness = Witness::from_slice(&[&signature[..]]);
+		assert_eq!(spend.input[0].witness.len(), 1);
+		SECP.verify_schnorr(&signature, &sighash, &signing_key.x_only_public_key().0).unwrap();
+		assert!(SECP.verify_schnorr(&authorization.sig, &sighash, &signing_key.x_only_public_key().0).is_err());
+		assert!(SECP.verify_schnorr(&authorization.sig, &sighash, &mailbox.x_only_public_key().0).is_err(),
+			"the message domains differ even before the Taproot key tweak");
+		assert!(!MailboxAuthorization { sig: signature, ..authorization }.verify());
+		let raw_input_signature = SECP.sign_schnorr_no_aux_rand(&sighash, &mailbox);
+		assert!(!MailboxAuthorization { sig: raw_input_signature, ..authorization }.verify());
+	}
 
 	#[test]
 	fn mailbox_blinding() {

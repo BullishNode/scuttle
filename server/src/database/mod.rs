@@ -45,7 +45,7 @@ use std::borrow::Borrow;
 use std::str::FromStr;
 use std::task;
 use std::backtrace::Backtrace;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -107,6 +107,7 @@ pub struct StoredUncommittedOffboard {
 pub struct MailboxEntry {
 	pub checkpoint: Checkpoint,
 	pub payload: MailboxPayload,
+	pub owner_mailboxes: BTreeMap<VtxoId, PublicKey>,
 }
 
 impl MailboxEntry {
@@ -547,6 +548,12 @@ impl<'t> Tx<'t> {
 		if vtxos.is_empty() {
 			return Ok(None);
 		}
+		// Shadow the same-transaction delivery constraint. Registration stays
+		// authoritative until the coordinated fresh-store ownership switch.
+		let ids = vtxos.iter().map(|vtxo| vtxo.id()).collect::<Vec<_>>();
+		if !self.delivery_owners_match(&ids, mailbox_id).await? {
+			tracing::debug!("Shadow mailbox delivery has missing or mismatched coin ownership");
+		}
 
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
@@ -669,6 +676,7 @@ impl<'t> Tx<'t> {
 					res.push(MailboxEntry {
 						checkpoint: cp,
 						payload: MailboxPayload::LightningReceive { payment_hash, amount },
+						owner_mailboxes: BTreeMap::new(),
 					});
 					telemetry::set_mailbox_get_metric(mailbox_type, 1);
 
@@ -689,6 +697,7 @@ impl<'t> Tx<'t> {
 					res.push(MailboxEntry {
 						checkpoint: cp,
 						payload: MailboxPayload::RoundParticipationCompleted { unlock_hash },
+						owner_mailboxes: BTreeMap::new(),
 					});
 					telemetry::set_mailbox_get_metric(mailbox_type, 1);
 
@@ -712,6 +721,7 @@ impl<'t> Tx<'t> {
 						payload: MailboxPayload::LightningSendFinished {
 							payment_hash, preimage, failure,
 						},
+						owner_mailboxes: BTreeMap::new(),
 					});
 					telemetry::set_mailbox_get_metric(mailbox_type, 1);
 					continue;
@@ -724,6 +734,7 @@ impl<'t> Tx<'t> {
 			// we check if we have an item ongoing
 			let entry = current_entry.get_or_insert_with(|| MailboxEntry {
 				checkpoint: cp,
+				owner_mailboxes: BTreeMap::new(),
 				payload: match mailbox_type {
 					MailboxType::ArkoorReceive => MailboxPayload::Arkoor { vtxos: vec![], },
 					MailboxType::RecoveryVtxoId => {
@@ -768,6 +779,23 @@ impl<'t> Tx<'t> {
 		if let Some(entry) = current_entry.take() {
 			telemetry::set_mailbox_get_metric(entry.mailbox_type(), entry.len());
 			res.push(entry);
+		}
+		let mut ids = Vec::new();
+		for entry in &res {
+			match &entry.payload {
+				MailboxPayload::Arkoor { vtxos } => ids.extend(vtxos.iter().map(|v| v.id())),
+				MailboxPayload::RecoveryVtxoIds { vtxo_ids } => ids.extend(vtxo_ids),
+				_ => {},
+			}
+		}
+		let owners = self.coin_owner_mailboxes(&ids).await?;
+		for entry in &mut res {
+			let ids = match &entry.payload {
+				MailboxPayload::Arkoor { vtxos } => vtxos.iter().map(|v| v.id()).collect::<Vec<_>>(),
+				MailboxPayload::RecoveryVtxoIds { vtxo_ids } => vtxo_ids.clone(),
+				_ => continue,
+			};
+			entry.owner_mailboxes = ids.into_iter().filter_map(|id| owners.get(&id).map(|owner| (id, *owner))).collect();
 		}
 
 		Ok(res)

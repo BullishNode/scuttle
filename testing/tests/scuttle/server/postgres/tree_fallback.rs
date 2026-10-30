@@ -169,6 +169,66 @@ async fn derived_expiry_owner_uses_the_stage_selected_key() {
 }
 
 #[tokio::test]
+async fn customer_birth_constraint_is_deferred_and_padding_is_exact() {
+	let (_ctx, db) = test_db("deferred_customer_birth_owner").await;
+	let server = super::super::test_server_mailbox_key();
+	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM pg_trigger
+		WHERE tgname='customer_coin_owner' AND tgrelid='public.vtxo'::regclass", &[]).await?.get::<_, i64>(0))).await.unwrap(), 0,
+		"the production shadow initializer must not activate the constraint");
+	db.write(async |tx| {
+		tx.batch_execute("CREATE CONSTRAINT TRIGGER customer_coin_owner AFTER INSERT ON public.vtxo
+			DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION scuttle.require_customer_coin_owner();").await?;
+		Ok(())
+	}).await.unwrap();
+	for state in [SpendState::Spendable, SpendState::Unregistered, SpendState::Unclaimed, SpendState::HtlcRecvUnclaimed] {
+		let missing = db.write(async |tx| {
+			assert_eq!(tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state),
+				Some((Network::Regtest, server))).await?, 1);
+			// The INSERT succeeded before its paired row was removed. Only
+			// the deferred commit check may reject this transaction.
+			tx.execute("DELETE FROM coin_owner WHERE vtxo_id=$1", &[&coin.id().to_string()]).await?;
+			Ok(())
+		}).await.unwrap_err();
+		assert_eq!(missing.to_string(), "tx commit error");
+		let error = missing.downcast_ref::<tokio_postgres::Error>().unwrap().as_db_error().unwrap();
+		assert_eq!(error.code(), &tokio_postgres::error::SqlState::CHECK_VIOLATION);
+		assert_eq!(error.message(), "customer VTXO has no coin_owner");
+		assert!(db.read(async |tx| tx.try_get_bare_vtxo_by_id(coin.id()).await).await.unwrap().is_none());
+	}
+	assert_eq!(db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([coin.clone()]),
+		Some((Network::Regtest, server))).await).await.unwrap(), 1);
+	assert_eq!(db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([coin.clone()]),
+		Some((Network::Regtest, server))).await).await.unwrap(), 0);
+	let pool = ServerVtxo::from(VTXO_VECTORS.round2_vtxo.clone());
+	db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_unspent_vtxos([pool], SpendState::Pool), None).await)
+		.await.unwrap();
+
+	let base = &VTXO_VECTORS.board_vtxo;
+	let policy = ark::VtxoPolicy::new_pubkey("02dfa52f6690299d2d6a08323083e290597b56fee125063e5f4e2957731639c42c".parse().unwrap());
+	let point = bitcoin::OutPoint::new(base.point().txid, 1000);
+	let padding = ServerVtxo::new(point, policy.into(), base.amount(), base.expiry_height(),
+		base.server_pubkey(), base.exit_delta(), base.chain_anchor());
+	// Knowing the padding point does not grant a customer the private writer's
+	// exemption. The ordinary issuing path still requires genuine joint proof.
+	assert!(db.write(async |tx| tx.execute_vtxo_tree_update(
+		VtxoTreeUpdate::new().insert_unspent_bare_vtxos([&padding], SpendState::Unclaimed), Some((Network::Regtest, server)),
+	).await).await.unwrap_err().is::<OwnershipRefusal>());
+	// A direct SQL role fixture exercises only the constraint's exact trusted
+	// padding exception, not a funded/signed native round or an issuing RPC.
+	db.write(async |tx| Ok(tx.execute("INSERT INTO vtxo
+		(vtxo_id,vtxo_txid,vtxo,expiry,exit_delta,policy_type,policy,server_pubkey,amount,anchor_point,spend_state,created_at,updated_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'unclaimed',NOW(),NOW())", &[
+			&padding.id().to_string(), &padding.point().txid.to_string(), &padding.serialize(),
+			&(padding.expiry_height().to_u32() as i32), &(padding.exit_delta().to_u16() as i32),
+			&padding.policy_type().to_string(), &padding.policy().serialize(), &padding.server_pubkey().to_string(),
+			&(padding.amount().to_sat() as i64), &padding.chain_anchor().to_string(),
+		]).await?)).await.unwrap();
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
+		&[&padding.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn supplied_duplicate_links_are_all_verified_and_batches_roll_back() {
 	let (_ctx, db) = test_db("duplicate_owner_links").await;
 	let server = super::super::test_server_mailbox_key();

@@ -45,6 +45,7 @@ message MailboxMessage {
 
 message ArkoorMessage {
 	repeated bytes vtxos = 1;
+	repeated core.VtxoOwner owners = 1000;
 }
 
 message RoundParticipationCompleted {
@@ -61,6 +62,7 @@ message IncomingLightningPaymentMessage {
 
 message RecoveryVtxoIdsMessage {
 	repeated bytes vtxo_ids = 1;
+	repeated core.VtxoOwner owners = 1000;
 }
 
 message LightningSendFinishedMessage {

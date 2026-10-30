@@ -350,6 +350,7 @@ async fn recovery_tolerates_an_unknown_vtxo_id() {
 			resp.messages.push(MailboxMessage {
 				message: Some(mailbox_message::Message::RecoveryVtxoIds(RecoveryVtxoIdsMessage {
 					vtxo_ids: vec![self.unknown.to_bytes().to_vec()],
+					owners: Vec::new(),
 				})),
 				checkpoint: 0,
 			});

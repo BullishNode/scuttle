@@ -48,11 +48,59 @@ async fn recovery_posts_do_not_create_or_change_coin_ownership() {
 	}).await.unwrap().into_inner().messages;
 	assert_eq!(messages.len(), 1);
 	let Some(Message::RecoveryVtxoIds(message)) = &messages[0].message else { panic!("expected recovery hints"); };
+	assert_eq!(message.owners.len(), 1, "unknown recovery hints have no invented owner");
+	assert_eq!(message.owners[0].vtxo_id, coin.id().to_bytes().to_vec());
+	assert_eq!(message.owners[0].owner_mailbox, owner.public_key().serialize().to_vec());
 	let mut actual = message.vtxo_ids.clone();
 	let mut expected = request().vtxo_ids;
 	actual.sort_unstable();
 	expected.sort_unstable();
 	assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn delivery_owner_check_rejects_an_incomplete_or_mixed_batch() {
+	let mut ctx = TestContext::new_minimal("postgresd/delivery_owner_batch").await;
+	ctx.init_central_postgres().await;
+	let config = ctx.new_postgres(&ctx.test_name).await;
+	let db = Db::create(&config, bitcoin::Network::Regtest).await.unwrap();
+	let server = super::test_server_mailbox_key();
+	let first = Keypair::new(&SECP, &mut thread_rng());
+	let second = Keypair::new(&SECP, &mut thread_rng());
+	let a = Keypair::new(&SECP, &mut thread_rng());
+	let b = Keypair::new(&SECP, &mut thread_rng());
+	super::register_test_owners(&db, server, &first, &[a]).await;
+	super::register_test_owners(&db, server, &second, &[b]).await;
+	let one = DummyTestVtxoSpec { user_keypair: a, ..Default::default() }.build().1;
+	let two = DummyTestVtxoSpec { user_keypair: b, ..Default::default() }.build().1;
+	let unknown = DummyTestVtxoSpec { ..Default::default() }.build().1;
+	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(one.clone()), ServerVtxo::from(two.clone())],
+		Some((bitcoin::Network::Regtest, server))).await).await.unwrap();
+	let mailbox = MailboxIdentifier::from_pubkey(first.public_key());
+	let snapshot = async || db.read(async |tx| {
+		let row = tx.query_one("SELECT (SELECT count(*) FROM mailbox),
+			(SELECT to_jsonb(s)::TEXT FROM checkpoint_state s WHERE type_id=1)", &[]).await?;
+		Ok((row.get::<_, i64>(0), row.get::<_, String>(1)))
+	}).await.unwrap();
+	let before = snapshot().await;
+	for batch in [vec![one.clone(), two.clone()], vec![one.clone(), unknown]] {
+		let refused = db.write(async |tx| {
+			let ids = batch.iter().map(|vtxo| vtxo.id()).collect::<Vec<_>>();
+			// This exercises the strict same-transaction contract before its
+			// coordinated activation at the public delivery endpoint.
+			anyhow::ensure!(tx.delivery_owners_match(&ids, mailbox).await?, "delivery owner mismatch");
+			tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &batch).await
+		}).await.unwrap_err();
+		assert_eq!(refused.root_cause().to_string(), "delivery owner mismatch");
+		assert_eq!(snapshot().await, before, "no partial message or checkpoint may be consumed");
+	}
+	let post = async || db.write(async |tx| {
+		anyhow::ensure!(tx.delivery_owners_match(&[one.id(), one.id()], mailbox).await?, "delivery owner mismatch");
+		tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[one.clone(), one.clone()]).await
+	}).await.unwrap();
+	assert!(post().await.is_some());
+	assert!(post().await.is_none(), "a valid delivery replay remains idempotent");
+	assert_eq!(snapshot().await.0, before.0 + 1);
 }
 
 #[tokio::test]
