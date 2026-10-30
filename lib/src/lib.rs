@@ -13,6 +13,7 @@ pub mod board;
 pub mod connectors;
 pub mod encode;
 pub mod error;
+pub mod fallback;
 pub mod fees;
 pub mod forfeit;
 pub mod lightning;
