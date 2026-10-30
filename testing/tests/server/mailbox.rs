@@ -17,7 +17,7 @@ use server_rpc::{protos, MAX_NB_MAILBOX_ARKOOR_VTXOS};
 use server_rpc::protos::mailbox_server::mailbox_message::Message;
 
 use ark_testing::{TestContext, btc, require_bark_version};
-use ark_testing::daemon::captaind::MailboxClient;
+use ark_testing::daemon::captaind::{self, MailboxClient};
 
 /// Regression test for the checkpoint visibility gap in concurrent mailbox writes.
 ///
@@ -77,7 +77,7 @@ async fn mailbox_checkpoint_visibility_gap() {
 		let unblinded_id = unblinded_id.clone();
 
 		tokio::spawn(async move {
-			let mut client = MailboxClient::connect(ark_url).await.unwrap();
+			let mut client = captaind::connect_mailbox_client(&ark_url).await.unwrap();
 			let mut cursor: u64 = 0;
 			let mut seen: usize = 0;
 			let mut final_poll = false;
@@ -114,7 +114,7 @@ async fn mailbox_checkpoint_visibility_gap() {
 		let vtxo_bytes = ProtocolEncoding::serialize(vtxo).to_vec();
 
 		tokio::spawn(async move {
-			let mut client = MailboxClient::connect(ark_url).await.unwrap();
+			let mut client = captaind::connect_mailbox_client(&ark_url).await.unwrap();
 			client.post_arkoor_message(protos::mailbox_server::PostArkoorMessageRequest {
 				blinded_id: blinded_id.as_ref().to_vec(),
 				vtxos: vec![vtxo_bytes],

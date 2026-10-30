@@ -29,12 +29,12 @@ use crate::error::{BadArgument, FallbackRefusal, OwnershipRefusal, NotFound, Rou
 /// The minimum protocol version supported by the server.
 ///
 /// For info on protocol versions, see [server_rpc::pver] module documentation.
-pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_PPM_FEE_TOTAL;
+pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_SCUTTLE;
 
 /// The maximum protocol version supported by the server.
 ///
 /// For info on protocol versions, see [server_rpc::pver] module documentation.
-pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF;
+pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_SCUTTLE;
 
 /// Default maximum number of remotely-reset HTTP/2 streams that may sit in a
 /// connection's accept queue before h2 closes the connection.
@@ -228,6 +228,15 @@ impl ReceiverExt for oneshot::Receiver<anyhow::Error> {
 	}
 }
 
+/// Require the negotiated Scuttle epoch before reading or mutating fork state.
+fn validate_scuttle_pver<T>(req: &tonic::Request<T>) -> Result<u64, tonic::Status> {
+	let pver = req.pver()?;
+	if pver != pver::PROTOCOL_VERSION_SCUTTLE {
+		return Err(tonic::Status::invalid_argument("unsupported Scuttle protocol version"));
+	}
+	Ok(pver)
+}
+
 /// Get the protocol version sent by the user and check if it's supported.
 #[allow(unused)]
 fn validate_pver<T>(req: &tonic::Request<T>) -> Result<u64, tonic::Status> {
@@ -246,6 +255,18 @@ mod fallback_tests {
 	use ::ark::test_util::VTXO_VECTORS;
 	use ::ark::tree::signed::UnlockHash;
 	use bitcoin::hashes::Hash;
+
+	#[test]
+	fn scuttle_version_is_required_before_public_operations() {
+		let mut request = tonic::Request::new(server_rpc::protos::Empty {});
+		assert_eq!(validate_scuttle_pver(&request).unwrap_err().code(), tonic::Code::InvalidArgument);
+		for version in [0, 4, 5, 6, 7, pver::PROTOCOL_VERSION_SCUTTLE - 1, pver::PROTOCOL_VERSION_SCUTTLE + 1] {
+			request.set_pver(version);
+			assert_eq!(validate_scuttle_pver(&request).unwrap_err().code(), tonic::Code::InvalidArgument);
+		}
+		request.set_pver(pver::PROTOCOL_VERSION_SCUTTLE);
+		assert_eq!(validate_scuttle_pver(&request).unwrap(), pver::PROTOCOL_VERSION_SCUTTLE);
+	}
 
 	#[test]
 	fn cancelled_round_metadata_binds_requested_hash_through_error_context() {

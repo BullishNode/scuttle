@@ -45,3 +45,7 @@ pub const PROTOCOL_VERSION_OWNER_PROOF: u64 = 6;
 /// Version with matching coin/mailbox authorization for new issuance.
 /// Legacy issued rights and authenticated accepted operations remain readable.
 pub const PROTOCOL_VERSION_JOINT_OWNER_PROOF: u64 = 7;
+
+/// Scuttle's fixed fork wire epoch. Upstream and older fork clients must not
+/// interpret joint-owner fields, scoped status or fork spend states as upstream.
+pub const PROTOCOL_VERSION_SCUTTLE: u64 = 1000;

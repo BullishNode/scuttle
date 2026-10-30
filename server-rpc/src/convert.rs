@@ -821,6 +821,61 @@ mod test {
 	use super::*;
 
 	#[test]
+	fn retired_owner_tags_do_not_populate_scuttle_owner_fields() {
+		use prost::Message;
+
+		#[derive(Clone, PartialEq, prost::Message)]
+		struct OldDestination {
+			#[prost(uint64, tag = "1")]
+			total_amount: u64,
+			#[prost(bytes = "vec", tag = "2")]
+			policy: Vec<u8>,
+			#[prost(message, optional, tag = "3")]
+			owner_proof: Option<protos::OwnerProof>,
+		}
+		let key = |n| { let mut bytes = [0; 32]; bytes[31] = n;
+			bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &bytes).unwrap() };
+		let server = key(11); let mailbox = key(17); let coin = key(3);
+		let proof = protos::OwnerProof::from(OwnerLink::new_joint(bitcoin::Network::Regtest,
+			server.public_key(), &mailbox, &coin).unwrap());
+		let old = OldDestination { total_amount: 10_000, policy: vec![1, 2, 3], owner_proof: Some(proof.clone()) };
+		let new = protos::ArkoorDestination::decode(old.encode_to_vec().as_slice()).unwrap();
+		assert_eq!(new.total_amount, 10_000);
+		assert_eq!(new.policy, [1, 2, 3]);
+		assert!(new.owner_proof.is_none(), "old tag3 must not supply a new binding");
+		let new = protos::VtxoRequest::decode(old.encode_to_vec().as_slice()).unwrap();
+		assert!(new.owner_proof.is_none());
+		let current = protos::ArkoorDestination {
+			total_amount: 10_000, policy: vec![1, 2, 3], owner_proof: Some(proof),
+		};
+		let decoded = protos::ArkoorDestination::decode(current.encode_to_vec().as_slice()).unwrap();
+		assert_eq!(decoded, current);
+	}
+
+	#[test]
+	fn scuttle_preserves_upstream_invoice_expiry_tag() {
+		use prost::Message;
+
+		#[derive(Clone, PartialEq, prost::Message)]
+		struct UpstreamReceive {
+			#[prost(uint64, optional, tag = "6")]
+			expiry_secs: Option<u64>,
+		}
+		let old = UpstreamReceive { expiry_secs: Some(60) };
+		let new = protos::StartLightningReceiveRequest::decode(old.encode_to_vec().as_slice()).unwrap();
+		assert_eq!(new.expiry_secs, Some(60));
+		assert!(new.claim_destination.is_none());
+		let new = protos::StartLightningReceiveRequest {
+			expiry_secs: Some(90), claim_destination: Some(protos::VtxoRequest::default()),
+			..Default::default()
+		};
+		let old = UpstreamReceive::decode(new.encode_to_vec().as_slice()).unwrap();
+		assert_eq!(old.expiry_secs, Some(90));
+		let decoded = protos::StartLightningReceiveRequest::decode(new.encode_to_vec().as_slice()).unwrap();
+		assert!(decoded.claim_destination.is_some());
+	}
+
+	#[test]
 	fn owner_link_proto_roundtrip_rejects_malformed_evidence() {
 		let blinded_id = BlindedMailboxIdentifier::from_pubkey(PublicKey::from_str(
 			"0229757774cc6f3be1d5f1774aefa8f02e50bc64404230e7a67e8fde79bd559a9a").unwrap());

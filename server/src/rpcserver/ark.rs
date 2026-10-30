@@ -37,7 +37,7 @@ use ark::tree::signed::{LeafVtxoCosignRequest, UnlockHash, UnlockPreimage};
 use ark::vtxo::Full;
 use ark::vtxo::policy::check_block_height;
 use bitcoin_ext::{BlockDelta, BlockHeight};
-use server_rpc::{self as rpc, protos, RequestExt, TryFromBytes};
+use server_rpc::{self as rpc, protos, TryFromBytes};
 use crate::database::SpendState;
 use crate::owner_proof::OwnerLinks;
 
@@ -137,6 +137,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::OffboardFeeRateResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&_req)?;
 		let feerate = self.offboard_feerate();
 		Ok(tonic::Response::new(protos::OffboardFeeRateResponse {
 			sat_vkb: feerate.to_sat_per_kwu() * 4,
@@ -148,6 +149,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxoRequest>,
 	) -> Result<tonic::Response<protos::GetVtxoResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
@@ -167,6 +169,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxoStatusRequest>,
 	) -> Result<tonic::Response<protos::GetVtxoStatusResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
@@ -204,6 +207,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxosByIdsRequest>,
 	) -> Result<tonic::Response<protos::GetVtxosByIdsResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxo_ids.len() > rpc::MAX_NB_VTXO_IDS {
@@ -238,6 +242,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxosStatusByIdsRequest>,
 	) -> Result<tonic::Response<protos::GetVtxosStatusByIdsResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxos.len() > rpc::MAX_NB_VTXO_IDS {
@@ -302,6 +307,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RecoverVtxosByXpubRequest>,
 	) -> Result<tonic::Response<protos::RecoverVtxosByXpubResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if self.config.recovery_xpub_nb_keys == 0 {
@@ -370,6 +376,7 @@ impl rpc::server::ArkService for Server {
 	async fn set_fallback(
 		&self, req: tonic::Request<protos::SetFallbackRequest>,
 	) -> Result<tonic::Response<protos::SetFallbackResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 		let mailbox = PublicKey::from_bytes(&req.mailbox_pk)?;
 		let record = ark::fallback::FallbackRegistration::deserialize(&req.record)
@@ -389,7 +396,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::BoardCosignRequest>,
 	) -> Result<tonic::Response<protos::BoardCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_BOARD_FUNDING_TX
@@ -428,6 +435,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::BoardVtxoRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let vtxo = <Vtxo<Full>>::deserialize(&req.board_vtxo[..])
@@ -445,6 +453,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RegisterVtxoTransactionsRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxos.is_empty() {
@@ -473,6 +482,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RegisterVtxoTransactionsRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxos.is_empty() {
@@ -500,6 +510,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ArkoorPackageCosignRequest>,
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
 			macros::badarg!("too many parts in cosign request");
@@ -519,7 +530,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::LightningPayHtlcCosignRequest>,
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -545,7 +556,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::InitiateLightningPaymentRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -580,6 +591,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CheckLightningPaymentRequest>,
 	) -> Result<tonic::Response<protos::LightningPaymentStatus>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
@@ -594,6 +606,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ArkoorPackageCosignRequest>
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
 			macros::badarg!("too many parts in cosign request");
@@ -613,6 +626,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::FetchBolt12InvoiceRequest>,
 	) -> Result<tonic::Response<protos::FetchBolt12InvoiceResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let offer = match Offer::try_from(req.offer.to_vec()) {
@@ -641,7 +655,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::StartLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::StartLightningReceiveResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF {
@@ -675,6 +689,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CheckLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::CheckLightningReceiveResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
@@ -688,7 +703,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::PrepareLightningReceiveClaimRequest>
 	) -> Result<tonic::Response<protos::PrepareLightningReceiveClaimResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		// For token filters. Like the integration API, this trusts the
 		// proxy chain to set `X-Forwarded-For`, see `RemoteAddrService`.
 		let client_address = req.extensions().get::<SocketAddr>().cloned()
@@ -723,7 +738,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ClaimLightningReceiveRequest>
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
@@ -750,6 +765,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CancelLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
@@ -766,6 +782,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::NextRoundTimeResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&_req)?;
 		Ok(tonic::Response::new(protos::NextRoundTimeResponse {
 			timestamp: self.rounds.next_round_time.read()
 				.duration_since(UNIX_EPOCH).expect("we set this value beyond unix epoch")
@@ -785,6 +802,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<Self::SubscribeRoundsStream>, tonic::Status> {
+		super::validate_scuttle_pver(&_req)?;
 		let mgr = self.rtmgr.clone();
 		let stream = self.rounds.events()
 			.map(|e| Ok(e.as_ref().into()))
@@ -797,6 +815,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::RoundEvent>, tonic::Status> {
+		super::validate_scuttle_pver(&_req)?;
 		if let Some(event) = self.rounds.last_event() {
 			Ok(tonic::Response::new(event.as_ref().into()))
 		} else {
@@ -812,7 +831,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::SubmitPaymentRequest>,
 	) -> Result<tonic::Response<protos::SubmitPaymentResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -873,7 +892,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::VtxoSignaturesRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -905,7 +924,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RoundParticipationRequest>,
 	) -> Result<tonic::Response<protos::RoundParticipationResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -954,6 +973,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RoundParticipationStatusRequest>,
 	) -> Result<tonic::Response<protos::RoundParticipationStatusResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let unlock_hash = UnlockHash::from_bytes(&req.unlock_hash)?;
@@ -1033,7 +1053,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::LeafVtxoCosignRequest>,
 	) -> Result<tonic::Response<protos::LeafVtxoCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -1055,7 +1075,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ForfeitNoncesRequest>,
 	) -> Result<tonic::Response<protos::ForfeitNoncesResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -1086,7 +1106,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ForfeitVtxosRequest>,
 	) -> Result<tonic::Response<protos::ForfeitVtxosResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -1110,7 +1130,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::PrepareOffboardRequest>,
 	) -> Result<tonic::Response<protos::PrepareOffboardResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let request = req.offboard.badarg("missing offboard field")?.try_into()
@@ -1150,6 +1170,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::FinishOffboardRequest>,
 	) -> Result<tonic::Response<protos::FinishOffboardResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let offboard_txid = Txid::from_bytes(req.offboard_txid)?;

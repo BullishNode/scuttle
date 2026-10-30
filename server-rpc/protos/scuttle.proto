@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package scuttle;
+
+import "core.proto";
+import "bark_server.proto";
+
+// Scuttle operator service, exposed only on the existing privileged admin listener.
+service ScuttleService {
+	rpc ListExpiryHolds(core.Empty) returns (ListExpiryHoldsResponse) {}
+	rpc FailLightningAttempt(FailLightningAttemptRequest) returns (core.Empty) {}
+	rpc ScopedPaymentStatus(bark_server.CheckLightningPaymentRequest) returns (bark_server.LightningPaymentStatus) {}
+}
+
+message ExpiryHold {
+	bytes vtxo_id = 1;
+	string reason = 2;
+	int64 first_seen = 3;
+	int64 last_seen = 4;
+}
+
+message ListExpiryHoldsResponse {
+	repeated ExpiryHold holds = 1;
+}
+
+message FailLightningAttemptRequest {
+	int64 attempt_id = 1;
+	string reason = 2;
+}

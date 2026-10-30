@@ -55,10 +55,19 @@ async fn connect_ark_client(url: &str) -> anyhow::Result<ArkClient> {
 	Ok(rpc::ArkServiceClient::with_interceptor(channel, inject_pver as PverInterceptor))
 }
 
+/// Connect the native mailbox fixture with the same fork epoch as its Ark client.
+pub async fn connect_mailbox_client(url: &str) -> anyhow::Result<MailboxClient> {
+	let channel = tonic::transport::Endpoint::from_shared(url.to_owned())
+		.context("invalid mailbox url")?.connect().await.context("connecting mailbox rpc")?;
+	Ok(rpc::mailbox::MailboxServiceClient::with_interceptor(channel, inject_pver as PverInterceptor))
+}
+
 pub type ArkClient = rpc::ArkServiceClient<
 	tonic::service::interceptor::InterceptedService<tonic::transport::Channel, PverInterceptor>,
 >;
-pub type MailboxClient = rpc::mailbox::MailboxServiceClient<tonic::transport::Channel>;
+pub type MailboxClient = rpc::mailbox::MailboxServiceClient<
+	tonic::service::interceptor::InterceptedService<tonic::transport::Channel, PverInterceptor>,
+>;
 pub type WalletAdminClient = rpc::admin::WalletAdminServiceClient<tonic::transport::Channel>;
 pub type RoundAdminClient = rpc::admin::RoundAdminServiceClient<tonic::transport::Channel>;
 pub type SweepAdminClient = rpc::admin::SweepAdminServiceClient<tonic::transport::Channel>;
@@ -258,7 +267,7 @@ impl Captaind {
 	}
 
 	pub async fn get_mailbox_public_rpc(&self) -> MailboxClient {
-		MailboxClient::connect(self.ark_url()).await.expect("can't connect server public rpc")
+		connect_mailbox_client(&self.ark_url()).await.expect("can't connect server mailbox rpc")
 	}
 
 	/// Wait until the server has seen the HTLCs of a lightning receive.

@@ -19,6 +19,7 @@ fn main() {
 			"./protos/bark_server.proto",
 			"./protos/intman.proto",
 			"./protos/mailbox_server.proto",
+			"./protos/scuttle.proto",
 		], &["./protos"])
 		.expect("failed to compile bark server rpc protos");
 
@@ -28,6 +29,7 @@ fn main() {
 	println!("cargo:rerun-if-changed=protos/bark_server.proto");
 	println!("cargo:rerun-if-changed=protos/intman.proto");
 	println!("cargo:rerun-if-changed=protos/mailbox_server.proto");
+	println!("cargo:rerun-if-changed=protos/scuttle.proto");
 }
 
 fn generate_method_lookup(descriptor_path: &Path, out_dir: &str) {

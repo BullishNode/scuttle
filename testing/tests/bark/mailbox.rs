@@ -216,7 +216,7 @@ async fn accept_mailbox() {
 
 /// Helper to read all vtxo_ids from a recovery mailbox
 async fn read_recovery_vtxo_ids(
-	mb_rpc: &mut server_rpc::protos::mailbox_server::mailbox_service_client::MailboxServiceClient<tonic::transport::Channel>,
+	mb_rpc: &mut MailboxClient,
 	wallet: &bark::Wallet,
 ) -> Vec<VtxoId> {
 	let recovery_mailbox_kp = wallet.recovery_mailbox_keypair();
