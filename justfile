@@ -636,3 +636,7 @@ _nix-build-checksums:
 	rm -f SHA256SUMS
 	LC_ALL=C sha256sum * > SHA256SUMS
 	cat SHA256SUMS
+
+# Read-only Git maintenance canary; no application or native test is started.
+fork-canary:
+	python3 contrib/check-scuttle-delta.py
