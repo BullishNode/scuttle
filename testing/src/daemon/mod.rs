@@ -38,6 +38,64 @@ pub enum DaemonState {
 	Error
 }
 
+/// Identity of one owned native child. No process is selected by a name alone.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NativeProcessIdentity {
+	pub pid: u32,
+	pub start_ticks: u64,
+	pub exe: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn native_process(pid: u32) -> anyhow::Result<(NativeProcessIdentity, char, u32)> {
+	let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+	let (_, fields) = stat.rsplit_once(')').context("malformed process stat")?;
+	let fields = fields.split_whitespace().collect::<Vec<_>>();
+	ensure!(fields.len() > 19, "incomplete process stat");
+	let identity = NativeProcessIdentity { pid, start_ticks: fields[19].parse()?,
+		exe: fs::read_link(format!("/proc/{pid}/exe"))? };
+	Ok((identity, fields[0].chars().next().context("missing process state")?, fields[1].parse()?))
+}
+
+/// Resume only the same child that this guard stopped, including during unwind.
+#[cfg(target_os = "linux")]
+pub struct PausedNativeDaemon {
+	identity: NativeProcessIdentity,
+	resume_required: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl PausedNativeDaemon {
+	pub fn identity(&self) -> &NativeProcessIdentity { &self.identity }
+
+	pub fn resume(mut self) -> anyhow::Result<()> {
+		let (actual, state, _) = native_process(self.identity.pid)?;
+		ensure!(actual == self.identity && matches!(state, 'T' | 't'), "paused daemon identity/state changed");
+		info!("Continuing owned daemon {:?}", self.identity);
+		signal::kill(Pid::from_raw(self.identity.pid.try_into()?), signal::Signal::SIGCONT)?;
+		self.resume_required = false;
+		Ok(())
+	}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PausedNativeDaemon {
+	fn drop(&mut self) {
+		if self.resume_required {
+			if let Ok((actual, _, _)) = native_process(self.identity.pid) {
+				// CONT also cancels a STOP still pending acknowledgement.
+				if actual == self.identity {
+					info!("Finally continuing owned daemon {:?}", self.identity);
+					if let Err(error) = signal::kill(Pid::from_raw(self.identity.pid as i32), signal::Signal::SIGCONT) {
+						warn!("Could not resume owned daemon {}: {}", self.identity.pid, error);
+					}
+				}
+			}
+		}
+	}
+}
+
 pub trait LogHandler: Send + Sync + 'static {
 	/// Process a log line. Return true when you're done.
 	fn process_log(&mut self, line: &str) -> bool;
@@ -225,6 +283,50 @@ impl<T> Daemon<T>
 				Err(e)
 			}
 		}
+	}
+
+	#[cfg(target_os = "linux")]
+	pub(crate) async fn native_child(&self) -> anyhow::Result<NativeProcessIdentity> {
+		let mut child = self.child.lock().await;
+		let child = child.as_mut().context("daemon has no child")?;
+		ensure!(child.try_wait()?.is_none(), "daemon child already exited");
+		Ok(native_process(child.id().context("daemon PID missing")?)?.0)
+	}
+
+	/// Pause an owned native process, refusing a stop acquired by someone else.
+	#[cfg(target_os = "linux")]
+	pub async fn pause_native(&self) -> anyhow::Result<PausedNativeDaemon> {
+		let mut child = self.child.lock().await;
+		let child = child.as_mut().context("daemon has no child")?;
+		ensure!(child.try_wait()?.is_none(), "daemon child already exited");
+		let pid = child.id().context("daemon PID missing")?;
+		let (identity, state, _) = native_process(pid)?;
+		ensure!(!matches!(state, 'T' | 't'), "daemon is already stopped; STOP ownership refused");
+		let guard = PausedNativeDaemon { identity, resume_required: true };
+		info!("Pausing owned daemon {:?}", guard.identity);
+		signal::kill(Pid::from_raw(pid.try_into()?), signal::Signal::SIGSTOP)?;
+		tokio::time::timeout(Duration::from_secs(2), async {
+			loop {
+				let (actual, state, _) = native_process(pid)?;
+				ensure!(actual == guard.identity, "daemon changed while acquiring STOP");
+				if matches!(state, 'T' | 't') { return anyhow::Ok(()); }
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		}).await.context("daemon did not acknowledge STOP")??;
+		Ok(guard)
+	}
+
+	/// Reap an already exiting child without sending another signal.
+	#[cfg(target_os = "linux")]
+	pub(crate) async fn wait_native_exit(&self) -> anyhow::Result<std::process::ExitStatus> {
+		let mut state = self.daemon_state.lock().await;
+		let mut child = self.child.lock().await;
+		let child = child.as_mut().context("daemon has no child")?;
+		let result = tokio::time::timeout(wait_timeout(), child.wait()).await
+			.context("native child did not exit")??;
+		*state = DaemonState::Stopped;
+		info!("Owned native daemon {} exited with {}", self.name, result);
+		Ok(result)
 	}
 
 	pub async fn stop(&self) -> anyhow::Result<()> {

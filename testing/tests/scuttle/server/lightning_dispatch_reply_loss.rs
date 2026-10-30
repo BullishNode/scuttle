@@ -1,6 +1,7 @@
 //! Reconcile a real payment after its caller has stopped, using its own native label.
 
 use std::collections::{BTreeMap, BTreeSet};
+use anyhow::{Context, ensure};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,12 +22,13 @@ use ark_testing::onchain::AppBip84Wallet;
 use bitcoin::{Amount, Network, OutPoint, Transaction};
 use bitcoin::consensus::deserialize;
 use bitcoin::hex::DisplayHex;
+use bitcoin::hashes::{sha256, Hash};
 use bitcoin_ext::{BlockDelta, BlockHeight};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use cln_rpc::listpays_pays::ListpaysPaysStatus;
 use cln_rpc::plugins::hold;
 use server::database::Db;
-use server_log::ArkFeeRecorded;
+use server_log::{ArkFeeRecorded, XpayRpcReturned};
 use server_rpc::protos;
 
 async fn remote_pays(node: &Lightningd, hash: PaymentHash) -> Vec<cln_rpc::ListpaysPays> {
@@ -70,8 +72,20 @@ async fn recovery_records_its_native_routing_fee() {
 		.expect("routing fee reconciliation must finish within 180 seconds");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn coded_xpay_error_retains_its_own_pending_payment() {
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, true)).await
+		.expect("the native plugin fault and original settlement tail must finish");
+}
+
 async fn external_success_during_restart(routed: bool) {
-	let ctx = TestContext::new(if routed { "server/recovery_records_its_native_routing_fee" }
+	external_success_with_fault(routed, false).await;
+}
+
+async fn external_success_with_fault(routed: bool, plugin_fault: bool) {
+	let ctx = TestContext::new(if plugin_fault { "scuttle/coded_xpay_error_own_pending" }
+		else if routed { "server/recovery_records_its_native_routing_fee" }
 		else { "server/recovery_binds_restarted_payment_success_to_source" }).await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let routed_receiver = if routed {
@@ -124,7 +138,9 @@ async fn external_success_during_restart(routed: bool) {
 			// Final CLTV18 plus at most one regtest forwarding delta6 fits
 			// the existing native margin; no production deadline is qualified.
 			config.htlc_send_expiry_delta = BlockDelta::new(40);
-			config.invoice_check_interval = Duration::from_secs(1);
+			// Isolate the immediate xpay reconciliation while the fault is
+			// observed. The original1s monitor is restored for the normal tail.
+			config.invoice_check_interval = Duration::from_secs(if plugin_fault { 3600 } else { 1 });
 			if routed {
 				config.fees.lightning_send.base_fee = sat(1_000);
 				config.ln_max_fee_ppm = 1_000_000;
@@ -185,9 +201,10 @@ async fn external_success_during_restart(routed: bool) {
 		min_final_cltv_expiry: Some(18), expiry: Some(3600), routing_hints: vec![],
 	}).await.unwrap().into_inner().bolt11;
 	lightning.sync().await;
+	let mut xpay_returned = plugin_fault.then(|| srv.subscribe_log::<XpayRpcReturned>());
 	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 100_000, htlc_vtxo_ids: vec![sources[0].to_bytes().to_vec()],
-		mailbox_id: routed.then(|| mailbox.mailbox().serialize()), retry_for_secs: Some(5),
+		mailbox_id: (routed || plugin_fault).then(|| mailbox.mailbox().serialize()), retry_for_secs: Some(5),
 	}).await.unwrap();
 	receiving_node.wait_for_hold_invoice_accepted(hash).await;
 	drop(client);
@@ -220,6 +237,24 @@ async fn external_success_during_restart(routed: bool) {
 		assert!(part.created_index > 0);
 		Some((part.id, part.groupid, part.partid, part.created_index))
 	} else { None };
+	let mut fault_target = None;
+	#[cfg(target_os = "linux")]
+	if plugin_fault {
+		let observation = tokio::time::timeout(Duration::from_secs(15), pending_plugin_window(
+			&ctx, &srv, &lightning.internal, &db, hash, &sources, attempt, xpay_returned.as_mut().unwrap(),
+		)).await;
+		let (target, record) = match observation {
+			Ok(Ok(record)) => (record["disposition"] == "TARGET_REACHED", record),
+			Ok(Err(error)) => (false, serde_json::json!({ "disposition": "INCONSISTENT", "error": error.to_string() })),
+			Err(error) => (false, serde_json::json!({ "disposition": "MISSED_TARGET", "error": error.to_string() })),
+		};
+		tokio::fs::write(ctx.datadir.join("own-pending-window.json"), serde_json::to_vec_pretty(&record).unwrap()).await.unwrap();
+		fault_target = Some(target);
+		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash).await;
+		// The original same-store settlement/restart/fallback tail below is
+		// unchanged; neither a missed target nor a transport error is credit.
+		srv.config_mut().invoice_check_interval = Duration::from_secs(1);
+	}
 	// The external payment survives loss of the local xpay task/response.
 	// Both product processes are stopped, while the two owned CLN peers stay
 	// running. This is an unresolved dispatch, not a forged status.
@@ -503,6 +538,125 @@ async fn external_success_during_restart(routed: bool) {
 	}
 	assert!(ctx.bitcoind().get_block_count().await - first_height <= 96,
 		"payment reconciliation must remain a bounded native case");
+	if plugin_fault {
+		assert_eq!(fault_target, Some(true), "MISSED_TARGET or inconsistent native window: see own-pending-window.json");
+	}
+}
+
+#[cfg(target_os = "linux")]
+async fn pending_parts(node: &Lightningd, hash: PaymentHash, label: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+	let mut parts = node.grpc_client().await.list_send_pays(cln_rpc::ListsendpaysRequest {
+		payment_hash: Some(hash.to_vec()), ..Default::default()
+	}).await?.into_inner().payments;
+	parts.sort_by_key(|part| (part.id, part.groupid, part.partid));
+	ensure!(!parts.is_empty(), "own pending payment has no native parts");
+	parts.into_iter().map(|part| {
+		ensure!(part.status() == cln_rpc::listsendpays_payments::ListsendpaysPaymentsStatus::Pending
+			&& part.label.as_deref() == Some(label) && part.payment_hash == hash.to_vec()
+			&& part.payment_preimage.is_none(), "native part is not the original own Pending payment");
+		Ok(serde_json::json!({ "id": part.id, "group": part.groupid, "part": part.partid,
+			"created_index": part.created_index, "status": part.status, "label": part.label,
+			"amount_msat": part.amount_msat.context("native amount missing")?.msat,
+			"amount_sent_msat": part.amount_sent_msat.context("native sent amount missing")?.msat }))
+	}).collect()
+}
+
+#[cfg(target_os = "linux")]
+async fn normal_channels(node: &Lightningd) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>, u32)>> {
+	let channels = node.grpc_client().await.list_peer_channels(cln_rpc::ListpeerchannelsRequest::default())
+		.await?.into_inner().channels;
+	ensure!(!channels.is_empty(), "provider has no native channels");
+	let mut points = channels.into_iter().map(|channel| {
+		ensure!(channel.peer_connected && channel.state() == cln_rpc::ChannelState::ChanneldNormal,
+			"provider channel is not ready");
+		Ok((channel.channel_id.context("channel id missing")?, channel.funding_txid.context("funding txid missing")?,
+			channel.funding_outnum.context("funding output missing")?))
+	}).collect::<anyhow::Result<Vec<_>>>()?;
+	points.sort();
+	Ok(points)
+}
+
+#[cfg(target_os = "linux")]
+async fn pending_plugin_window(
+	ctx: &TestContext, srv: &Captaind, node: &Lightningd, db: &Db,
+	hash: PaymentHash, sources: &[VtxoId], attempt: i64,
+	returned: &mut tokio::sync::mpsc::UnboundedReceiver<XpayRpcReturned>,
+) -> anyhow::Result<serde_json::Value> {
+	let original = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await?
+		.context("original attempt missing")?;
+	ensure!(original.id == attempt && original.status == server::database::ln::LightningPaymentStatus::Requested
+		&& original.error.is_none(), "immediate reconciliation is not uniquely observable from this initial state");
+	let label = attempt.to_string();
+	let parts = pending_parts(node, hash, &label).await?;
+	let pays = remote_pays(node, hash).await;
+	ensure!(pays.len() == 1 && pays[0].status() == ListpaysPaysStatus::Pending
+		&& pays[0].label.as_deref() == Some(label.as_str()) && pays[0].preimage.is_none(), "own native pay is not Pending");
+	let channels = normal_channels(node).await?;
+	let node_before = node.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await?.into_inner();
+	let grpc = node.grpc_details().await;
+	let hold = node.hold_details().await;
+	let peer_port = node.port().await;
+	let cert_paths = [&grpc.server_cert_path, &grpc.client_cert_path, &hold.server_cert_path, &hold.client_cert_path];
+	let certificates = cert_paths.into_iter().map(|path| std::fs::read(path)
+		.map(|bytes| sha256::Hash::hash(&bytes))).collect::<Result<Vec<_>, _>>()?;
+	let source_rows = super::owner_helpers::source_rows(db, sources).await;
+	let height = ctx.bitcoind().get_block_count().await;
+	let paused = srv.pause_native().await?;
+	let cap_identity = paused.identity().clone();
+	let killed = node.kill_owned_xpay().await?;
+	let native_exit = node.restart_same_ports_after_exit().await?;
+	let after = node.grpc_details().await;
+	let after_hold = node.hold_details().await;
+	ensure!(grpc.uri == after.uri && hold.uri == after_hold.uri && peer_port == node.port().await
+		&& grpc.server_cert_path == after.server_cert_path && grpc.client_cert_path == after.client_cert_path
+		&& grpc.client_key_path == after.client_key_path && hold.server_cert_path == after_hold.server_cert_path
+		&& hold.client_cert_path == after_hold.client_cert_path && hold.client_key_path == after_hold.client_key_path,
+		"same-store restart changed native endpoints/certificate paths");
+	let paths = [&after.server_cert_path, &after.client_cert_path, &after_hold.server_cert_path, &after_hold.client_cert_path];
+	let actual_certificates = paths.into_iter().map(|path| std::fs::read(path)
+		.map(|bytes| sha256::Hash::hash(&bytes))).collect::<Result<Vec<_>, _>>()?;
+	ensure!(actual_certificates == certificates, "public native certificates changed");
+	let node_after = node.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await?.into_inner();
+	ensure!(node_before.id == node_after.id && node_before.network == node_after.network && node_before.version == node_after.version,
+		"same-store restart changed native identity");
+	loop {
+		if normal_channels(node).await.is_ok_and(|actual| actual == channels) { break; }
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	ensure!(pending_parts(node, hash, &label).await? == parts, "native part identity changed before CONT");
+	paused.resume()?;
+	let event = loop {
+		let event = returned.recv().await.context("xpay return observer closed")?;
+		if event.payment_hash == hash { break event; }
+	};
+	tokio::fs::write(ctx.datadir.join("own-pending-xpay-return.json"), serde_json::to_vec_pretty(&event)?).await?;
+	let coded = event.error.as_deref().is_some_and(|e| e.contains("RpcError {") && e.contains("code: Some(-4)"));
+	let after_attempt = tokio::time::timeout(Duration::from_secs(5), async {
+		loop {
+			let current = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await?
+				.context("own attempt disappeared")?;
+			if !coded || current.status != server::database::ln::LightningPaymentStatus::Requested { break anyhow::Ok(current); }
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	}).await.context("immediate Pending reconciliation was not observed")??;
+	ensure!(after_attempt.id == attempt, "fault created or selected a different attempt");
+	// Existing periodic reconciliation waits retry_for5 + timeout buffer15.
+	// A new monitor's first tick cannot be mistaken for the immediate call.
+	let immediate = chrono::Local::now() - original.created_at < chrono::Duration::seconds(20);
+	ensure!(pending_parts(node, hash, &label).await? == parts, "own native Pending parts changed after CONT");
+	ensure!(ctx.bitcoind().get_block_count().await == height, "fault window mined a block");
+	ensure!(super::owner_helpers::source_rows(db, sources).await == source_rows, "source custody changed while native payment is Pending");
+	ensure!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await?.is_none(), "pending payment has a settlement");
+	let stored_coded = after_attempt.error.as_deref().is_some_and(|e| e.contains("code: Some(-4)"));
+	let target = coded && stored_coded && immediate && after_attempt.status == server::database::ln::LightningPaymentStatus::Submitted;
+	let disposition = if target { "TARGET_REACHED" } else if coded && stored_coded && immediate
+		&& after_attempt.status == server::database::ln::LightningPaymentStatus::Failed { "DEFECT_REPRODUCED" } else { "MISSED_TARGET" };
+	Ok(serde_json::json!({ "disposition": disposition, "payment_hash": hash.to_string(), "attempt_id": attempt,
+		"cap": cap_identity, "killed_xpay": killed, "provider_exit": native_exit.code(), "node_id": node_after.id,
+		"own_parts": parts, "native_error": event.error, "stored_error": after_attempt.error,
+		"status": after_attempt.status.to_string(), "within_existing_monitor_delay": immediate,
+		"source_ids": sources.iter().map(ToString::to_string).collect::<Vec<_>>(),
+		"same_store_same_ports_public_certificates_channels": true }))
 }
 
 #[tokio::test]
