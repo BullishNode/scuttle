@@ -4133,3 +4133,5 @@ async fn late_xpay_result_does_not_finalize_a_retry() {
 
 include!("lightning_fallback.rs");
 
+#[path = "lightning_settlement.rs"]
+mod settlement;

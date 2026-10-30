@@ -1,8 +1,17 @@
-# Warns after `period`, kills after `terminate-after` additional periods.
-# e.g. period = "60s", terminate-after = 3 => warns at 60s, kills at 4*60s = 240s.
+# Warns after each `period`, kills after `terminate-after` periods.
+# e.g. period = "60s", terminate-after = 3 => warns at 60s and 120s, kills at 180s.
 
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Ignored scale tests need a longer timeout than ordinary integration tests.
+[profile.fallback-scale]
+slow-timeout = { period = "60s", terminate-after = 60 }
+
+# Other scale tests retain their existing runner limit.
+[[profile.fallback-scale.overrides]]
+filter = 'not test(=expiry_oversize::expiry_bounded_round_inventory_splits_and_pays_every_owner)'
+slow-timeout = { period = "60s", terminate-after = 29 }
 
 [profile.ci]
 slow-timeout = { period = "60s", terminate-after = 5 }
