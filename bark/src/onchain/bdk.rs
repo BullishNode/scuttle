@@ -643,11 +643,14 @@ mod fallback_tests {
 	use super::*;
 
 	#[test]
-	fn scuttle_shadow_vector_fixture() {
+	fn bip86_mailbox_mnemonic_vectors_match_native_index_zero() {
 		// Standard public BIP39 test mnemonic, never a wallet-store read.
 		let mnemonic: bip39::Mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".parse().unwrap();
 		let secp = Secp256k1::new();
-		for network in [Network::Bitcoin, Network::Signet, Network::Regtest] {
+		let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!("../../testdata/bip86-mailbox.json")).unwrap();
+		assert_eq!(vectors.len(), 3);
+		for vector in vectors {
+			let network: Network = vector["network"].as_str().unwrap().parse().unwrap();
 			let master = bip32::Xpriv::new_master(network, &mnemonic.to_seed("")).unwrap();
 			let path = [bip32::ChildNumber::from_hardened_idx(86).unwrap(),
 				bip32::ChildNumber::from_hardened_idx(u32::from(network != Network::Bitcoin)).unwrap(),
@@ -657,10 +660,9 @@ mod fallback_tests {
 			let native = BdkWallet::create_single(bdk_wallet::template::Bip86(master, KeychainKind::External))
 				.network(network).create_wallet_no_persist().unwrap();
 			assert_eq!(native.peek_address(KeychainKind::External, 0).address.script_pubkey(), script);
-			println!("SCUTTLE_BIP86_VECTOR {}", serde_json::json!({
-				"network": network.to_string(), "mailbox": mailbox.public_key().to_string(),
-				"output_key": script.as_bytes()[2..].as_hex().to_string(), "script": script.to_hex_string(),
-			}));
+			assert_eq!(mailbox.public_key().to_string(), vector["mailbox"]);
+			assert_eq!(script.as_bytes()[2..].as_hex().to_string(), vector["output_key"]);
+			assert_eq!(script.to_hex_string(), vector["script"]);
 		}
 	}
 

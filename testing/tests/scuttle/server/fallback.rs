@@ -158,7 +158,12 @@ async fn fallback_links_are_authenticated_conflict_safe_and_transactional() {
 		db.write(async |tx| tx.set_fallback(mailbox, record, Network::Regtest).await).await.unwrap();
 	}
 	let link = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap();
-	let resigned = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap();
+	let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!("../../../../lib/testdata/owner-joint-v2.json")).unwrap();
+	let resigned = vectors.iter().find(|vector| vector["network"] == "regtest"
+		&& vector["mailbox"] == mailbox.public_key().to_string()).unwrap();
+	let resigned = ark::fallback::OwnerLink::deserialize_hex(resigned["resigned_proof"].as_str().unwrap()).unwrap();
+	assert_ne!(link.signature, resigned.signature);
+	assert_eq!(resigned.verify_joint(Network::Regtest, &server, coin.public_key()).unwrap().as_pubkey(), mailbox.public_key());
 	let shadow_rows = async |key: PublicKey| db.read(async |tx| Ok(tx.query(
 		"SELECT user_pubkey,mailbox_pk,blinded_id,joint_proof,xmin::TEXT FROM owner_key WHERE user_pubkey=$1",
 		&[&key.to_string()],

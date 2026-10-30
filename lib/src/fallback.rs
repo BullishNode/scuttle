@@ -364,32 +364,38 @@ mod tests {
 	}
 
 	#[test]
-	fn scuttle_shadow_vector_fixture() {
-		// Temporary fixture emitter for a root-owned unit invocation. Replace
-		// with literal expected bytes before the ownership chunk is released.
+	fn joint_owner_link_frozen_network_and_resigning_vectors() {
+		let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+			"../testdata/owner-joint-v2.json")).unwrap();
+		assert_eq!(vectors.len(), 9);
 		let server = Keypair::from_seckey_slice(&SECP, &[11; 32]).unwrap();
 		let coin = Keypair::from_seckey_slice(&SECP, &[3; 32]).unwrap();
-		for network in [Network::Bitcoin, Network::Signet, Network::Regtest] {
-			for mailbox in [Keypair::from_seckey_slice(&SECP, &[17; 32]).unwrap(), key(3), key(6)] {
-				let link = OwnerLink::new_joint(network, server.public_key(), &mailbox, &coin).unwrap();
-				let intent = OwnerLink::joint_intent(network, server.public_key(), coin.public_key(), link.blinded_id);
-				let coin_message = tagged_message(COIN_TAG, &[&intent]);
-				let mailbox_message = tagged_message(MAILBOX_TAG, &[&intent]);
-				let mut resigned = link;
-				resigned.signature = SECP.sign_schnorr_with_aux_rand(&coin_message, &coin, &[1; 32]);
-				assert_ne!(resigned.signature, link.signature);
-				assert_eq!(resigned.verify_joint(network, &server, coin.public_key()).unwrap(),
-					MailboxIdentifier::from_pubkey(mailbox.public_key()));
-				println!("SCUTTLE_JOINT_VECTOR {}", serde_json::json!({
-					"network": network.to_string(), "server": server.public_key().to_string(),
-					"coin": coin.public_key().to_string(), "mailbox": mailbox.public_key().to_string(),
-					"intent": intent.as_hex().to_string(), "coin_message": coin_message.to_string(),
-					"mailbox_message": mailbox_message.to_string(),
-					"proof": link.serialize_hex(), "resigned_proof": resigned.serialize_hex(),
-					"payout_script": ScriptBuf::new_p2tr(&SECP, mailbox.x_only_public_key().0, None).to_hex_string(),
-				}));
-			}
+		let mailboxes = [Keypair::from_seckey_slice(&SECP, &[17; 32]).unwrap(), key(3), key(6)];
+		let mut parities = std::collections::BTreeSet::new();
+		for vector in vectors {
+			let network: Network = vector["network"].as_str().unwrap().parse().unwrap();
+			let mailbox = mailboxes.iter().find(|key| key.public_key().to_string() == vector["mailbox"]).unwrap();
+			assert_eq!(server.public_key().to_string(), vector["server"]);
+			assert_eq!(coin.public_key().to_string(), vector["coin"]);
+			parities.insert(mailbox.public_key().serialize()[0]);
+			let link = OwnerLink::new_joint(network, server.public_key(), mailbox, &coin).unwrap();
+			assert_eq!(link.serialize_hex(), vector["proof"]);
+			let intent = OwnerLink::joint_intent(network, server.public_key(), coin.public_key(), link.blinded_id);
+			assert_eq!(intent.as_hex().to_string(), vector["intent"]);
+			assert_eq!(tagged_message(COIN_TAG, &[&intent]).to_string(), vector["coin_message"]);
+			assert_eq!(tagged_message(MAILBOX_TAG, &[&intent]).to_string(), vector["mailbox_message"]);
+			let resigned = OwnerLink::deserialize_hex(vector["resigned_proof"].as_str().unwrap()).unwrap();
+			assert_ne!(resigned.signature, link.signature);
+			assert_eq!(resigned.blinded_id, link.blinded_id);
+			assert_eq!(resigned.mailbox_signature, link.mailbox_signature);
+			assert_eq!(resigned.verify_joint(network, &server, coin.public_key()).unwrap(),
+				MailboxIdentifier::from_pubkey(mailbox.public_key()));
+			assert!(resigned.verify_joint(network, &key(12), coin.public_key()).is_err());
+			let other_network = if network == Network::Bitcoin { Network::Signet } else { Network::Bitcoin };
+			assert!(resigned.verify_joint(other_network, &server, coin.public_key()).is_err());
+			assert_eq!(ScriptBuf::new_p2tr(&SECP, mailbox.x_only_public_key().0, None).to_hex_string(), vector["payout_script"]);
 		}
+		assert_eq!(parities, [2, 3].into_iter().collect());
 	}
 
 	#[test]
