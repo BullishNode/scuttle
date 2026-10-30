@@ -165,6 +165,12 @@ test-integration TEST="": ensure-build-bins docker-pull
 		-E 'not binary(tor) and not binary(server-migrations) and not binary(upgrade)' {{TEST}}
 alias int := test-integration
 
+# Scuttle-only financial, ownership, wire and recovery regressions.
+test-integration-scuttle TEST="": ensure-build-bins docker-pull
+	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
+		--test scuttle {{TEST}}
+alias int-scuttle := test-integration-scuttle
+
 # Run the server upgrade/migration tests. Requires OLD_CAPTAIND_EXEC to
 # point at a previous captaind release binary, e.g.:
 #   OLD_CAPTAIND_EXEC=/opt/second/captaind-0.7.0 just int-server-migrations

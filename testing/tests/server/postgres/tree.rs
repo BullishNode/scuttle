@@ -555,5 +555,3 @@ async fn provide_signatures_does_not_resurrect_spent_vtxo() {
 	}).await.unwrap();
 	assert_eq!(state, "spent");
 }
-
-include!("tree_fallback.rs");

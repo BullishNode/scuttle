@@ -1,51 +1,9 @@
-mod expiry_test;
-mod expiry_partial_conflict_reorg;
-mod expiry_failed_swap;
-mod offboard_restart;
-mod expiry_internal_terminal_return;
-mod expiry_view_service;
+#[path = "../scuttle/server/owner_helpers.rs"]
 mod expiry_admission;
-mod expiry_races;
-mod expiry_refresh_completion;
-mod expiry_replacement_transfer;
-mod expiry_operation_races;
-mod expiry_transfer_refresh;
-mod expiry_ownership;
-mod expiry_dispatch;
-mod expiry_lightning_terminal;
-mod expiry_lightning_native_status;
-mod expiry_internal_replan;
-mod expiry_internal_reclaim_reorg;
-mod expiry_internal_partial_terminal;
-mod expiry_internal_batched_terminal;
-mod expiry_internal_reserved_batched_terminal;
-mod expiry_hash_provenance;
-mod expiry_payout_flow;
-mod expiry_split;
-mod expiry_send_claim;
-mod expiry_send_claim_receipts;
-mod expiry_reorg;
-mod expiry_conflict;
-mod expiry_independent_payouts;
-mod lightning_dispatch_reply_loss;
-mod lightning_forwarded_ack;
-mod lightning_forwarded_reopen;
-mod expiry_oversize;
-mod lightning_receive_fallback;
-mod lightning_receive_unmaterialized;
-mod expiry_cold_backup;
-mod lightning_cold_backup;
-mod offboard_reply_restore;
-mod expiry_tiny_payout_grouping;
-mod expiry_dust_later_receipt;
-mod expiry_three_owner_forwarding;
-mod expiry_script_dust_boundaries;
 mod ban;
 mod blocklist;
 mod block_index;
 mod forfeit;
-mod fallback;
-mod expiry_attribution;
 mod lightning;
 mod mailbox;
 mod nursery;
@@ -57,7 +15,6 @@ mod registration;
 mod round_status_privacy;
 mod settler;
 mod watchman;
-mod watchman_wallet;
 
 use std::iter;
 use std::str::FromStr;
@@ -3024,4 +2981,4 @@ async fn confirmed_exit_during_signing_does_not_stop_round_coordinator() {
 	assert!(next_attempt, "a participant's exit must not terminate the round coordinator");
 }
 
-include!("mod_fallback.rs");
+include!("../scuttle/server/mod_fallback.rs");

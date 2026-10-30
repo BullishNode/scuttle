@@ -586,27 +586,5 @@ async fn pay_with_retry_for() {
 
 /// The first real upstream claim succeeds, but its reply never reaches the
 /// client. This observes the durable checkpoint while the request is in flight.
-#[derive(Clone)]
-struct HoldSuccessfulReceiveClaim {
-	hold: Arc<AtomicBool>,
-	arrived: Arc<tokio::sync::Notify>,
-	requests: Arc<AtomicUsize>,
-}
 
-#[async_trait::async_trait]
-impl captaind::proxy::ArkRpcProxy for HoldSuccessfulReceiveClaim {
-	async fn claim_lightning_receive(
-		&self, upstream: &mut ArkClient, request: protos::ClaimLightningReceiveRequest,
-	) -> Result<protos::ArkoorPackageCosignResponse, tonic::Status> {
-		self.requests.fetch_add(1, Ordering::SeqCst);
-		let response = upstream.claim_lightning_receive(request).await?.into_inner();
-		if self.hold.swap(false, Ordering::SeqCst) {
-			self.arrived.notify_one();
-			std::future::pending::<()>().await;
-		}
-		Ok(response)
-	}
-}
-
-
-include!("lightning_fallback.rs");
+include!("../scuttle/bark_sdk/lightning_helpers.rs");

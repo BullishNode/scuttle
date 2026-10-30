@@ -163,5 +163,3 @@ async fn balance_sets_aside_expired_vtxos() {
 	assert_eq!(balance.spendable, AMOUNT, "refreshed: {balance:?}");
 	assert_eq!(balance.needs_refresh, Amount::ZERO, "refreshed: {balance:?}");
 }
-
-include!("balance_fallback.rs");

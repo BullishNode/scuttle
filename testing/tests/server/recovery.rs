@@ -231,6 +231,3 @@ async fn recover_vtxos_by_xpub_disabled() {
 	let err = client.recover_vtxos_by_xpub(req).await.expect_err("the rpc is disabled");
 	assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
 }
-
-
-include!("recovery_fallback.rs");

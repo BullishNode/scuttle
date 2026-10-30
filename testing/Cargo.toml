@@ -9,6 +9,10 @@ name = "lock-holder"
 path = "tests/core/lock-holder.rs"
 
 [[test]]
+name = "scuttle"
+path = "tests/scuttle/mod.rs"
+
+[[test]]
 name = "server"
 path = "tests/server/mod.rs"
 
