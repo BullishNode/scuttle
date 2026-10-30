@@ -894,6 +894,8 @@ impl<'t> Tx<'t> {
 		}
 	}
 
+	/// Store recovery hints only. A mailbox holder may name foreign or unknown
+	/// IDs; this path must never create VTXOs or coin-to-mailbox bindings.
 	pub async fn store_vtxo_ids_in_mailbox(
 		&self,
 		mailbox_type: MailboxType,

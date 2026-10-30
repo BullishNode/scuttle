@@ -1,4 +1,61 @@
 #[tokio::test]
+async fn recovery_posts_do_not_create_or_change_coin_ownership() {
+	let ctx = TestContext::new("scuttle/recovery_posts_do_not_create_ownership").await;
+	let srv = ctx.captaind("server").no_vtxo_pool().create().await;
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let server_key = srv.mailbox_keypair();
+	let coin_key = Keypair::new(&SECP, &mut thread_rng());
+	let owner = Keypair::new(&SECP, &mut thread_rng());
+	let recovery = Keypair::new(&SECP, &mut thread_rng());
+	let unknown_key = Keypair::new(&SECP, &mut thread_rng());
+	super::register_test_owners(&db, &server_key, &owner, &[coin_key]).await;
+	super::register_test_owners(&db, &server_key, &recovery, &[]).await;
+	let coin = DummyTestVtxoSpec { user_keypair: coin_key, ..Default::default() }.build().1;
+	let unknown = DummyTestVtxoSpec { user_keypair: unknown_key, ..Default::default() }.build().1;
+	assert_ne!(coin.id(), unknown.id());
+	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(coin.clone())],
+		Some((bitcoin::Network::Regtest, &server_key))).await).await.unwrap();
+	let ids = [coin.id().to_string(), unknown.id().to_string()];
+	let keys = [coin_key.public_key().to_string(), unknown_key.public_key().to_string()];
+	let snapshot = async || db.read(async |tx| {
+		let row = tx.query_one("SELECT
+			(SELECT COALESCE(jsonb_agg(to_jsonb(k) ORDER BY user_pubkey),'[]')::TEXT
+			 FROM owner_key k WHERE user_pubkey=ANY($1)),
+			(SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY vtxo_id),'[]')::TEXT
+			 FROM coin_owner c WHERE vtxo_id=ANY($2)),
+			(SELECT COALESCE(jsonb_agg(to_jsonb(v) ORDER BY vtxo_id),'[]')::TEXT
+			 FROM vtxo v WHERE vtxo_id=ANY($2))", &[&keys.as_slice(), &ids.as_slice()]).await?;
+		Ok((row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)))
+	}).await.unwrap();
+	let before = snapshot().await;
+	assert!(before.0.contains(&owner.public_key().to_string()));
+	assert!(before.1.contains(&owner.public_key().to_string()));
+	assert!(!before.2.contains(&unknown.id().to_string()));
+	let mailbox = MailboxIdentifier::from_pubkey(recovery.public_key());
+	let authorization = MailboxAuthorization::new(&recovery,
+		chrono::Local::now() + Duration::from_secs(300)).serialize();
+	let request = || protos::mailbox_server::PostRecoveryVtxoIdsRequest {
+		mailbox_id: mailbox.serialize(), authorization: Some(authorization.clone()),
+		vtxo_ids: vec![coin.id().to_bytes().to_vec(), unknown.id().to_bytes().to_vec()],
+	};
+	let mut rpc = srv.get_mailbox_public_rpc().await;
+	for _ in 0..2 {
+		rpc.post_recovery_vtxo_ids(request()).await.unwrap();
+		assert_eq!(snapshot().await, before);
+	}
+	let messages = rpc.read_mailbox(protos::mailbox_server::MailboxRequest {
+		mailbox_id: mailbox.serialize(), authorization: Some(authorization.clone()), checkpoint: 0,
+	}).await.unwrap().into_inner().messages;
+	assert_eq!(messages.len(), 1);
+	let Some(Message::RecoveryVtxoIds(message)) = &messages[0].message else { panic!("expected recovery hints"); };
+	let mut actual = message.vtxo_ids.clone();
+	let mut expected = request().vtxo_ids;
+	actual.sort_unstable();
+	expected.sort_unstable();
+	assert_eq!(actual, expected);
+}
+
+#[tokio::test]
 async fn mailbox_registration_and_commit_notifications() {
 	let ctx = TestContext::new("server/mailbox_registration_and_commit_notifications").await;
 	let srv = ctx.captaind("server").create().await;
