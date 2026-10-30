@@ -90,6 +90,7 @@ const DEFAULT_DATABASE: &str = "postgres";
 enum AdvisoryLock {
 	MailboxWrite = 1,
 	HtlcSettlementWrite = 2,
+	SchemaMigrations = 3,
 }
 
 /// An uncommitted offboard fetched for the retry-task commit path. Carries
@@ -166,8 +167,55 @@ pub struct Db {
 impl Db {
 	async fn run_migrations(&self) -> anyhow::Result<()> {
 		let mut conn = self.get_conn().await?;
-		embedded::migrations::runner().run_async::<Client>(&mut conn).await?;
+		let lock = AdvisoryLock::SchemaMigrations as i64;
+		conn.query_one("SELECT pg_advisory_lock($1)", &[&lock]).await?;
+		let result = Self::migrate_fresh_store(&mut conn).await;
+		let unlocked = conn.query_one("SELECT pg_advisory_unlock($1)", &[&lock]).await;
+		result?;
+		unlocked?;
 		info!("All migrations got successfully run");
+		Ok(())
+	}
+
+	async fn migrate_fresh_store(conn: &mut Client) -> anyhow::Result<()> {
+		// Existing development stores are preserved, never upgraded into this
+		// fresh Scuttle schema. Check before either initialization or refinery.
+		let legacy: bool = conn.query_one(
+			"SELECT to_regclass('scuttle.refinery_schema_history') IS NOT NULL \
+			 OR to_regclass('public.fallback_record') IS NOT NULL \
+			 OR to_regclass('public.expiry_owner_key') IS NOT NULL", &[],
+		).await?.get(0);
+		ensure!(!legacy, "existing database is not a fresh Scuttle store; initialization refused");
+		let initialized: bool = conn.query_one(
+			"SELECT to_regclass('scuttle.owner_key') IS NOT NULL", &[],
+		).await?.get(0);
+		if !initialized {
+			let occupied: bool = conn.query_one(
+				"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_tables \
+				 WHERE schemaname NOT IN ('pg_catalog', 'information_schema'))", &[],
+			).await?.get(0);
+			ensure!(!occupied, "existing database is not a fresh Scuttle store; initialization refused");
+		}
+
+		if initialized {
+			let bound: bool = conn.query_one(
+				"SELECT to_regclass('scuttle.fallback_record') IS NOT NULL \
+				 AND to_regclass('public.refinery_schema_history') IS NOT NULL", &[],
+			).await?.get(0);
+			ensure!(bound, "incomplete Scuttle schema; use a fresh store");
+		}
+
+		embedded::migrations::runner()
+			.set_migration_table_name("public.refinery_schema_history")
+			.run_async::<Client>(conn).await?;
+		if !initialized {
+			// All Scuttle tables appear atomically. An interrupted upstream-only
+			// initialization is unrecognized on reopen and needs a new empty DB.
+			let tx = conn.transaction().await?;
+			tx.batch_execute("CREATE SCHEMA IF NOT EXISTS scuttle").await?;
+			tx.batch_execute(include_str!("scuttle.sql")).await?;
+			tx.commit().await?;
+		}
 		Ok(())
 	}
 
@@ -176,6 +224,7 @@ impl Db {
 		pg_config.host(&config.host);
 		pg_config.port(config.port);
 		pg_config.dbname(database);
+		pg_config.options("-c search_path=public,scuttle");
 		if let Some(user) = &config.user {
 			pg_config.user(user);
 		}

@@ -44,7 +44,7 @@ fn main() {
 		println!("cargo:rustc-env=SERVER_VERSION={}", version);
 	}
 
-	generate_migrations();
+	generate_migrations("migrations");
 }
 
 /// Generates the embedded database migrations module.
@@ -54,10 +54,11 @@ fn main() {
 /// unreproducible. Generate the equivalent module from a sorted file list.
 ///
 /// This is fixed in refinery v0.10.0, but it requires Rust v1.92.
-fn generate_migrations() {
-	println!("cargo:rerun-if-changed=src/database/migrations");
+fn generate_migrations(directory: &str) {
+	let directory = PathBuf::from("src/database").join(directory);
+	println!("cargo:rerun-if-changed={}", directory.display());
 
-	let mut files = fs::read_dir("src/database/migrations")
+	let mut files = fs::read_dir(&directory)
 		.expect("failed to read migrations directory")
 		.map(|entry| entry.expect("failed to read migrations directory").path())
 		.filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
@@ -77,6 +78,6 @@ fn generate_migrations() {
 	}
 	code.push_str("\t];\n\t::refinery::Runner::new(&migrations)\n}\n");
 
-	let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("migrations.rs");
+	let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join(directory.file_name().unwrap()).with_extension("rs");
 	fs::write(out, code).expect("failed to write migrations.rs");
 }
