@@ -1,0 +1,3 @@
+- Show the registered fallback destination and pending settlement
+  Inspect the registration with `bark dev fallback-record` and distinguish unpaid principal.
+  [#32](https://github.com/BullishNode/abandon-ship-bark/pull/32)

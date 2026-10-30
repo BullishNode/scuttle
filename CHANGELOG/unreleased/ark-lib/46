@@ -1,0 +1,4 @@
+- Add signed fallback destination links to Ark addresses
+  Deterministic coin-key signatures bind each customer output to its mailbox.
+  [#46](https://github.com/BullishNode/abandon-ship-bark/pull/46)
+  - **BREAKING:** Require signed `0x02` recipient addresses.

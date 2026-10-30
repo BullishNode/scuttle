@@ -1,0 +1,5 @@
+- Preserve joint recipient authorization and paid-mailbox return behavior.
+  A full sync reconciles receipts imported after the first payout scan.
+  [#2](https://github.com/BullishNode/scuttle/pull/2)
+  - **BREAKING:** New issuance requires matching coin and mailbox authorization.
+    Existing issued rights retain their original proof version.

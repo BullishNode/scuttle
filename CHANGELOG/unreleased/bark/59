@@ -1,0 +1,4 @@
+- Use the configured SOCKS proxy to create a wallet
+  New wallets can connect to Esplora onion services. Local chain sources
+  retain direct connections.
+  [#59](https://github.com/BullishNode/abandon-ship-bark/pull/59)
