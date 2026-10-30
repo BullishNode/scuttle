@@ -1,0 +1,5 @@
+- Rebase Scuttle on Bark c5f03f0b and retain registered fallback obligations.
+  Use upstream payment-attempt isolation, token filters, board-exit binding and
+  offboard capacity checks. Preserve existing migration bytes; add board-exit
+  binding as V79. Release qualification remains incomplete.
+  [#2](https://github.com/BullishNode/scuttle/pull/2)
