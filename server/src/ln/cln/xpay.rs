@@ -4,10 +4,10 @@
 //! ## Payment lifecycle
 //!
 //! [`ClnXpay::pay`] is fire-and-forget: it spawns a task that calls `xpay` over gRPC.
-//! When CLN answers, success or error, the attempt is reconciled right away, and an
-//! error is trusted as a final failure. When the call breaks in transport, xpay may
-//! still be running, so the monitor reconciles the attempt once its retry time has
-//! passed.
+//! When CLN answers, success or error, the attempt is reconciled right away.
+//! Its own Pending record keeps the attempt open even if xpay reported an error.
+//! When the call breaks in transport, xpay may still be running, so the monitor
+//! reconciles the attempt once its retry time has passed.
 //!
 //! ## Sendpay stream
 //!
@@ -88,8 +88,8 @@ impl ClnXpayClient {
 	///
 	/// On RPC success the sendpay stream will pick up the result, but we still
 	/// reconcile afterwards to handle edge cases (e.g. the stream missing an event).
-	/// An error from CLN means xpay stopped trying, so the attempt is failed.
-	/// On a transport error it is left to the monitor.
+	/// A coded error is retained as context, not substituted for the native status.
+	/// On a transport error reconciliation is left to the monitor.
 	#[tracing::instrument(skip_all, fields(
 		payment_hash = %invoice.payment_hash(),
 		invoice = %invoice,
@@ -212,9 +212,8 @@ impl ClnXpayClient {
 	/// Sends on `payment_update_tx` when the status changes.
 	///
 	/// `pay_error` is the error CLN returned for the xpay call this follows.
-	/// xpay only returns once it has stopped trying, so the attempt is failed
-	/// even when `listpays` still reports it pending. The monitor loop passes
-	/// `None`; it is reconciling attempts it did not make.
+	/// It supplies failure context, but cannot override an own Pending record.
+	/// The monitor loop passes `None`; it is reconciling attempts it did not make.
 	pub async fn sync_payment_attempt_status(
 		&self,
 		attempt: LightningPaymentAttempt,
@@ -268,8 +267,6 @@ impl ClnXpayClient {
 			}).expect("we have at least one");
 
 			let updated_status = match latest.status() {
-				// xpay told us it failed, trust that over the listpays record.
-				ListpaysPaysStatus::Pending if pay_error.is_some() => LightningPaymentStatus::Failed,
 				ListpaysPaysStatus::Pending => LightningPaymentStatus::Submitted,
 				ListpaysPaysStatus::Complete => {
 					if latest.preimage.is_none() {
@@ -545,9 +542,9 @@ impl ClnXpayProcess {
 	}
 }
 
-/// Whether lightningd itself answered with an error, meaning xpay has stopped
-/// trying. cln-grpc words every failed call as `Error calling method ...`, but
-/// only an answer from lightningd carries `RpcError { code: Some(..) }`.
+/// Whether lightningd itself answered with a coded RPC error. This is not a
+/// terminal payment record. cln-grpc words every failed call as `Error calling
+/// method ...`, but only lightningd carries `RpcError { code: Some(..) }`.
 fn is_cln_error(err: &anyhow::Error) -> bool {
 	err.downcast_ref::<tonic::Status>()
 		.is_some_and(|s| s.message().contains("RpcError { code: Some("))

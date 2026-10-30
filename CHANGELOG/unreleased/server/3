@@ -1,0 +1,3 @@
+- Keep an outgoing Lightning attempt pending while its own native payment is pending.
+  An xpay error no longer marks that unresolved payment failed.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
