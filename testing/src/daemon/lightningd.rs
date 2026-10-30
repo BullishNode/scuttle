@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use anyhow::Context;
+
 use bitcoin::consensus::Decodable;
 use bitcoin::hex::DisplayHex;
 use bitcoin::{Amount, Network, Transaction};
@@ -143,6 +145,7 @@ impl Lightningd {
 
 #[derive(Default)]
 struct LightningDHelperState{
+	preserve_ports: bool,
 	grpc_port: Option<u16>,
 	hold_port: Option<u16>,
 	port: Option<u16>,
@@ -390,6 +393,13 @@ impl DaemonHelper for LightningDHelper {
 	}
 
 	async fn make_reservations(&self) -> anyhow::Result<()> {
+		let state = self.state.lock().await;
+		if state.preserve_ports {
+			ensure!(state.grpc_port.is_some() && state.hold_port.is_some() && state.port.is_some(),
+				"same-port restart requires the original reservations");
+			return Ok(());
+		}
+		drop(state);
 		let grpc_port = pick_port();
 		let hold_port = pick_port();
 		let port = pick_port();
@@ -452,6 +462,45 @@ impl Lightningd {
 	/// Kill and reap this node without letting it persist a graceful shutdown.
 	pub async fn crash_stop(&self) -> anyhow::Result<()> {
 		self.stop_with_signal(nix::sys::signal::Signal::SIGKILL).await
+	}
+
+	/// Kill only the unique installed xpay child of this owned native node.
+	#[cfg(target_os = "linux")]
+	pub async fn kill_owned_xpay(&self) -> anyhow::Result<crate::daemon::NativeProcessIdentity> {
+		ensure!(!Self::should_use_docker(), "xpay fault requires native owned processes");
+		let provider = self.native_child().await?;
+		let installed = Self::exec().context("native lightningd executable missing")?;
+		let expected = installed.parent().and_then(|p| p.parent()).context("invalid installed CLN path")?
+			.join("libexec/c-lightning/plugins/cln-xpay").canonicalize()?;
+		let children = std::fs::read_to_string(format!("/proc/{}/task/{}/children", provider.pid, provider.pid))?;
+		let mut selected = Vec::new();
+		for pid in children.split_whitespace() {
+			if let Ok((identity, _, parent)) = crate::daemon::native_process(pid.parse()?) {
+				if parent == provider.pid && identity.exe == expected { selected.push(identity); }
+			}
+		}
+		ensure!(selected.len() == 1, "expected exactly one owned installed xpay child");
+		let child = selected.pop().unwrap();
+		ensure!(self.native_child().await? == provider, "provider identity changed before xpay KILL");
+		let (actual, _, parent) = crate::daemon::native_process(child.pid)?;
+		ensure!(actual == child && parent == provider.pid, "xpay identity changed before KILL");
+		log::info!("Killing owned xpay {:?} under provider {:?}", child, provider);
+		nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.pid.try_into()?), nix::sys::signal::Signal::SIGKILL)?;
+		Ok(child)
+	}
+
+	/// After a genuine plugin-induced exit, preserve the same node's endpoints.
+	/// This neither retries a payment nor changes the store or certificates.
+	#[cfg(target_os = "linux")]
+	pub async fn restart_same_ports_after_exit(&self) -> anyhow::Result<std::process::ExitStatus> {
+		ensure!(!Self::should_use_docker(), "same-port restart requires a native node");
+		let exited = self.wait_native_exit().await?;
+		ensure!(exited.code() == Some(1), "important plugin did not produce the expected native exit1");
+		self.inner.state.lock().await.preserve_ports = true;
+		let result = self.start().await;
+		self.inner.state.lock().await.preserve_ports = false;
+		result?;
+		Ok(exited)
 	}
 
 	pub async fn try_grpc_client(&self) -> anyhow::Result<NodeClient<Channel>> {
