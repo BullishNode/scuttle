@@ -540,6 +540,7 @@ pub struct BarkSdkBuilder<'a> {
 	mod_cfg: Option<Box<dyn FnOnce(&mut bark::Config)>>,
 	mnemonic: Option<bip39::Mnemonic>,
 	app_bip84: bool,
+	external_mailbox: Option<bitcoin::secp256k1::Keypair>,
 }
 
 impl<'a> BarkSdkBuilder<'a> {
@@ -557,6 +558,7 @@ impl<'a> BarkSdkBuilder<'a> {
 			mod_cfg: None,
 			mnemonic: None,
 			app_bip84: false,
+			external_mailbox: None,
 		}
 	}
 
@@ -564,6 +566,12 @@ impl<'a> BarkSdkBuilder<'a> {
 	/// Lets a test recover into a new wallet from another wallet's seed.
 	pub fn mnemonic(mut self, mnemonic: bip39::Mnemonic) -> Self {
 		self.mnemonic = Some(mnemonic);
+		self
+	}
+
+	/// Keep an application-owned mailbox key in memory, separate from the Ark seed.
+	pub fn external_mailbox_keypair(mut self, keypair: bitcoin::secp256k1::Keypair) -> Self {
+		self.external_mailbox = Some(keypair);
 		self
 	}
 
@@ -649,6 +657,7 @@ impl<'a> BarkSdkBuilder<'a> {
 		};
 
 		let seed = WalletSeed::new_from_mnemonic(network, &mnemonic);
+		let seed = if let Some(key) = self.external_mailbox { seed.with_external_mailbox_keypair(key) } else { seed };
 		let wallet = bark::Wallet::open(network, seed, cfg, OpenWalletArgs {
 			persister: Some(db),
 			create_if_not_exists: true,

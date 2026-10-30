@@ -16,7 +16,7 @@ use ark::{ProtocolEncoding, Vtxo};
 use ark::lightning::{PaymentHash, Preimage};
 use ark::vtxo::Full;
 
-use crate::{VtxoId, WalletProperties};
+use crate::{ExternalMailboxIdentity, VtxoId, WalletProperties};
 use crate::actions::{WalletActionCheckpoint, WalletActionId};
 use crate::exit::{ExitState, ExitStateKind, ExitTxOrigin};
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
@@ -46,6 +46,9 @@ pub (crate) fn set_properties(
 		":server_pubkey": properties.server_pubkey.map(|pk| pk.to_string()),
 		":server_mailbox_pubkey": properties.server_mailbox_pubkey.map(|pk| pk.to_string()),
 	})?;
+	conn.execute("INSERT INTO bark_mailbox_identity (id, public_key, network) VALUES (1, ?1, ?2)",
+		params![properties.external_mailbox.as_ref().map(|id| id.public_key.to_string()),
+			properties.external_mailbox.as_ref().map(|id| id.network.to_string())])?;
 
 	Ok(())
 }
@@ -89,7 +92,8 @@ pub (crate) fn set_server_mailbox_pubkey(
 }
 
 pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<WalletProperties>> {
-	let query = "SELECT * FROM bark_properties";
+	let query = "SELECT p.*, m.public_key AS external_mailbox_pubkey, m.network AS external_mailbox_network
+		FROM bark_properties p LEFT JOIN bark_mailbox_identity m ON m.id = p.id";
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query([])?;
 
@@ -98,6 +102,16 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 		let fingerprint: String = row.get("fingerprint")?;
 		let server_pubkey: Option<String> = row.get("server_pubkey")?;
 		let server_mailbox_pubkey: Option<String> = row.get("server_mailbox_pubkey")?;
+		let external_pubkey: Option<String> = row.get("external_mailbox_pubkey")?;
+		let external_network: Option<String> = row.get("external_mailbox_network")?;
+		let external_mailbox = match (external_pubkey, external_network) {
+			(None, None) => None,
+			(Some(public_key), Some(network)) => Some(ExternalMailboxIdentity {
+				network: Network::from_str(&network).context("invalid external mailbox network")?,
+				public_key: PublicKey::from_str(&public_key).context("invalid external mailbox public key")?,
+			}),
+			_ => bail!("incomplete external mailbox identity"),
+		};
 
 		let server_pubkey = server_pubkey
 			.map(|s| PublicKey::from_str(&s))
@@ -115,6 +129,7 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 				fingerprint: Fingerprint::from_str(&fingerprint).context("invalid fingerprint")?,
 				server_pubkey,
 				server_mailbox_pubkey,
+				external_mailbox,
 			}
 		))
 	} else {

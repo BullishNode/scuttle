@@ -346,3 +346,56 @@ async fn fallback_reconciles_once_per_connection_and_explicit_sync() {
 	operation.await.unwrap();
 	assert_eq!(gate.seen.load(Ordering::SeqCst), 2, "cold waiters share the authenticated connection");
 }
+
+/// An application mailbox changes routing, while the registered payout remains authoritative in shadow mode.
+#[tokio::test]
+async fn external_mailbox_identity_routes_delivery_and_refuses_wrong_reopen() {
+	let ctx = TestContext::new("bark_sdk/external_mailbox_identity_routes_delivery").await;
+	let srv = ctx.captaind("server").create().await;
+	let mnemonic = bip39::Mnemonic::generate(12).unwrap();
+	let key = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[41; 32]).unwrap();
+	let first = ctx.bark_sdk("external", &srv).mnemonic(mnemonic.clone())
+		.external_mailbox_keypair(key).cfg(|c| c.daemon_manual_sync = true).create().await;
+	first.stop_daemon_wait().await.unwrap();
+	assert_eq!(first.mailbox_identifier().as_pubkey(), key.public_key());
+	let original = first.fallback_destination().await.unwrap();
+	original.verify(Network::Regtest, key.public_key()).unwrap();
+	let expected = {
+		let onchain = first.onchain().unwrap();
+		let guard = onchain.read().await;
+		(&*guard as &dyn std::any::Any).downcast_ref::<bark::onchain::OnchainWallet>().unwrap().fallback_script()
+	};
+	assert_eq!(original.spk, expected, "external mailbox must not change the registered Bitcoin target");
+	let (address, index) = first.new_address_with_index().await.unwrap();
+	assert_eq!(index, 0);
+	let link = first.owner_link(address.policy().user_pubkey()).await.unwrap();
+	assert_eq!(link.verify_joint(Network::Regtest, &srv.mailbox_keypair(), address.policy().user_pubkey()).unwrap(),
+		first.mailbox_identifier());
+	let properties = SqliteClient::open(ctx.datadir.join("external/db.sqlite")).unwrap()
+		.read_properties().await.unwrap().unwrap();
+	assert_eq!(properties.external_mailbox, Some(bark::ExternalMailboxIdentity {
+		network: Network::Regtest, public_key: key.public_key(),
+	}));
+	let config = first.config().clone();
+	let sender = ctx.bark_sdk("sender", &srv).boarded(ark_testing::sat(100_000)).create().await;
+	sender.send_arkoor_payment(&address, ark_testing::sat(10_000)).await.unwrap();
+	first.sync().await;
+	assert_eq!(first.balance().await.unwrap().spendable, ark_testing::sat(10_000));
+	drop(first);
+	let seed = || bark::WalletSeed::new_from_mnemonic(Network::Regtest, &mnemonic);
+	let directory = ctx.datadir.join("external");
+	let wrong = bitcoin::secp256k1::Keypair::from_secret_key(&ark::SECP, &key.secret_key().negate());
+	for supplied in [seed(), seed().with_external_mailbox_keypair(wrong)] {
+		let result = bark::Wallet::open(Network::Regtest, supplied, config.clone(), bark::OpenWalletArgs {
+			datadir: Some(directory.clone()), run_daemon: false, ..Default::default()
+		}).await;
+		let error = match result { Ok(_) => panic!("wrong or missing mailbox key must refuse reopen"), Err(error) => error };
+		assert!(error.to_string().contains("external mailbox key"));
+	}
+	let reopened = bark::Wallet::open(Network::Regtest, seed().with_external_mailbox_keypair(key), config,
+		bark::OpenWalletArgs { datadir: Some(directory), run_daemon: false, ..Default::default() },
+	).await.unwrap();
+	assert_eq!(reopened.mailbox_identifier().as_pubkey(), key.public_key());
+	assert_eq!(reopened.fallback_destination().await.unwrap(), original);
+	assert_eq!(reopened.balance().await.unwrap().spendable, ark_testing::sat(10_000));
+}
