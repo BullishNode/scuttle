@@ -589,22 +589,30 @@ mod tests {
 	use crate::{protos, pver};
 
 	#[test]
-	fn joint_authorization_client_requires_a_capable_server() {
-		let old_server = protos::HandshakeResponse {
-			min_protocol_version: pver::PROTOCOL_VERSION_PPM_FEE_TOTAL,
-			max_protocol_version: pver::PROTOCOL_VERSION_OWNER_PROOF,
+	fn scuttle_client_requires_exact_fork_protocol() {
+		for maximum in [pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES,
+			pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF, pver::PROTOCOL_VERSION_SCUTTLE - 1] {
+			let old = protos::HandshakeResponse {
+				min_protocol_version: pver::PROTOCOL_VERSION_PPM_FEE_TOTAL,
+				max_protocol_version: maximum,
+				..Default::default()
+			};
+			assert!(matches!(check_handshake(old), Err(ConnectError::ProtocolVersionMismatchServerTooOld {
+				client_min: pver::PROTOCOL_VERSION_SCUTTLE, server_max,
+			}) if server_max == maximum));
+		}
+		let capable = protos::HandshakeResponse {
+			min_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE,
+			max_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE,
 			..Default::default()
 		};
-		assert!(matches!(check_handshake(old_server), Err(ConnectError::ProtocolVersionMismatchServerTooOld {
-			client_min: pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF,
-			server_max: pver::PROTOCOL_VERSION_OWNER_PROOF,
-		})));
-		let capable_server = protos::HandshakeResponse {
-			min_protocol_version: pver::PROTOCOL_VERSION_PPM_FEE_TOTAL,
-			max_protocol_version: pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF,
+		assert_eq!(check_handshake(capable).unwrap(), pver::PROTOCOL_VERSION_SCUTTLE);
+		let future = protos::HandshakeResponse {
+			min_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE + 1,
+			max_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE + 1,
 			..Default::default()
 		};
-		assert_eq!(check_handshake(capable_server).unwrap(), pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF);
+		assert!(matches!(check_handshake(future), Err(ConnectError::ProtocolVersionMismatchClientTooOld { .. })));
 	}
 
 	#[test]

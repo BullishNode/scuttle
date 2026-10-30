@@ -101,6 +101,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::PostArkoorMessageRequest>,
 	) -> Result<tonic::Response<protos::core::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxos.len() > MAX_NB_MAILBOX_ARKOOR_VTXOS {
@@ -188,6 +189,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::MailboxRequest>,
 	) -> Result<tonic::Response<protos::mailbox_server::MailboxMessages>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
@@ -229,6 +231,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::MailboxRequest>,
 	) -> Result<tonic::Response<Self::SubscribeMailboxStream>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
@@ -309,6 +312,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::PostRecoveryVtxoIdsRequest>,
 	) -> Result<tonic::Response<protos::core::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxo_ids.len() > MAX_NB_MAILBOX_RECOVERY_IDS {

@@ -235,6 +235,30 @@ impl rpc::server::BanAdminService for Server {
 	}
 }
 
+#[async_trait]
+impl rpc::server::ScuttleService for Server {
+	async fn list_expiry_holds(
+		&self, req: tonic::Request<protos::Empty>,
+	) -> Result<tonic::Response<protos::scuttle::ListExpiryHoldsResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
+		Err(tonic::Status::unimplemented("expiry hold administration is not enabled"))
+	}
+
+	async fn fail_lightning_attempt(
+		&self, req: tonic::Request<protos::scuttle::FailLightningAttemptRequest>,
+	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
+		Err(tonic::Status::unimplemented("Lightning attempt administration is not enabled"))
+	}
+
+	async fn scoped_payment_status(
+		&self, req: tonic::Request<protos::CheckLightningPaymentRequest>,
+	) -> Result<tonic::Response<protos::LightningPaymentStatus>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
+		<Self as rpc::server::ArkService>::check_lightning_payment(self, req).await
+	}
+}
+
 /// Run the captaind admin gRPC endpoint.
 pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 	RPC_RICH_ERRORS.store(srv.config.rpc_rich_errors, atomic::Ordering::Relaxed);
@@ -245,6 +269,7 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 	info!("Starting admin gRPC service on address {}", addr);
 
 	let routes = tonic::service::Routes::default()
+		.add_service(rpc::server::ScuttleServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::WalletAdminServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::RoundAdminServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::LightningAdminServiceServer::from_arc(srv.clone()))
