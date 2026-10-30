@@ -64,9 +64,9 @@ async fn intra_ark_settlement_completes_after_crash_between_transactions() {
 	receiver.stop_daemon_wait().await.unwrap();
 	let invoice = receiver.bolt11_invoice(sat(10_000), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
-	payer.pay_lightning_invoice(invoice, None, false).await.unwrap();
+	Box::pin(payer.pay_lightning_invoice(invoice, None, false)).await.unwrap();
 	srv.wait_for_lightning_receive_accepted(hash).await;
-	assert!(matches!(receiver.try_claim_lightning_receive(hash, true).await.unwrap(), LightningReceiveState::Settled(_)));
+	assert!(matches!(Box::pin(receiver.try_claim_lightning_receive(hash, true)).await.unwrap(), LightningReceiveState::Settled(_)));
 	payer.check_lightning_payment(hash, true).await.unwrap();
 	let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
 	let (subscription, attempt, preimage) = tokio::time::timeout(Duration::from_secs(30), async {
