@@ -250,7 +250,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool) {
 		};
 		tokio::fs::write(ctx.datadir.join("own-pending-window.json"), serde_json::to_vec_pretty(&record).unwrap()).await.unwrap();
 		fault_target = Some(target);
-		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash).await;
+		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 0).await;
 		// The original same-store settlement/restart/fallback tail below is
 		// unchanged; neither a missed target nor a transport error is credit.
 		srv.config_mut().invoice_check_interval = Duration::from_secs(1);
@@ -790,7 +790,7 @@ async fn queued_send_does_not_inherit_completed_payment() {
 		while let Ok(event) = fee_logs.try_recv() {
 			assert_ne!(event.op_type, "lightning_send", "the absent own payment earns no send fee");
 		}
-		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash).await;
+		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 1).await;
 		assert_eq!(remote_pays(&lightning.internal, hash).await, native);
 	})).await.expect("queued payment source isolation exceeded 180 seconds");
 }
@@ -801,6 +801,7 @@ async fn queued_send_does_not_inherit_completed_payment() {
 /// Ark attempt, using different signed inputs, paid that hash.
 async fn assert_no_success_in_sender_mailbox(
 	srv: &Captaind, auth: &ark::mailbox::MailboxAuthorization, hash: PaymentHash,
+	expected_terminal_count: usize,
 ) {
 	let mut rpc = srv.get_mailbox_public_rpc().await;
 	let mut checkpoint = 0;
@@ -820,7 +821,7 @@ async fn assert_no_success_in_sender_mailbox(
 			}
 		}
 		if !page.have_more {
-			assert_eq!(finished, 1, "the native failure must have a real, unique authenticated mailbox payload");
+			assert_eq!(finished, expected_terminal_count, "authenticated terminal payload count differs from the native outcome");
 			return;
 		}
 	}
@@ -934,7 +935,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 				tokio::time::sleep(Duration::from_millis(50)).await;
 			}
 		}).await.expect("the normal monitor must close the previous failure before a later Ark attempt");
-		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash).await;
+		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 1).await;
 
 		let later = Box::pin(ctx.bark_sdk("later-sender", &srv).app_bip84()
 			.cfg(|config| { config.daemon_manual_sync = true; config.vtxo_refresh_expiry_threshold=BlockDelta::new(4); config.vtxo_exit_margin=BlockDelta::new(2); }).boarded(sat(50_000)).boarded(sat(50_000)).create()).await;
@@ -1009,7 +1010,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 			assert!(status.htlc_vtxo_ids.is_empty());
 			assert!(matches!(status.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Pending(_))));
 		}
-		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash).await;
+		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 1).await;
 		drop(later);
 
 		// The paid later sources and failed source form two expiry
@@ -1059,7 +1060,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		let utxo = core.get_tx_out(&payout.txid,payout.vout,Some(true)).unwrap().unwrap();
 		assert!(utxo.confirmations>=6); assert_eq!(utxo.value,sat(99_000));
 		assert_eq!(utxo.script_pub_key.script().unwrap(),destination.spk);
-		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash).await;
+		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 1).await;
 		tokio::time::timeout(Duration::from_secs(30),async {
 			loop {
 				let confirmed=db.read(async |tx| Ok(tx.query_opt("SELECT a.id FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND c.active AND c.disposition='customer' AND a.status='confirmed' AND a.sweep_txid=$2",&[&old_source.id().to_string(),&parent.compute_txid().to_string()]).await?.is_some())).await.unwrap();
