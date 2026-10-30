@@ -1,3 +1,6 @@
+-- Registration-era relations remain available until the ownership switch.
+SET LOCAL search_path TO scuttle, public;
+
 -- Initial signature-link schema for fresh fork stores.
 
 CREATE TABLE fallback_record (
@@ -29,7 +32,10 @@ CREATE TABLE expiry_owner_key (
 	user_pubkey TEXT PRIMARY KEY,
 	mailbox_pk TEXT NOT NULL REFERENCES fallback_record(mailbox_pk),
 	blinded_id TEXT NOT NULL CHECK (length(blinded_id) = 66),
-	signature TEXT NOT NULL CHECK (length(signature) = 128)
+	signature TEXT NOT NULL CHECK (length(signature) = 128),
+	proof_version SMALLINT NOT NULL DEFAULT 1 CHECK (proof_version IN (1, 2)),
+	joint_proof TEXT CHECK (joint_proof IS NULL OR length(joint_proof) = 326),
+	CHECK (proof_version = 1 OR joint_proof IS NOT NULL)
 );
 
 -- Chain-derived decisions are invalid until both processes acknowledge their
@@ -124,4 +130,34 @@ CREATE TABLE expiry_lightning_receive_claim (
 	payment_hash TEXT NOT NULL,
 	output_vtxo_id TEXT NOT NULL UNIQUE,
 	output_vtxo BYTEA NOT NULL
+);
+
+-- Shadow ownership state. Admission and payout switch in a later source step.
+CREATE TABLE owner_key (
+	user_pubkey TEXT PRIMARY KEY CHECK (length(user_pubkey) = 66),
+	mailbox_pk TEXT NOT NULL CHECK (length(mailbox_pk) = 66),
+	blinded_id TEXT NOT NULL CHECK (length(blinded_id) = 66),
+	joint_proof TEXT NOT NULL CHECK (length(joint_proof) = 326)
+);
+
+CREATE TABLE coin_owner (
+	vtxo_id TEXT PRIMARY KEY REFERENCES public.vtxo(vtxo_id),
+	mailbox_pk TEXT NOT NULL CHECK (length(mailbox_pk) = 66)
+);
+
+CREATE TABLE expiry_hold (
+	vtxo_id TEXT PRIMARY KEY REFERENCES public.vtxo(vtxo_id),
+	reason TEXT NOT NULL,
+	first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE htlc_settlement_source (
+	settlement_id BIGINT NOT NULL REFERENCES public.htlc_settlement(id),
+	kind TEXT NOT NULL CHECK (kind IN ('attempt', 'receive', 'onchain', 'unknown')),
+	attempt_id BIGINT REFERENCES public.lightning_payment_attempt(id),
+	subscription_id BIGINT REFERENCES public.lightning_htlc_subscription(id),
+	vtxo_id TEXT REFERENCES public.vtxo(vtxo_id),
+	recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	UNIQUE NULLS NOT DISTINCT (settlement_id, kind, attempt_id, subscription_id, vtxo_id)
 );

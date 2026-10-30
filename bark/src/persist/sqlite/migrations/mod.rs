@@ -40,7 +40,6 @@ mod m0039_movement_action_id;
 mod m0040_unlock_failed_movement_vtxos_again;
 mod m0041_offboard_action_checkpoint;
 mod m0042_vtxo_registered;
-mod m0043_fallback;
 
 use anyhow::Context;
 use log::debug;
@@ -88,7 +87,6 @@ use m0039_movement_action_id::Migration0039;
 use m0040_unlock_failed_movement_vtxos_again::Migration0040;
 use m0041_offboard_action_checkpoint::Migration0041;
 use m0042_vtxo_registered::Migration0042;
-use m0043_fallback::Migration0043;
 
 pub struct MigrationContext {}
 
@@ -101,6 +99,7 @@ impl MigrationContext {
 
 	/// Perform all initliazation scripts
 	pub fn do_all_migrations(&self, conn: &mut Connection) -> anyhow::Result<()> {
+		let fresh = super::scuttle::is_fresh(conn)?;
 		let tx = conn.transaction().context("Failed to start transcation")?;
 		self.init_migrations(&tx)?;
 		tx.commit().context("Failed to commit transaction")?;
@@ -148,7 +147,9 @@ impl MigrationContext {
 		self.try_migration(conn, &Migration0040{})?;
 		self.try_migration(conn, &Migration0041{})?;
 		self.try_migration(conn, &Migration0042{})?;
-		self.try_migration(conn, &Migration0043{})?;
+		if fresh {
+			super::scuttle::initialize(conn)?;
+		}
 
 		Ok(())
 	}
@@ -298,12 +299,11 @@ mod test {
 		let mut conn = rusqlite::Connection::open(":memory:").unwrap();
 		let migs = MigrationContext::new();
 
-		migs.init_migrations(&conn).unwrap();
-		assert_current_version(&conn, 0).unwrap();
-
-		// Perform the migrations and confirm it took effect
+		// Run upstream migrations and initialize Scuttle from an empty store.
 		migs.do_all_migrations(&mut conn).unwrap();
-		assert_current_version(&conn, 43).unwrap();
+		assert_current_version(&conn, 42).unwrap();
+		assert!(table_exists(&conn, "bark_mailbox_identity").unwrap());
+		assert!(!table_exists(&conn, "scuttle_schema_history").unwrap());
 
 		assert!(table_exists(&conn, "bark_vtxo").unwrap());
 		assert!(table_exists(&conn, "bark_vtxo_state").unwrap());
@@ -327,6 +327,39 @@ mod test {
 
 		// The migration can be run multiple times
 		migs.do_all_migrations(&mut conn).unwrap();
+	}
+
+	#[test]
+	fn old_fork_wallet_is_refused_before_migration_writes() {
+		let mut conn = Connection::open_in_memory().unwrap();
+		conn.execute_batch("CREATE TABLE migrations (value INTEGER NOT NULL);
+			INSERT INTO migrations (value) VALUES (43);
+			CREATE TABLE bark_fallback_record (id INTEGER PRIMARY KEY, record BLOB NOT NULL);
+			INSERT INTO bark_fallback_record (id, record) VALUES (1, x'010203');").unwrap();
+		let changes = conn.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0)).unwrap();
+		let schema: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0)).unwrap();
+		let error = MigrationContext::new().do_all_migrations(&mut conn).unwrap_err();
+		assert!(error.to_string().contains("not a fresh Scuttle store"));
+		assert_eq!(conn.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0)).unwrap(), changes);
+		assert_eq!(conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0)).unwrap(), schema);
+		assert_eq!(conn.query_row("SELECT value FROM migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 43);
+		assert_eq!(conn.query_row("SELECT record FROM bark_fallback_record", [],
+			|row| row.get::<_, Vec<u8>>(0)).unwrap(), [1, 2, 3]);
+		assert!(!table_exists(&conn, "scuttle_schema_history").unwrap());
+	}
+
+	#[test]
+	fn superseded_fork_history_is_refused_before_writes() {
+		let mut conn = Connection::open_in_memory().unwrap();
+		let ctx = MigrationContext::new();
+		ctx.do_all_migrations(&mut conn).unwrap();
+		conn.execute_batch("CREATE TABLE scuttle_schema_history (version INTEGER PRIMARY KEY, name TEXT);
+			INSERT INTO scuttle_schema_history VALUES (0, 'fresh_store');").unwrap();
+		let changes = conn.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0)).unwrap();
+		let error = ctx.do_all_migrations(&mut conn).unwrap_err();
+		assert!(error.to_string().contains("not a fresh Scuttle store"));
+		assert_eq!(conn.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0)).unwrap(), changes);
+		assert_current_version(&conn, 42).unwrap();
 	}
 
 	struct BadMigration {}

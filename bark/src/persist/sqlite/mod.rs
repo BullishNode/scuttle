@@ -11,6 +11,7 @@
 mod convert;
 mod migrations;
 mod query;
+mod scuttle;
 
 
 use std::path::{Path, PathBuf};
