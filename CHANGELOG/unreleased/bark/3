@@ -1,0 +1,5 @@
+- Accept an application-supplied mailbox key through `WalletSeed`.
+  Persist its full public identity and network, and refuse reopening with a
+  missing or different key. The application retains responsibility for backup.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+  - **BREAKING:** `WalletProperties` includes `external_mailbox`.

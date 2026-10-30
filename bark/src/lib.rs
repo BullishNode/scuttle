@@ -649,6 +649,16 @@ pub struct OffchainBalance {
 	pub pending_exit: Amount,
 }
 
+/// Public identity of an application-supplied mailbox signing key.
+///
+/// The compressed point includes its parity. This identity does not describe
+/// the application's Bitcoin descriptor or promise that its backup can recover it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalMailboxIdentity {
+	pub network: Network,
+	pub public_key: PublicKey,
+}
+
 /// Read-only properties of the Bark wallet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletProperties {
@@ -678,6 +688,23 @@ pub struct WalletProperties {
 	/// successful handshake. If the key changes, the wallet refuses to
 	/// connect until the user resolves the rotation.
 	pub server_mailbox_pubkey: Option<PublicKey>,
+
+	/// An external mailbox key must be supplied again on every open.
+	/// `None` retains the seed-derived mailbox identity.
+	#[serde(default)]
+	pub external_mailbox: Option<ExternalMailboxIdentity>,
+}
+
+impl WalletProperties {
+	fn check_mailbox_identity(&self, network: Network, seed: &WalletSeed) -> anyhow::Result<()> {
+		let supplied = seed.external_mailbox_identity(network);
+		ensure!(self.external_mailbox == supplied,
+			"external mailbox key is missing or differs from the wallet identity");
+		if self.external_mailbox.is_some() {
+			ensure!(self.network == network, "external mailbox wallet is for a different network");
+		}
+		Ok(())
+	}
 }
 
 /// Struct representing an extended private key derived from a
@@ -688,6 +715,7 @@ pub struct WalletProperties {
 pub struct WalletSeed {
 	master: bip32::Xpriv,
 	vtxo: bip32::Xpriv,
+	external_mailbox: Option<Keypair>,
 }
 
 impl WalletSeed {
@@ -703,12 +731,27 @@ impl WalletSeed {
 		let vtxo = master.derive_priv(&SECP, &vtxo_path)
 			.expect("vtxo path is valid");
 
-		Self { master, vtxo }
+		Self { master, vtxo, external_mailbox: None }
 	}
 
 	/// Create a new [WalletSeed] from a given BIP-39 [Mnemonic]
 	pub fn new_from_mnemonic(network: Network, mnemonic: &Mnemonic) -> Self {
 		Self::new_from_seed(network, &mnemonic.to_seed(""))
+	}
+
+	/// Use the application's mailbox key without changing any Ark child keys or
+	/// bitcoin wallet descriptors. Supply the same key on each subsequent open.
+	///
+	/// The key stays in memory; only its full public identity is persisted. The
+	/// application is responsible for its backup and discovery policy. This does
+	/// not derive a BIP86 key or change the registered payout during shadow mode.
+	pub fn with_external_mailbox_keypair(mut self, keypair: Keypair) -> Self {
+		self.external_mailbox = Some(keypair);
+		self
+	}
+
+	fn external_mailbox_identity(&self, network: Network) -> Option<ExternalMailboxIdentity> {
+		self.external_mailbox.map(|key| ExternalMailboxIdentity { network, public_key: key.public_key() })
 	}
 
 	pub fn fingerprint(&self) -> Fingerprint {
@@ -720,6 +763,7 @@ impl WalletSeed {
 	}
 
 	fn to_mailbox_keypair(&self) -> Keypair {
+		if let Some(keypair) = self.external_mailbox { return keypair; }
 		let mailbox_path = [ChildNumber::from_hardened_idx(MAILBOX_KEY_INDEX).unwrap()];
 		self.master.derive_priv(&SECP, &mailbox_path).unwrap().to_keypair(&SECP)
 	}
@@ -1276,6 +1320,7 @@ impl Wallet {
 			fingerprint: wallet_fingerprint,
 			server_pubkey,
 			server_mailbox_pubkey: mailbox_pubkey,
+			external_mailbox: seed.external_mailbox_identity(network),
 		};
 
 		// write the config to db
@@ -1346,6 +1391,7 @@ impl Wallet {
 		if properties.fingerprint != fingerprint {
 			bail!("incorrect mnemonic")
 		}
+		properties.check_mailbox_identity(network, &seed)?;
 
 		let chain_source = if let Some(ref url) = config.esplora_address {
 			ChainSourceSpec::Esplora {
@@ -2692,6 +2738,35 @@ mod tests {
 		check_ark_info_safe, wrap_server_connect_error,
 		MAX_NB_ROUND_NONCES, MIN_MAINNET_VTXO_EXIT_DELTA, MISSING_SERVER_TRANSPORT_HELP,
 	};
+
+	#[test]
+	fn external_mailbox_identity_requires_same_full_key_and_network() {
+		let key = bitcoin::secp256k1::Keypair::from_seckey_slice(&super::SECP, &[1; 32]).unwrap();
+		let opposite = bitcoin::secp256k1::Keypair::from_secret_key(&super::SECP, &key.secret_key().negate());
+		assert_eq!(key.x_only_public_key().0, opposite.x_only_public_key().0);
+		assert_ne!(key.public_key(), opposite.public_key());
+		let seed = || super::WalletSeed::new_from_seed(Network::Regtest, &[17; 64]);
+		let external = || seed().with_external_mailbox_keypair(key);
+		let props = super::WalletProperties {
+			network: Network::Regtest, fingerprint: seed().fingerprint(),
+			server_pubkey: None, server_mailbox_pubkey: None,
+			external_mailbox: external().external_mailbox_identity(Network::Regtest),
+		};
+		props.check_mailbox_identity(Network::Regtest, &external()).unwrap();
+		assert!(props.check_mailbox_identity(Network::Regtest, &seed()).is_err());
+		assert!(props.check_mailbox_identity(Network::Regtest,
+			&seed().with_external_mailbox_keypair(opposite)).is_err());
+		assert!(props.check_mailbox_identity(Network::Signet, &external()).is_err());
+		assert_eq!(seed().fingerprint(), external().fingerprint());
+		assert_eq!(seed().derive_vtxo_keypair(0).public_key(), external().derive_vtxo_keypair(0).public_key());
+		assert_eq!(seed().to_recovery_mailbox_keypair().public_key(), external().to_recovery_mailbox_keypair().public_key());
+		assert_eq!(external().to_mailbox_keypair().public_key(), key.public_key());
+		let derived = super::WalletProperties { external_mailbox: None, ..props.clone() };
+		derived.check_mailbox_identity(Network::Regtest, &seed()).unwrap();
+		assert!(derived.check_mailbox_identity(Network::Regtest, &external()).is_err());
+		let restored: super::WalletProperties = serde_json::from_slice(&serde_json::to_vec(&props).unwrap()).unwrap();
+		assert_eq!(restored, props);
+	}
 
 	#[test]
 	fn no_transport_connect_error_is_reworded_for_wallet_users() {

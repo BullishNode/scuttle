@@ -62,6 +62,7 @@ impl BarkPersister for Dummy {
 			fingerprint: Fingerprint::default(),
 			server_pubkey: None,
 			server_mailbox_pubkey: None,
+			external_mailbox: None,
 		}))
 	}
 

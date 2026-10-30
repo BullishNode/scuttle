@@ -29,6 +29,7 @@ use crate::persist::adaptor::{Query, QueryRange, Record, StorageAdaptor, Storage
 ///		fingerprint: Fingerprint::default(),
 ///		server_pubkey: None,
 ///		server_mailbox_pubkey: None,
+///		external_mailbox: None,
 ///	};
 ///
 /// storage.init_wallet(&properties).await?;

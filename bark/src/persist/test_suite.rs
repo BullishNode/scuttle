@@ -62,6 +62,7 @@ macro_rules! bark_persister_tests {
 	($setup:expr) => {
 		$crate::persist::test_suite::bark_persister_tests!(@tests $setup,
 			test_init_and_read_properties,
+			test_external_mailbox_public_identity_roundtrip,
 			test_fallback_record_is_immutable,
 			test_pending_fallback_record_never_authorizes_registration,
 			test_set_server_pubkey,
@@ -131,6 +132,7 @@ fn test_properties() -> WalletProperties {
 		fingerprint: Fingerprint::default(),
 		server_pubkey: None,
 		server_mailbox_pubkey: None,
+		external_mailbox: None,
 	}
 }
 
@@ -302,6 +304,19 @@ pub async fn test_init_and_read_properties(db: &impl BarkPersister) {
 
 	let read = db.read_properties().await.expect("read_properties");
 	assert_eq!(read, Some(props), "read_properties should return the stored properties");
+}
+
+pub async fn test_external_mailbox_public_identity_roundtrip(db: &impl BarkPersister) {
+	let secp = Secp256k1::new();
+	let key = test_pubkey();
+	let key = if key.serialize()[0] == 3 { key } else { key.negate(&secp) };
+	assert_eq!(key.serialize()[0], 3);
+	let mut props = test_properties();
+	props.external_mailbox = Some(crate::ExternalMailboxIdentity { network: props.network, public_key: key });
+	db.init_wallet(&props).await.expect("init external mailbox identity");
+	let read = db.read_properties().await.unwrap().unwrap();
+	assert_eq!(read, props);
+	assert_eq!(read.external_mailbox.unwrap().public_key.serialize(), key.serialize());
 }
 
 pub async fn test_set_server_pubkey(db: &impl BarkPersister) {
