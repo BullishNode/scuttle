@@ -8,7 +8,7 @@ use futures::future::join_all;
 
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoPolicy, SECP};
 use ark::lightning::PaymentHash;
-use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
+use ark::mailbox::{MailboxAuthorization, MailboxIdentifier, MailboxType};
 use ark::test_util::dummy::DummyTestVtxoSpec;
 use ark::vtxo::raw::RawVtxo;
 
