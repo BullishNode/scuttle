@@ -213,6 +213,22 @@ impl<'t> Tx<'t> {
 		}
 	}
 
+	/// Get the attempt that funded this receive, including a terminal attempt.
+	/// Its immutable subscription link, not a same-hash open attempt, identifies
+	/// an intra-Ark payment when settlement resumes after a process failure.
+	pub async fn get_lightning_payment_attempt_by_subscription_id(
+		&self,
+		lightning_htlc_subscription_id: i64,
+	) -> anyhow::Result<Option<LightningPaymentAttempt>> {
+		let stmt = self.prepare(&format!("
+			SELECT {LIGHTNING_PAYMENT_ATTEMPT_COLUMNS}
+			FROM lightning_payment_attempt lpa
+			WHERE lpa.lightning_htlc_subscription_id = $1;
+		")).await?;
+		let row = self.query_opt(&stmt, &[&lightning_htlc_subscription_id]).await?;
+		row.map(TryInto::try_into).transpose()
+	}
+
 	/// Stores data after lightning payment start.
 	///
 	/// Creates a new payment attempt for the given invoice and links the
