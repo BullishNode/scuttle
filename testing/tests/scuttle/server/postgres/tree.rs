@@ -13,6 +13,8 @@ use ark::test_util::VTXO_VECTORS;
 use server::OwnershipRefusal;
 use server::owner_proof::OwnerLinks;
 use server::database::{Db, SpendState};
+use server::database::expiry_attribution::Attribution;
+use server::database::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
 use server::database::tree::VtxoTreeUpdate;
 
 use ark_testing::TestContext;

@@ -11,6 +11,7 @@ use ark::mailbox::{BlindedMailboxIdentifier, MailboxIdentifier};
 use ark::ProtocolEncoding;
 
 use crate::error::OwnershipRefusal;
+use super::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
 use super::Tx;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,6 +21,28 @@ pub enum Attribution {
 }
 
 impl Tx<'_> {
+	/// Resolve the stage-selected key from admission's immutable shadow binding.
+	/// Birth metadata constrains an ordinary coin, not a different entitled key
+	/// selected by an input-owner, receive-claim or participation rule.
+	pub async fn derived_expiry_owner(&self, ownership: &OwnershipProposal) -> anyhow::Result<Attribution> {
+		let OwnershipDisposition::Customer { user_pubkey } = &ownership.disposition
+			else { return Ok(Attribution::Unresolved); };
+		let Some(evidence) = &ownership.evidence else { return Ok(Attribution::Unresolved); };
+		let Some(row) = self.query_opt("SELECT k.mailbox_pk,c.mailbox_pk AS birth_mailbox
+			FROM owner_key k LEFT JOIN coin_owner c ON c.vtxo_id=$2
+			WHERE k.user_pubkey=$1", &[&user_pubkey.to_string(), &ownership.id.to_string()]).await?
+			else { return Ok(Attribution::Unresolved); };
+		let Ok(mailbox) = PublicKey::from_str(row.get("mailbox_pk"))
+			else { return Ok(Attribution::Unresolved); };
+		if matches!(evidence, OwnershipEvidence::Pubkey)
+			&& row.get::<_, Option<&str>>("birth_mailbox") != Some(mailbox.to_string().as_str())
+		{
+			return Ok(Attribution::Unresolved);
+		}
+		Ok(Attribution::Owned { mailbox_pk: mailbox,
+			spk: ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None) })
+	}
+
 	/// Verify the actual output key's chosen mailbox and store the immutable
 	/// binding in the caller's admission transaction. Both key holders authorize it.
 	pub async fn verify_owner_link(
