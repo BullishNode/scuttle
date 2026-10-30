@@ -2,6 +2,8 @@ mod bip321;
 mod boards;
 mod core;
 mod exits;
+mod fallback;
+mod fallback_restore;
 mod helpers;
 mod history;
 mod lifecycle;
