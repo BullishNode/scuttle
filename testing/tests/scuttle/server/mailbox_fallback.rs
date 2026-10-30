@@ -24,8 +24,11 @@ async fn recovery_posts_do_not_create_or_change_coin_ownership() {
 			(SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY vtxo_id),'[]')::TEXT
 			 FROM coin_owner c WHERE vtxo_id=ANY($2)),
 			(SELECT COALESCE(jsonb_agg(to_jsonb(v) ORDER BY vtxo_id),'[]')::TEXT
-			 FROM vtxo v WHERE vtxo_id=ANY($2))", &[&keys.as_slice(), &ids.as_slice()]).await?;
-		Ok((row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)))
+			 FROM vtxo v WHERE vtxo_id=ANY($2)),
+			(SELECT COALESCE(jsonb_agg(to_jsonb(m) ORDER BY id),'[]')::TEXT FROM mailbox m),
+			(SELECT to_jsonb(c)::TEXT FROM checkpoint_state c WHERE type_id=1)", &[&keys.as_slice(), &ids.as_slice()]).await?;
+		Ok((row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2),
+			row.get::<_, String>(3), row.get::<_, String>(4)))
 	}).await.unwrap();
 	let before = snapshot().await;
 	assert!(before.0.contains(&owner.public_key().to_string()));
@@ -36,19 +39,26 @@ async fn recovery_posts_do_not_create_or_change_coin_ownership() {
 		chrono::Local::now() + Duration::from_secs(300)).serialize();
 	let request = || protos::mailbox_server::PostRecoveryVtxoIdsRequest {
 		mailbox_id: mailbox.serialize(), authorization: Some(authorization.clone()),
-		vtxo_ids: vec![coin.id().to_bytes().to_vec(), unknown.id().to_bytes().to_vec()],
+		vtxo_ids: vec![coin.id().to_bytes().to_vec()],
 	};
 	let mut rpc = srv.get_mailbox_public_rpc().await;
 	for _ in 0..2 {
 		rpc.post_recovery_vtxo_ids(request()).await.unwrap();
-		assert_eq!(snapshot().await, before);
+		let after = snapshot().await;
+		assert_eq!((&after.0, &after.1, &after.2), (&before.0, &before.1, &before.2));
 	}
+	let before_refusal = snapshot().await;
+	let mut mixed = request();
+	mixed.vtxo_ids.push(unknown.id().to_bytes().to_vec());
+	assert!(rpc.post_recovery_vtxo_ids(mixed).await.is_err());
+	assert_eq!(snapshot().await, before_refusal,
+		"an unknown recovery ID must not partially write hints or change ownership");
 	let messages = rpc.read_mailbox(protos::mailbox_server::MailboxRequest {
 		mailbox_id: mailbox.serialize(), authorization: Some(authorization.clone()), checkpoint: 0,
 	}).await.unwrap().into_inner().messages;
 	assert_eq!(messages.len(), 1);
 	let Some(Message::RecoveryVtxoIds(message)) = &messages[0].message else { panic!("expected recovery hints"); };
-	assert_eq!(message.owners.len(), 1, "unknown recovery hints have no invented owner");
+	assert_eq!(message.owners.len(), 1, "a foreign hint reports its actual owner");
 	assert_eq!(message.owners[0].vtxo_id, coin.id().to_bytes().to_vec());
 	assert_eq!(message.owners[0].owner_mailbox, owner.public_key().serialize().to_vec());
 	let mut actual = message.vtxo_ids.clone();
