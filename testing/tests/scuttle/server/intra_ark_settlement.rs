@@ -54,7 +54,7 @@ async fn sender_snapshot(db: &Db, hash: PaymentHash, attempt: i64) -> serde_json
 async fn intra_ark_settlement_completes_after_crash_between_transactions() {
 	let ctx = TestContext::new("scuttle/intra_ark_settlement_after_crash").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(1))
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
 		.cfg(|cfg| cfg.htlc_settlement_poll_interval = Duration::from_millis(50)).create().await;
 	srv.wait_for_vtxopool(&ctx).await;
 	let payer = ctx.bark_sdk("payer", &srv).boarded(sat(100_000))
