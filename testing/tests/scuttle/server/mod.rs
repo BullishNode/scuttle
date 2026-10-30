@@ -1,4 +1,5 @@
 mod owner_helpers;
+mod intra_ark_settlement;
 mod postgres;
 mod fresh_store;
 mod wire;

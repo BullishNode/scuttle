@@ -1,3 +1,7 @@
 - Keep an outgoing Lightning attempt pending while its own native payment is pending.
   An xpay error no longer marks that unresolved payment failed.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Resume an intra-Ark receive after its sender already settled.
+  A restart between the sender and receive commits no longer retries a cancelled
+  external hold or repeats the sender's success notification.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)

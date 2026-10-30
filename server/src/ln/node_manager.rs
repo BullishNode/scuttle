@@ -668,22 +668,26 @@ impl LightningManager {
 			.read(async |t| t.get_htlc_subscription_by_id(subscription_id).await).await?
 			.expect("can only settle known invoice");
 
-		// If an open self-payment attempt exists for the payment hash, it is an
-		// intra-Ark lightning payment so we can mark it as succeeded,
-		// then skip hold invoice settlement.
-		let attempt = self.db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await).await?
-			.filter(|attempt| attempt.is_self_payment());
+		// The funding link survives the first settlement transaction. An already
+		// Succeeded sender is still intra-Ark: its CLN hold was cancelled when
+		// accepted, so retrying that hold cannot finish the receive.
+		let attempt = self.db.read(async |t|
+			t.get_lightning_payment_attempt_by_subscription_id(subscription_id).await
+		).await?;
 		let is_self_payment = attempt.is_some();
 		if let Some(attempt) = attempt {
 			// NB: the xpay reconciliation loop may also post the mailbox notification
 			// for the same payment hash. The DB insert is idempotent (ON CONFLICT DO NOTHING).
-			self.payment_handler().process_payment_attempt(
-				&self.settler, &attempt,
-				LightningPaymentStatus::Succeeded,
-				None,
-				None,
-				Some(preimage),
-			).await?;
+			ensure!(attempt.payment_hash == payment_hash, "funding attempt does not match the receive");
+			if attempt.status != LightningPaymentStatus::Succeeded {
+				self.payment_handler().process_payment_attempt(
+					&self.settler, &attempt,
+					LightningPaymentStatus::Succeeded,
+					None,
+					None,
+					Some(preimage),
+				).await?;
+			}
 		} else {
 			// Settle the hold invoice on the node that created the
 			// subscription - that's where the HTLCs are locked. The user has
