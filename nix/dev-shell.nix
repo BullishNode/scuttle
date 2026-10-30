@@ -99,6 +99,7 @@ let
 			hash = "sha256-cZEfzDXkqyRuvH1FMcrPK8OBYGnZZ5jcj3pztAMgfO0=";
 		};
 		makeFlags = [ "VERSION=v${lightningVersion}" ];
+		patches = (old.patches or []) ++ [ ./patches/cln-xpay-completed-route-error.patch ];
 		postPatch = (old.postPatch or "") + ''
 			chmod +x devtools/blockreplace.py
 			patchShebangs devtools/blockreplace.py
