@@ -5,3 +5,6 @@
   A restart between the sender and receive commits no longer retries a cancelled
   external hold or repeats the sender's success notification.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Record verified coin-to-mailbox bindings and customer coin births alongside the
+  existing registration state, without changing payout destinations.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
