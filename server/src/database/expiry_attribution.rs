@@ -44,6 +44,19 @@ impl Tx<'_> {
 					WHERE user_pubkey=$1 AND joint_proof IS NULL AND mailbox_pk=$3 AND blinded_id=$4",
 					&[&user_pubkey.to_string(), &link.serialize_hex(), &mailbox.to_string(),
 						&link.blinded_id.to_string()]).await?;
+				// Shadow the verified intent, retaining the first proof even if
+				// a later valid signature over the same binding differs.
+				self.execute("INSERT INTO owner_key (user_pubkey, mailbox_pk, blinded_id, joint_proof)
+					VALUES ($1, $2, $3, $4) ON CONFLICT (user_pubkey) DO NOTHING",
+					&[&user_pubkey.to_string(), &mailbox.to_string(),
+						&link.blinded_id.to_string(), &link.serialize_hex()]).await?;
+				let canonical = self.query_one("SELECT mailbox_pk, blinded_id FROM owner_key WHERE user_pubkey=$1",
+					&[&user_pubkey.to_string()]).await?;
+				if canonical.get::<_, &str>("mailbox_pk") != mailbox.to_string()
+					|| canonical.get::<_, &str>("blinded_id") != link.blinded_id.to_string()
+				{
+					return Err(OwnershipRefusal::Conflicting(user_pubkey).into());
+				}
 				Ok(mailbox)
 			},
 			Attribution::Owned { .. } => Err(OwnershipRefusal::Conflicting(user_pubkey).into()),

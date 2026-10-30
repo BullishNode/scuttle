@@ -357,6 +357,11 @@ async fn ownership_board_refusals_preserve_funding_and_exact_replay() {
 	assert_eq!(signed.point().txid, exit_txid);
 	rpc.register_board_vtxo(protos::BoardVtxoRequest { board_vtxo: signed.serialize() }).await.unwrap();
 	let confirmed_rows = board_rows().await;
+	let birth_owner = db.read(async |tx| Ok(tx.query_one("SELECT c.mailbox_pk,o.joint_proof
+		FROM coin_owner c JOIN owner_key o ON o.user_pubkey=$2 WHERE c.vtxo_id=$1",
+		&[&signed.id().to_string(), &coin.public_key().to_string()]).await?)).await.unwrap();
+	assert_eq!(birth_owner.get::<_, &str>(0), coin.public_key().to_string());
+	assert_eq!(birth_owner.get::<_, &str>(1), link.serialize_hex());
 	let error = rpc.request_board_cosign(replay).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::InvalidArgument);
 	assert!(error.message().contains(&format!("known as virtual tx: {}", funding_id)), "{error}");

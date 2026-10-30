@@ -45,8 +45,70 @@ async fn customer_fence_covers_every_birth_state_but_allows_internal_roles() {
 	).await).await.unwrap_err().is::<OwnershipRefusal>());
 	// Actual pool construction needs no customer link or seed context.
 	db.write(async |tx| tx.execute_vtxo_tree_update(
-		VtxoTreeUpdate::new().insert_unspent_vtxos([coin], SpendState::Pool), None,
+		VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], SpendState::Pool), None,
 	).await).await.unwrap();
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
+		&[&coin.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn customer_births_shadow_their_owners_once() {
+	let (_ctx, db) = test_db("customer_birth_shadow_owners").await;
+	let server = super::super::test_server_mailbox_key();
+	// These are SQL role fixtures backed by the existing signed transaction
+	// vectors and their genuinely verified owner links, not native issuance.
+	let births = [
+		(&VTXO_VECTORS.board_vtxo, SpendState::Spendable),
+		(&VTXO_VECTORS.arkoor2_vtxo, SpendState::Unregistered),
+		(&VTXO_VECTORS.round1_vtxo, SpendState::Unclaimed),
+		(&VTXO_VECTORS.arkoor_htlc_out_vtxo, SpendState::HtlcRecvUnclaimed),
+	];
+	for (coin, state) in births {
+		let coin = ServerVtxo::from(coin.clone());
+		assert_eq!(db.write(async |tx| tx.execute_vtxo_tree_update(
+			VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state),
+			Some((Network::Regtest, server)),
+		).await).await.unwrap(), 1);
+		let owner = db.read(async |tx| Ok(tx.query_one("SELECT mailbox_pk,xmin::TEXT FROM coin_owner WHERE vtxo_id=$1",
+			&[&coin.id().to_string()]).await?)).await.unwrap();
+		assert_eq!(owner.get::<_, &str>(0), server.public_key().to_string());
+		let original_xmin = owner.get::<_, String>(1);
+		assert_eq!(db.write(async |tx| tx.execute_vtxo_tree_update(
+			VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state),
+			Some((Network::Regtest, server)),
+		).await).await.unwrap(), 0);
+		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT xmin::TEXT FROM coin_owner WHERE vtxo_id=$1",
+			&[&coin.id().to_string()]).await?.get::<_, String>(0))).await.unwrap(), original_xmin);
+	}
+	let rollback = ServerVtxo::from(VTXO_VECTORS.round2_vtxo.clone());
+	let failed: anyhow::Result<()> = db.write(async |tx| {
+		tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([rollback.clone()]),
+			Some((Network::Regtest, server))).await?;
+		assert_eq!(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
+			&[&rollback.id().to_string()]).await?.get::<_, i64>(0), 1);
+		anyhow::bail!("roll back the complete birth transaction")
+	}).await;
+	assert!(failed.is_err());
+	assert!(db.read(async |tx| tx.try_get_bare_vtxo_by_id(rollback.id()).await).await.unwrap().is_none());
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
+		&[&rollback.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+
+	// Model an accepted pre-shadow record by omitting only its shadow key.
+	// Later genuine authorization must not turn a replay into a new birth.
+	let prior = ServerVtxo::from(VTXO_VECTORS.arkoor3_vtxo.clone());
+	let key = VTXO_VECTORS.arkoor3_user_key;
+	db.write(async |tx| {
+		tx.execute("DELETE FROM owner_key WHERE user_pubkey=$1", &[&key.public_key().to_string()]).await?;
+		tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([prior.clone()]),
+			Some((Network::Regtest, server))).await?;
+		let link = OwnerLink::new_joint(Network::Regtest, server.public_key(), server, &key)?;
+		tx.verify_owner_link(server, key.public_key(), &link, Network::Regtest).await?;
+		assert_eq!(tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([prior.clone()]),
+			Some((Network::Regtest, server))).await?, 0);
+		assert_eq!(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
+			&[&prior.id().to_string()]).await?.get::<_, i64>(0), 0);
+		Ok(())
+	}).await.unwrap();
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@ use ark::fallback::FallbackRegistration;
 use ark::mailbox::MailboxIdentifier;
 use ark::{ProtocolEncoding, SECP};
 use ark_testing::TestContext;
-use bitcoin::secp256k1::Keypair;
+use bitcoin::secp256k1::{Keypair, PublicKey};
 use bitcoin::{Network, ScriptBuf};
 use server_rpc::protos;
 use std::time::Duration;
@@ -18,7 +18,7 @@ async fn fallback_fresh_schema_reopens_concurrently_without_resetting_state() {
 	let history = client.query("SELECT version, checksum FROM refinery_schema_history ORDER BY version", &[]).await.unwrap()
 		.into_iter().map(|r| (r.get::<_, i32>(0), r.get::<_, String>(1))).collect::<Vec<_>>();
 	assert_eq!(history.iter().filter(|(version, _)| *version == 73).count(), 1);
-	assert_eq!(history.last().unwrap().0, 73);
+	assert_eq!(history.last().unwrap().0, 77);
 	let generation = client.query_one("SELECT generation FROM expiry_chain_view WHERE id=1", &[]).await.unwrap().get::<_, i64>(0);
 	assert!(generation > 0);
 	let (first, second) = tokio::join!(server::database::Db::connect(&config, bitcoin::Network::Regtest), server::database::Db::connect(&config, bitcoin::Network::Regtest));
@@ -159,9 +159,22 @@ async fn fallback_links_are_authenticated_conflict_safe_and_transactional() {
 	}
 	let link = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap();
 	let resigned = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap();
+	let shadow_rows = async |key: PublicKey| db.read(async |tx| Ok(tx.query(
+		"SELECT user_pubkey,mailbox_pk,blinded_id,joint_proof,xmin::TEXT FROM owner_key WHERE user_pubkey=$1",
+		&[&key.to_string()],
+	).await?.into_iter().map(|row| (row.get::<_, String>(0), row.get::<_, String>(1),
+		row.get::<_, String>(2), row.get::<_, String>(3), row.get::<_, String>(4))).collect::<Vec<_>>())).await.unwrap();
+	let mut canonical_shadow = None;
 	for proof in [&link, &resigned] {
 		assert_eq!(db.write(async |tx| tx.verify_owner_link(&server, coin.public_key(), proof, Network::Regtest).await)
 			.await.unwrap(), mailbox.public_key());
+		let rows = shadow_rows(coin.public_key()).await;
+		assert_eq!(rows.len(), 1);
+		assert_eq!((&rows[0].0, &rows[0].1, &rows[0].2, &rows[0].3),
+			(&coin.public_key().to_string(), &mailbox.public_key().to_string(),
+				&link.blinded_id.to_string(), &link.serialize_hex()));
+		if let Some(canonical) = &canonical_shadow { assert_eq!(&rows, canonical); }
+		canonical_shadow = Some(rows);
 	}
 	let stored = db.read(async |tx| Ok(tx.query_one("SELECT blinded_id,signature FROM expiry_owner_key WHERE user_pubkey=$1",
 		&[&coin.public_key().to_string()]).await?)).await.unwrap();
@@ -173,6 +186,9 @@ async fn fallback_links_are_authenticated_conflict_safe_and_transactional() {
 	assert!(db.write(async |tx| tx.verify_owner_link(&server, key(5).public_key(), &link, Network::Regtest).await).await.is_err());
 	let unregistered = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &key(21), &key(7)).unwrap();
 	assert!(db.write(async |tx| tx.verify_owner_link(&server, key(7).public_key(), &unregistered, Network::Regtest).await).await.is_err());
+	assert_eq!(shadow_rows(coin.public_key()).await, canonical_shadow.unwrap());
+	assert!(shadow_rows(key(5).public_key()).await.is_empty());
+	assert!(shadow_rows(key(7).public_key()).await.is_empty());
 
 	// A genuine legacy mapping remains readable but is not permission for
 	// another admission, even under the same P and M.
@@ -191,8 +207,10 @@ async fn fallback_links_are_authenticated_conflict_safe_and_transactional() {
 	};
 	assert_eq!(db.read(async |tx| tx.expiry_owner(legacy_coin.public_key(), Network::Regtest, &server).await).await.unwrap(), expected_legacy);
 	assert!(db.write(async |tx| tx.verify_owner_link(&server, legacy_coin.public_key(), &legacy, Network::Regtest).await).await.is_err());
+	assert!(shadow_rows(legacy_coin.public_key()).await.is_empty(), "legacy readback must not synthesize joint consent");
 	let coauthorized = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &mailbox, &legacy_coin).unwrap();
 	db.write(async |tx| tx.verify_owner_link(&server, legacy_coin.public_key(), &coauthorized, Network::Regtest).await).await.unwrap();
+	assert_eq!(shadow_rows(legacy_coin.public_key()).await[0].3, coauthorized.serialize_hex());
 	let row = db.read(async |tx| Ok(tx.query_one("SELECT signature,proof_version,joint_proof FROM expiry_owner_key WHERE user_pubkey=$1",
 		&[&legacy_coin.public_key().to_string()]).await?)).await.unwrap();
 	assert_eq!(row.get::<_, &str>("signature"), legacy.signature.to_string());
@@ -208,6 +226,7 @@ async fn fallback_links_are_authenticated_conflict_safe_and_transactional() {
 		Ok(())
 	}).await;
 	assert!(result.is_err());
+	assert!(shadow_rows(pending.public_key()).await.is_empty(), "both authoritative and shadow bindings must roll back");
 	assert_eq!(db.read(async |tx| tx.expiry_owner(pending.public_key(), Network::Regtest, &server).await).await.unwrap(),
 		server::database::expiry_attribution::Attribution::Unresolved);
 	let raced = key(23);
@@ -219,6 +238,7 @@ async fn fallback_links_are_authenticated_conflict_safe_and_transactional() {
 	);
 	assert!(first_result.is_ok() ^ second_result.is_ok());
 	let winner = if first_result.is_ok() { mailbox.public_key() } else { other_mailbox.public_key() };
+	assert_eq!(shadow_rows(raced.public_key()).await[0].1, winner.to_string());
 	assert_eq!(db.read(async |tx| tx.expiry_owner(raced.public_key(), Network::Regtest, &server).await).await.unwrap(),
 		server::database::expiry_attribution::Attribution::Owned { mailbox_pk: winner, spk: script.clone() });
 	let expected = server::database::expiry_attribution::Attribution::Owned { mailbox_pk: mailbox.public_key(), spk: script };
