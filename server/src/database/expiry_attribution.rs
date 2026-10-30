@@ -1,5 +1,6 @@
 //! Authenticated payout mailbox links.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use anyhow::Context;
@@ -8,7 +9,7 @@ use bitcoin::{Network, ScriptBuf};
 
 use ark::fallback::OwnerLink;
 use ark::mailbox::{BlindedMailboxIdentifier, MailboxIdentifier};
-use ark::ProtocolEncoding;
+use ark::{ProtocolEncoding, VtxoId};
 
 use crate::error::OwnershipRefusal;
 use super::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
@@ -21,6 +22,22 @@ pub enum Attribution {
 }
 
 impl Tx<'_> {
+	/// Immutable birth ownership only; recovery hints do not populate this map.
+	pub async fn coin_owner_mailboxes(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, PublicKey>> {
+		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+		self.query("SELECT vtxo_id,mailbox_pk FROM coin_owner WHERE vtxo_id=ANY($1)", &[&ids]).await?
+			.into_iter().map(|row| Ok((row.get::<_, &str>(0).parse()?,
+				row.get::<_, &str>(1).parse()?))).collect()
+	}
+
+	/// Every member of a delivery batch must have the same admitted mailbox.
+	/// Check this before allocating a mailbox checkpoint in the same transaction.
+	pub async fn delivery_owners_match(&self, ids: &[VtxoId], mailbox: MailboxIdentifier) -> anyhow::Result<bool> {
+		let owners = self.coin_owner_mailboxes(ids).await?;
+		let ids = ids.iter().copied().collect::<BTreeSet<_>>();
+		Ok(ids.len() == owners.len() && owners.values().all(|owner| *owner == mailbox.as_pubkey()))
+	}
+
 	/// Resolve the stage-selected key from admission's immutable shadow binding.
 	/// Birth metadata constrains an ordinary coin, not a different entitled key
 	/// selected by an input-owner, receive-claim or participation rule.

@@ -1045,6 +1045,7 @@ async fn recovered_wallet_skips_unownable_vtxo() {
 			resp.messages.push(MailboxMessage {
 				message: Some(mailbox_message::Message::RecoveryVtxoIds(RecoveryVtxoIdsMessage {
 					vtxo_ids: vec![self.foreign_id.to_bytes().to_vec()],
+					owners: Vec::new(),
 				})),
 				checkpoint: 0,
 			});
@@ -1361,6 +1362,7 @@ async fn recovered_wallet_tolerates_undecodable_vtxo_id() {
 			resp.messages.push(MailboxMessage {
 				message: Some(mailbox_message::Message::RecoveryVtxoIds(RecoveryVtxoIdsMessage {
 					vtxo_ids: vec![vec![0xde, 0xad, 0xbe, 0xef]],
+					owners: Vec::new(),
 				})),
 				checkpoint: 0,
 			});

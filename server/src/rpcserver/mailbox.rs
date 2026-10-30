@@ -33,12 +33,14 @@ fn check_auth_not_expired(auth: &MailboxAuthorization) -> Result<(), tonic::Stat
 
 #[allow(deprecated)]
 fn new_mailbox_msg(entry: MailboxEntry) -> protos::mailbox_server::MailboxMessage {
+	let owners = super::convert::owner_mailboxes(&entry.owner_mailboxes);
 	match entry.payload {
 		MailboxPayload::Arkoor { vtxos } => {
 			protos::mailbox_server::MailboxMessage {
 				message: Some(protos::mailbox_server::mailbox_message::Message::Arkoor(
 					protos::mailbox_server::ArkoorMessage {
 						vtxos: vtxos.into_iter().map(|v| v.serialize()).collect(),
+						owners,
 					}
 				)),
 				checkpoint: entry.checkpoint.into(),
@@ -72,6 +74,7 @@ fn new_mailbox_msg(entry: MailboxEntry) -> protos::mailbox_server::MailboxMessag
 				message: Some(protos::mailbox_server::mailbox_message::Message::RecoveryVtxoIds(
 					protos::mailbox_server::RecoveryVtxoIdsMessage {
 						vtxo_ids: vtxo_ids.into_iter().map(|v| v.to_bytes().to_vec()).collect(),
+						owners,
 					}
 				)),
 				checkpoint: entry.checkpoint.into(),

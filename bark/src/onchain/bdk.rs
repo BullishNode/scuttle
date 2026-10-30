@@ -637,8 +637,32 @@ impl OnchainWallet {
 
 #[cfg(test)]
 mod fallback_tests {
+	use bitcoin::hex::DisplayHex;
+	use bitcoin::secp256k1::Secp256k1;
 	use crate::persist::adaptor::StorageAdaptorWrapper;
 	use super::*;
+
+	#[test]
+	fn scuttle_shadow_vector_fixture() {
+		// Standard public BIP39 test mnemonic, never a wallet-store read.
+		let mnemonic: bip39::Mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".parse().unwrap();
+		let secp = Secp256k1::new();
+		for network in [Network::Bitcoin, Network::Signet, Network::Regtest] {
+			let master = bip32::Xpriv::new_master(network, &mnemonic.to_seed("")).unwrap();
+			let path = [bip32::ChildNumber::from_hardened_idx(86).unwrap(),
+				bip32::ChildNumber::from_hardened_idx(u32::from(network != Network::Bitcoin)).unwrap(),
+				bip32::ChildNumber::from_hardened_idx(0).unwrap(), 0.into(), 0.into()];
+			let mailbox = master.derive_priv(&secp, &path).unwrap().to_keypair(&secp);
+			let script = ScriptBuf::new_p2tr(&secp, mailbox.x_only_public_key().0, None);
+			let native = BdkWallet::create_single(bdk_wallet::template::Bip86(master, KeychainKind::External))
+				.network(network).create_wallet_no_persist().unwrap();
+			assert_eq!(native.peek_address(KeychainKind::External, 0).address.script_pubkey(), script);
+			println!("SCUTTLE_BIP86_VECTOR {}", serde_json::json!({
+				"network": network.to_string(), "mailbox": mailbox.public_key().to_string(),
+				"output_key": script.as_bytes()[2..].as_hex().to_string(), "script": script.to_hex_string(),
+			}));
+		}
+	}
 
 	#[tokio::test]
 	async fn fixed_index_zero_remains_reserved_after_reload() {

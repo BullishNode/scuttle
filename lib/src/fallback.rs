@@ -273,7 +273,7 @@ fn validate_script(spk: &Script) -> Result<(), FallbackError> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use bitcoin::hex::FromHex;
+	use bitcoin::hex::{DisplayHex, FromHex};
 
 	fn key(number: u8) -> Keypair {
 		let mut secret = [0; 32];
@@ -361,6 +361,35 @@ mod tests {
 		assert!(MailboxIdentifier::from_blinded(link.blinded_id, coin.public_key(), &server).is_err());
 		let cancelling_mailbox = MailboxIdentifier::from_pubkey(key(33).public_key().negate(&SECP));
 		assert!(OwnerLink::new(server.public_key(), cancelling_mailbox, &coin).is_err());
+	}
+
+	#[test]
+	fn scuttle_shadow_vector_fixture() {
+		// Temporary fixture emitter for a root-owned unit invocation. Replace
+		// with literal expected bytes before the ownership chunk is released.
+		let server = Keypair::from_seckey_slice(&SECP, &[11; 32]).unwrap();
+		let coin = Keypair::from_seckey_slice(&SECP, &[3; 32]).unwrap();
+		for network in [Network::Bitcoin, Network::Signet, Network::Regtest] {
+			for mailbox in [Keypair::from_seckey_slice(&SECP, &[17; 32]).unwrap(), key(3), key(6)] {
+				let link = OwnerLink::new_joint(network, server.public_key(), &mailbox, &coin).unwrap();
+				let intent = OwnerLink::joint_intent(network, server.public_key(), coin.public_key(), link.blinded_id);
+				let coin_message = tagged_message(COIN_TAG, &[&intent]);
+				let mailbox_message = tagged_message(MAILBOX_TAG, &[&intent]);
+				let mut resigned = link;
+				resigned.signature = SECP.sign_schnorr_with_aux_rand(&coin_message, &coin, &[1; 32]);
+				assert_ne!(resigned.signature, link.signature);
+				assert_eq!(resigned.verify_joint(network, &server, coin.public_key()).unwrap(),
+					MailboxIdentifier::from_pubkey(mailbox.public_key()));
+				println!("SCUTTLE_JOINT_VECTOR {}", serde_json::json!({
+					"network": network.to_string(), "server": server.public_key().to_string(),
+					"coin": coin.public_key().to_string(), "mailbox": mailbox.public_key().to_string(),
+					"intent": intent.as_hex().to_string(), "coin_message": coin_message.to_string(),
+					"mailbox_message": mailbox_message.to_string(),
+					"proof": link.serialize_hex(), "resigned_proof": resigned.serialize_hex(),
+					"payout_script": ScriptBuf::new_p2tr(&SECP, mailbox.x_only_public_key().0, None).to_hex_string(),
+				}));
+			}
+		}
 	}
 
 	#[test]

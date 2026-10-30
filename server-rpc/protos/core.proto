@@ -4,6 +4,14 @@ package core;
 
 message Empty {}
 
+// Scuttle birth metadata. An omitted ID has no established mailbox binding;
+// callers must not infer ownership from control of its spending key alone.
+message VtxoOwner {
+	bytes vtxo_id = 1000;
+	// Full compressed mailbox public key, including its parity.
+	bytes owner_mailbox = 1001;
+}
+
 // Why a lightning send failed.
 //
 // Only FEE_TOO_LOW is worth retrying with a larger routing reserve: no route
