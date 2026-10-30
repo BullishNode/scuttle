@@ -1,0 +1,4 @@
+- Permit explicit fee-input exclusions when a wallet builds a CPFP child
+  A payout can preserve its parent inputs while the fee wallet supplies a
+  separate confirmed input.
+  [#32](https://github.com/BullishNode/abandon-ship-bark/pull/32)

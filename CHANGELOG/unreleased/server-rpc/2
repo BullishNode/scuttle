@@ -1,0 +1,5 @@
+- Require protocol 7 for new joint-authorized customer issuance.
+  Retain the existing destination field and use a separate invoice-expiry field.
+  [#2](https://github.com/BullishNode/scuttle/pull/2)
+  - **BREAKING:** Match Scuttle client and server protocol layouts. The stock
+    upstream field-6 invoice-expiry layout is not wire compatible with Scuttle.
