@@ -1,0 +1,649 @@
+{
+  "base": "source/upstream-20261030",
+  "fork": "HEAD",
+  "added": 6446,
+  "deleted": 542,
+  "gross": 6988,
+  "net": 5904,
+  "exact_renames": [
+    {
+      "before": "server/src/database/migrations/V73__history_skip_noop_updates.sql",
+      "after": "server/src/database/migrations/V74__history_skip_noop_updates.sql",
+      "lines": 264
+    },
+    {
+      "before": "server/src/database/migrations/V74__vtxo_txid_walk_index.sql",
+      "after": "server/src/database/migrations/V75__vtxo_txid_walk_index.sql",
+      "lines": 2
+    },
+    {
+      "before": "server/src/database/migrations/V75__cln_xpay.sql",
+      "after": "server/src/database/migrations/V76__cln_xpay.sql",
+      "lines": 68
+    },
+    {
+      "before": "server/src/database/migrations/V76__cln_hold.sql",
+      "after": "server/src/database/migrations/V77__cln_hold.sql",
+      "lines": 31
+    },
+    {
+      "before": "server/src/database/migrations/V77__board_exit.sql",
+      "after": "server/src/database/migrations/V79__board_exit.sql",
+      "lines": 7
+    }
+  ],
+  "files": [
+    {
+      "path": "bark-cli/src/bin/bark-legacy/dev.rs",
+      "added": 18,
+      "deleted": 0,
+      "gross": 18
+    },
+    {
+      "path": "bark-cli/src/bin/bark-legacy/main.rs",
+      "added": 7,
+      "deleted": 1,
+      "gross": 8
+    },
+    {
+      "path": "bark-cli/src/wallet.rs",
+      "added": 4,
+      "deleted": 1,
+      "gross": 5
+    },
+    {
+      "path": "bark-json/src/cli/mod.rs",
+      "added": 15,
+      "deleted": 2,
+      "gross": 17
+    },
+    {
+      "path": "bark-json/src/primitives.rs",
+      "added": 5,
+      "deleted": 0,
+      "gross": 5
+    },
+    {
+      "path": "bark-json/src/web.rs",
+      "added": 7,
+      "deleted": 0,
+      "gross": 7
+    },
+    {
+      "path": "bark-rest/src/api/v1/boards.rs",
+      "added": 2,
+      "deleted": 0,
+      "gross": 2
+    },
+    {
+      "path": "bark-rest/src/api/v1/lightning.rs",
+      "added": 8,
+      "deleted": 2,
+      "gross": 10
+    },
+    {
+      "path": "bark-rest/src/api/v1/wallet.rs",
+      "added": 54,
+      "deleted": 8,
+      "gross": 62
+    },
+    {
+      "path": "bark-rest/src/error.rs",
+      "added": 14,
+      "deleted": 1,
+      "gross": 15
+    },
+    {
+      "path": "bark/src/actions/arkoor_send.rs",
+      "added": 5,
+      "deleted": 1,
+      "gross": 6
+    },
+    {
+      "path": "bark/src/actions/lightning/pay.rs",
+      "added": 94,
+      "deleted": 20,
+      "gross": 114
+    },
+    {
+      "path": "bark/src/actions/lightning/receive.rs",
+      "added": 36,
+      "deleted": 13,
+      "gross": 49
+    },
+    {
+      "path": "bark/src/actions/mod.rs",
+      "added": 2,
+      "deleted": 1,
+      "gross": 3
+    },
+    {
+      "path": "bark/src/actions/offboard.rs",
+      "added": 60,
+      "deleted": 4,
+      "gross": 64
+    },
+    {
+      "path": "bark/src/arkoor.rs",
+      "added": 18,
+      "deleted": 9,
+      "gross": 27
+    },
+    {
+      "path": "bark/src/balance.rs",
+      "added": 108,
+      "deleted": 16,
+      "gross": 124
+    },
+    {
+      "path": "bark/src/board.rs",
+      "added": 3,
+      "deleted": 1,
+      "gross": 4
+    },
+    {
+      "path": "bark/src/chain.rs",
+      "added": 3,
+      "deleted": 1,
+      "gross": 4
+    },
+    {
+      "path": "bark/src/daemon/mod.rs",
+      "added": 1,
+      "deleted": 1,
+      "gross": 2
+    },
+    {
+      "path": "bark/src/fallback.rs",
+      "added": 200,
+      "deleted": 0,
+      "gross": 200
+    },
+    {
+      "path": "bark/src/fallback/payouts.rs",
+      "added": 177,
+      "deleted": 0,
+      "gross": 177
+    },
+    {
+      "path": "bark/src/fallback/reconcile.rs",
+      "added": 198,
+      "deleted": 0,
+      "gross": 198
+    },
+    {
+      "path": "bark/src/fallback/refusal.rs",
+      "added": 70,
+      "deleted": 0,
+      "gross": 70
+    },
+    {
+      "path": "bark/src/fallback/sync.rs",
+      "added": 64,
+      "deleted": 0,
+      "gross": 64
+    },
+    {
+      "path": "bark/src/import.rs",
+      "added": 14,
+      "deleted": 5,
+      "gross": 19
+    },
+    {
+      "path": "bark/src/lib.rs",
+      "added": 101,
+      "deleted": 41,
+      "gross": 142
+    },
+    {
+      "path": "bark/src/lightning/pay.rs",
+      "added": 6,
+      "deleted": 23,
+      "gross": 29
+    },
+    {
+      "path": "bark/src/lightning/receive.rs",
+      "added": 15,
+      "deleted": 0,
+      "gross": 15
+    },
+    {
+      "path": "bark/src/mailbox.rs",
+      "added": 10,
+      "deleted": 45,
+      "gross": 55
+    },
+    {
+      "path": "bark/src/onchain/bdk.rs",
+      "added": 15,
+      "deleted": 2,
+      "gross": 17
+    },
+    {
+      "path": "bark/src/persist/adaptor/mod.rs",
+      "added": 65,
+      "deleted": 2,
+      "gross": 67
+    },
+    {
+      "path": "bark/src/persist/mod.rs",
+      "added": 38,
+      "deleted": 1,
+      "gross": 39
+    },
+    {
+      "path": "bark/src/persist/models.rs",
+      "added": 38,
+      "deleted": 2,
+      "gross": 40
+    },
+    {
+      "path": "bark/src/persist/sqlite/migrations/m0043_fallback.rs",
+      "added": 20,
+      "deleted": 0,
+      "gross": 20
+    },
+    {
+      "path": "bark/src/persist/sqlite/migrations/mod.rs",
+      "added": 3,
+      "deleted": 0,
+      "gross": 3
+    },
+    {
+      "path": "bark/src/persist/sqlite/mod.rs",
+      "added": 40,
+      "deleted": 0,
+      "gross": 40
+    },
+    {
+      "path": "bark/src/persist/sqlite/query.rs",
+      "added": 67,
+      "deleted": 1,
+      "gross": 68
+    },
+    {
+      "path": "bark/src/recovery.rs",
+      "added": 50,
+      "deleted": 9,
+      "gross": 59
+    },
+    {
+      "path": "bark/src/round/mod.rs",
+      "added": 370,
+      "deleted": 44,
+      "gross": 414
+    },
+    {
+      "path": "bark/src/vtxo/mod.rs",
+      "added": 23,
+      "deleted": 4,
+      "gross": 27
+    },
+    {
+      "path": "bitcoin-ext/src/bdk.rs",
+      "added": 24,
+      "deleted": 3,
+      "gross": 27
+    },
+    {
+      "path": "lib/src/address.rs",
+      "added": 127,
+      "deleted": 4,
+      "gross": 131
+    },
+    {
+      "path": "lib/src/fallback.rs",
+      "added": 235,
+      "deleted": 0,
+      "gross": 235
+    },
+    {
+      "path": "lib/src/lib.rs",
+      "added": 1,
+      "deleted": 0,
+      "gross": 1
+    },
+    {
+      "path": "server-rpc/protos/bark_server.proto",
+      "added": 24,
+      "deleted": 1,
+      "gross": 25
+    },
+    {
+      "path": "server-rpc/src/convert.rs",
+      "added": 31,
+      "deleted": 0,
+      "gross": 31
+    },
+    {
+      "path": "server-rpc/src/lib.rs",
+      "added": 2,
+      "deleted": 2,
+      "gross": 4
+    },
+    {
+      "path": "server-rpc/src/pver.rs",
+      "added": 6,
+      "deleted": 0,
+      "gross": 6
+    },
+    {
+      "path": "server/src/arkoor.rs",
+      "added": 14,
+      "deleted": 2,
+      "gross": 16
+    },
+    {
+      "path": "server/src/bin/captaind/main.rs",
+      "added": 4,
+      "deleted": 1,
+      "gross": 5
+    },
+    {
+      "path": "server/src/bitcoind.rs",
+      "added": 25,
+      "deleted": 1,
+      "gross": 26
+    },
+    {
+      "path": "server/src/database/data_migrations/backfill_cln_hold.rs",
+      "added": 1,
+      "deleted": 1,
+      "gross": 2
+    },
+    {
+      "path": "server/src/database/data_migrations/fix_offboard_vtxos.rs",
+      "added": 2,
+      "deleted": 1,
+      "gross": 3
+    },
+    {
+      "path": "server/src/database/expiry_attribution.rs",
+      "added": 83,
+      "deleted": 0,
+      "gross": 83
+    },
+    {
+      "path": "server/src/database/expiry_chain.rs",
+      "added": 122,
+      "deleted": 0,
+      "gross": 122
+    },
+    {
+      "path": "server/src/database/expiry_decision.rs",
+      "added": 369,
+      "deleted": 0,
+      "gross": 369
+    },
+    {
+      "path": "server/src/database/expiry_geometry.rs",
+      "added": 88,
+      "deleted": 0,
+      "gross": 88
+    },
+    {
+      "path": "server/src/database/expiry_guard.rs",
+      "added": 90,
+      "deleted": 0,
+      "gross": 90
+    },
+    {
+      "path": "server/src/database/expiry_inventory.rs",
+      "added": 303,
+      "deleted": 0,
+      "gross": 303
+    },
+    {
+      "path": "server/src/database/expiry_lightning.rs",
+      "added": 128,
+      "deleted": 0,
+      "gross": 128
+    },
+    {
+      "path": "server/src/database/expiry_ownership.rs",
+      "added": 345,
+      "deleted": 0,
+      "gross": 345
+    },
+    {
+      "path": "server/src/database/expiry_payout.rs",
+      "added": 348,
+      "deleted": 0,
+      "gross": 348
+    },
+    {
+      "path": "server/src/database/expiry_receive.rs",
+      "added": 95,
+      "deleted": 0,
+      "gross": 95
+    },
+    {
+      "path": "server/src/database/fallback.rs",
+      "added": 49,
+      "deleted": 0,
+      "gross": 49
+    },
+    {
+      "path": "server/src/database/htlc_vtxo.rs",
+      "added": 1,
+      "deleted": 0,
+      "gross": 1
+    },
+    {
+      "path": "server/src/database/ln/mod.rs",
+      "added": 30,
+      "deleted": 24,
+      "gross": 54
+    },
+    {
+      "path": "server/src/database/ln/model.rs",
+      "added": 2,
+      "deleted": 9,
+      "gross": 11
+    },
+    {
+      "path": "server/src/database/migrations/V73__signature_link_fallback.sql",
+      "added": 104,
+      "deleted": 0,
+      "gross": 104
+    },
+    {
+      "path": "server/src/database/migrations/V78__joint_owner_authorization.sql",
+      "added": 4,
+      "deleted": 0,
+      "gross": 4
+    },
+    {
+      "path": "server/src/database/mod.rs",
+      "added": 33,
+      "deleted": 6,
+      "gross": 39
+    },
+    {
+      "path": "server/src/database/model.rs",
+      "added": 10,
+      "deleted": 1,
+      "gross": 11
+    },
+    {
+      "path": "server/src/database/query.rs",
+      "added": 8,
+      "deleted": 4,
+      "gross": 12
+    },
+    {
+      "path": "server/src/database/rounds/mod.rs",
+      "added": 21,
+      "deleted": 4,
+      "gross": 25
+    },
+    {
+      "path": "server/src/database/tree.rs",
+      "added": 53,
+      "deleted": 4,
+      "gross": 57
+    },
+    {
+      "path": "server/src/error.rs",
+      "added": 67,
+      "deleted": 0,
+      "gross": 67
+    },
+    {
+      "path": "server/src/expiry_readiness.rs",
+      "added": 299,
+      "deleted": 0,
+      "gross": 299
+    },
+    {
+      "path": "server/src/lib.rs",
+      "added": 12,
+      "deleted": 2,
+      "gross": 14
+    },
+    {
+      "path": "server/src/ln/cln/hold.rs",
+      "added": 5,
+      "deleted": 3,
+      "gross": 8
+    },
+    {
+      "path": "server/src/ln/cln/mod.rs",
+      "added": 3,
+      "deleted": 0,
+      "gross": 3
+    },
+    {
+      "path": "server/src/ln/cln/xpay.rs",
+      "added": 30,
+      "deleted": 8,
+      "gross": 38
+    },
+    {
+      "path": "server/src/ln/guard.rs",
+      "added": 45,
+      "deleted": 9,
+      "gross": 54
+    },
+    {
+      "path": "server/src/ln/mod.rs",
+      "added": 83,
+      "deleted": 46,
+      "gross": 129
+    },
+    {
+      "path": "server/src/ln/node_manager.rs",
+      "added": 62,
+      "deleted": 67,
+      "gross": 129
+    },
+    {
+      "path": "server/src/ln/payment_handler.rs",
+      "added": 11,
+      "deleted": 7,
+      "gross": 18
+    },
+    {
+      "path": "server/src/offboards.rs",
+      "added": 3,
+      "deleted": 0,
+      "gross": 3
+    },
+    {
+      "path": "server/src/owner_proof.rs",
+      "added": 152,
+      "deleted": 0,
+      "gross": 152
+    },
+    {
+      "path": "server/src/round/forfeit.rs",
+      "added": 8,
+      "deleted": 3,
+      "gross": 11
+    },
+    {
+      "path": "server/src/round/mod.rs",
+      "added": 51,
+      "deleted": 12,
+      "gross": 63
+    },
+    {
+      "path": "server/src/rpcserver/admin.rs",
+      "added": 16,
+      "deleted": 1,
+      "gross": 17
+    },
+    {
+      "path": "server/src/rpcserver/ark.rs",
+      "added": 93,
+      "deleted": 27,
+      "gross": 120
+    },
+    {
+      "path": "server/src/rpcserver/mailbox.rs",
+      "added": 11,
+      "deleted": 4,
+      "gross": 15
+    },
+    {
+      "path": "server/src/rpcserver/mod.rs",
+      "added": 17,
+      "deleted": 2,
+      "gross": 19
+    },
+    {
+      "path": "server/src/sync/block_index.rs",
+      "added": 8,
+      "deleted": 3,
+      "gross": 11
+    },
+    {
+      "path": "server/src/sync/mod.rs",
+      "added": 4,
+      "deleted": 0,
+      "gross": 4
+    },
+    {
+      "path": "server/src/vtxopool.rs",
+      "added": 18,
+      "deleted": 6,
+      "gross": 24
+    },
+    {
+      "path": "server/src/wallet/mod.rs",
+      "added": 2,
+      "deleted": 0,
+      "gross": 2
+    },
+    {
+      "path": "server/src/watchman/daemon.rs",
+      "added": 4,
+      "deleted": 0,
+      "gross": 4
+    },
+    {
+      "path": "server/src/watchman/mod.rs",
+      "added": 97,
+      "deleted": 13,
+      "gross": 110
+    },
+    {
+      "path": "server/src/watchman/payout.rs",
+      "added": 197,
+      "deleted": 0,
+      "gross": 197
+    },
+    {
+      "path": "server/src/watchman/recovery.rs",
+      "added": 239,
+      "deleted": 0,
+      "gross": 239
+    },
+    {
+      "path": "server/src/watchman/settlement.rs",
+      "added": 79,
+      "deleted": 0,
+      "gross": 79
+    }
+  ]
+}

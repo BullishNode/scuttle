@@ -1,0 +1,67 @@
+[
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/joint-authorization-corrected-case-result.json",
+    "sha256": "477ce00e2e310eae46d2da053ff1b3a444eb12b1c9e168db3b7f6a6530e6497f",
+    "bytes": 7266
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/joint-authorization-negative-case-result.json",
+    "sha256": "25ef01e8af81bb73bf0f444f5bd4cdd1599c4b590afa3eaa252b8b577a861a23",
+    "bytes": 4265
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/joint-authorization-unit-case-results.json",
+    "sha256": "0b3902b3b748a2fa1a0fe9a60e85d0a9aefd0b6fad8ab87f2c70dd7cc0f68f20",
+    "bytes": 5740
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/joint-paid-mailbox-case-result.json",
+    "sha256": "eb1c912b8137d4740f88f88a8c69aed18e8056524eb43477ff7e0a00ffb98cb9",
+    "bytes": 5005
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/joint-recipient-round-case-result.json",
+    "sha256": "8dcc931671df59482fa6a90a1dd61ce012a55b1adaa61c6b0288594627933369",
+    "bytes": 4945
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/joint-forwarded-claim-case-result.json",
+    "sha256": "7e51f99944e618b92ddfe4168d82030aeadfab1620d964345a2eefbca640b355",
+    "bytes": 4168
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/joint-protocol7-invoice-case-result.json",
+    "sha256": "4be6ee47830998843e778365fcc1d36f44b17deffd062c337271f3976afb3986",
+    "bytes": 3967
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/migration-copy73-to77-case-result.json",
+    "sha256": "824fb2213bdf5f49103581b3e963153201f87215a3020d8b94f66b96e1c81a93",
+    "bytes": 9348
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/migration-copy77-to78-case-result.json",
+    "sha256": "aaefa178ba6c6ca741c27e6ec56ba1dcd3f9378e43fb0df283d49d152892d45c",
+    "bytes": 5405
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/h09-eight-address-case-partial-result.json",
+    "sha256": "54e5ae43b4058b974f06d2828e751205281b8961e06f5b63412b16f5af61d774",
+    "bytes": 2867
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/joint-authorization-product-source-independent-r1/REVIEW.json",
+    "sha256": "c15a5d8e79660567253b18e9a2f1a7cd52affcd91dcbb49267603f52a103c6c3",
+    "bytes": 1442
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/joint-authorization-crypto-review-r1/REVIEW.json",
+    "sha256": "3d2854e54f4d26e47d5eea933785e0d41914d779dbbfb418e68a7129a27d6eb8",
+    "bytes": 1175
+  },
+  {
+    "path": "/home/francis/bark-integration-2026-10-01/qualification-resume-20261030/upstream18-board-binding-necessity-review-r1/REVIEW.json",
+    "sha256": "9405a2eeb429d499d345a3f99a46568afd7da5c54f188823ffcf48f93a30b1f6",
+    "bytes": 1555
+  }
+]

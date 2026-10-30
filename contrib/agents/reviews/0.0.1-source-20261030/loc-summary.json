@@ -1,0 +1,117 @@
+{
+  "abandon-ship-signature-rc-20261027-c23bad4b8911": {
+    "commit": "c23bad4b8911198b42144e98156166d3cb065cc7",
+    "tree": "8c80ce55abfed4d151f76ca364d7355a0255c6c4",
+    "total": 92716,
+    "by_component": {
+      ".gitlab": 69,
+      "bark": 31082,
+      "bark-cli": 3170,
+      "bark-common": 244,
+      "bark-json": 3065,
+      "bark-nwc": 818,
+      "bark-rest": 4339,
+      "bark-runtime": 209,
+      "bip321": 743,
+      "bitcoin-ext": 1782,
+      "cln-rpc": 19,
+      "contrib": 124,
+      "lib": 13202,
+      "server": 30165,
+      "server-log": 1541,
+      "server-rpc": 2144
+    }
+  },
+  "source/original-f34": {
+    "commit": "f34ce78fe28b9d22de8edf35a36bf8387d2bacc6",
+    "tree": "e338292a05afcc98ebeac3cdc3f7d5050295be5e",
+    "total": 96546,
+    "by_component": {
+      ".gitlab": 69,
+      "bark": 31338,
+      "bark-cli": 4752,
+      "bark-common": 244,
+      "bark-json": 3164,
+      "bark-nwc": 818,
+      "bark-rest": 4394,
+      "bark-runtime": 209,
+      "bip321": 743,
+      "bitcoin-ext": 1791,
+      "cln-rpc": 19,
+      "contrib": 124,
+      "lib": 13391,
+      "server": 31783,
+      "server-log": 1541,
+      "server-rpc": 2166
+    }
+  },
+  "959a489ff4934b181783b41c7d3ee68d85b95cbf": {
+    "commit": "959a489ff4934b181783b41c7d3ee68d85b95cbf",
+    "tree": "a202f688ce3f2627e3e8dda97bd5b15c4cbb4b4e",
+    "total": 87124,
+    "by_component": {
+      ".gitlab": 69,
+      "bark": 29447,
+      "bark-cli": 3143,
+      "bark-common": 244,
+      "bark-json": 3040,
+      "bark-nwc": 818,
+      "bark-rest": 4272,
+      "bark-runtime": 209,
+      "bip321": 743,
+      "bitcoin-ext": 1761,
+      "cln-rpc": 19,
+      "contrib": 124,
+      "lib": 12990,
+      "server": 26606,
+      "server-log": 1541,
+      "server-rpc": 2098
+    }
+  },
+  "source/upstream-20261030": {
+    "commit": "c5f03f0b89b543d0e2131307ebecf1aaa76c3b0a",
+    "tree": "096bf0da1e49edb6627a505e5de38518dd1dfef1",
+    "total": 90857,
+    "by_component": {
+      ".gitlab": 69,
+      "bark": 29670,
+      "bark-cli": 4725,
+      "bark-common": 244,
+      "bark-json": 3139,
+      "bark-nwc": 818,
+      "bark-rest": 4327,
+      "bark-runtime": 209,
+      "bip321": 743,
+      "bitcoin-ext": 1770,
+      "cln-rpc": 19,
+      "contrib": 124,
+      "lib": 13036,
+      "server": 28317,
+      "server-log": 1541,
+      "server-rpc": 2106
+    }
+  },
+  "HEAD": {
+    "commit": "a0a567b33fc49c8abe661f3dd31651901a839b07",
+    "tree": "ea16d117caa0bab99f773a9df379e0b39b40dae2",
+    "total": 96761,
+    "by_component": {
+      ".gitlab": 69,
+      "bark": 31338,
+      "bark-cli": 4752,
+      "bark-common": 244,
+      "bark-json": 3164,
+      "bark-nwc": 818,
+      "bark-rest": 4394,
+      "bark-runtime": 209,
+      "bip321": 743,
+      "bitcoin-ext": 1791,
+      "cln-rpc": 19,
+      "contrib": 124,
+      "lib": 13395,
+      "server": 31994,
+      "server-log": 1541,
+      "server-rpc": 2166
+    }
+  }
+}
