@@ -206,8 +206,9 @@ impl ClnXpayClient {
 
 	/// Queries CLN's `listpays` for the given attempt and updates the DB to match.
 	///
-	/// If CLN has no record of the payment and the attempt is still open, it is
-	/// marked `Failed`. If CLN reports a different status than the DB, the DB is
+	/// If CLN has no own record, keep the attempt open for its normal retry.
+	/// Neither an error nor elapsed height proves a native terminal outcome.
+	/// If CLN reports a different status than the DB, the DB is
 	/// updated (unless the DB status is already final, which is logged as an error).
 	/// Sends on `payment_update_tx` when the status changes.
 	///
@@ -258,7 +259,9 @@ impl ClnXpayClient {
 				LightningPaymentStatus::Requested
 					| LightningPaymentStatus::Submitted =>
 				{
-					self.payment_handler().fail_payment_attempt(&attempt, error).await?;
+					error!(attempt_id = attempt.id, %payment_hash, status = %attempt.status,
+						pay_error_present = error.is_some(),
+						"Own native payment lookup is empty; retaining custody and retrying");
 				},
 			}
 		} else {
