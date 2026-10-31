@@ -268,6 +268,18 @@ impl Server {
 						Ok::<_, anyhow::Error>((snapshot, cut))
 					}).await.context("expiry subtree validation task failed")??
 				};
+				// Avoid cancelling a round whose input this process already holds.
+				// Other processes still serialize on the durable source/participation
+				// fences; a late losing round handles their refusal recoverably.
+				let mut ids = cut.visited.iter().map(|i| snapshot.regular[*i].state.vtxo_id).collect::<Vec<_>>();
+				ids.sort_unstable(); ids.dedup();
+				let _flux = match self.vtxos_in_flux.try_lock(&ids) {
+					Ok(guard) => guard,
+					Err(error) => {
+						debug!(vtxo_id = %error.id, root = %root.id(), "Expiry preparation skips an in-flux input");
+						return Ok(());
+					},
+				};
 				let mut coins = Vec::with_capacity(cut.terminals.len());
 				let mut hold = false;
 				let mut needs_htlc_progress = false;
@@ -351,6 +363,22 @@ impl Server {
 		&self, view: ExpiryViewToken, outputs: Vec<ReadyOutput>,
 		frontier: &[DustCandidate], included: &mut BTreeSet<VtxoId>,
 	) -> anyhow::Result<()> {
+		// Preparation releases its local locks before grouping. Close that gap
+		// without letting one busy output stop unrelated ready outputs. Keep the
+		// guards through the decision commit; SQL still revalidates every source.
+		let mut guards = Vec::with_capacity(outputs.len());
+		let mut available = Vec::with_capacity(outputs.len());
+		for output in outputs {
+			match self.vtxos_in_flux.try_lock(&output.source_ids()) {
+				Ok(guard) => {
+					guards.push(guard);
+					available.push(output);
+				},
+				Err(error) => debug!(vtxo_id = %error.id, root = %output.root().id(),
+					"Expiry decision skips an in-flux input"),
+			}
+		}
+		let outputs = available;
 		if outputs.is_empty() {
 			return Ok(());
 		}

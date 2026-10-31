@@ -86,6 +86,12 @@ impl ReadyOutput {
 
 	pub fn root(&self) -> &ServerVtxo { &self.snapshot.roots[0] }
 
+	pub(crate) fn source_ids(&self) -> Vec<VtxoId> {
+		let mut ids = self.snapshot.regular.iter().map(|fact| fact.state.vtxo_id).collect::<Vec<_>>();
+		ids.sort_unstable(); ids.dedup();
+		ids
+	}
+
 	pub fn dust_candidates(&self) -> Vec<DustCandidate> {
 		let root = self.snapshot.regular.iter().find(|fact| fact.state.vtxo_id == self.root().id())
 			.expect("proven readiness includes its physical root");

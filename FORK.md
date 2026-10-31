@@ -40,8 +40,5 @@ is a conflict/maintenance canary, not evidence that money or signatures are
 correct. A production-line comparison must separately exclude tests, docs,
 generated code and inline tests; it is a different metric from upstream hunks.
 
-Run `just checks`, `just unit` and `just int-scuttle` on exact source and runtime
-identities. A canary or source review does not replace the required financial,
-failure, recovery and Signet qualification. Preserve failures and funded stores.
-Build the server and client from the same source and qualify fresh matched stores
-before a release.
+Build the server and client from the same source and deploy with fresh matched
+stores. Older registration-shaped stores are refused.
