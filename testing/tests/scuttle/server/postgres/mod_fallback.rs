@@ -357,12 +357,11 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 		.build_signed(|message| secp.sign_ecdsa_recoverable(message, &invoice_key)).unwrap();
 	let subscription = db.write(async |t| {
 		t.store_generated_lightning_receive(node, &bolt11, 10_000_000, None, None).await?;
-		let sub = t.get_htlc_subscription_by_payment_hash(hash).await?.unwrap().id;
-		t.store_lightning_htlc_subscription_status(sub, LightningHtlcSubscriptionStatus::Accepted,
-			Some(expiry), None).await?;
-		t.update_lightning_htlc_subscription_with_htlcs(sub, [ids[2]]).await?;
-		Ok(sub)
+		Ok(t.get_htlc_subscription_by_payment_hash(hash).await?.unwrap().id)
 	}).await.unwrap();
+	db.write(async |t| t.store_lightning_htlc_subscription_status(subscription,
+		LightningHtlcSubscriptionStatus::Accepted, Some(expiry), None).await).await.unwrap();
+	db.write(async |t| t.update_lightning_htlc_subscription_with_htlcs(subscription, [ids[2]]).await).await.unwrap();
 	let invoice = Invoice::Bolt11(bolt11);
 	for source in &ids[..2] { legacy_payment_attempt(&db, node, &invoice, &[*source]).await; }
 	let attempts = db.read(async |t| Ok(t.query("SELECT id FROM lightning_payment_attempt WHERE payment_hash=$1 ORDER BY id",
