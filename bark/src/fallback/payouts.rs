@@ -216,7 +216,12 @@ impl Wallet {
 			"fallback", &format!("fallback:{}", receipt.vtxo_id), MovementUpdate::new()
 				.consumed_vtxos(local_sources.iter().map(|source| source.id()))).await?;
 		let status = if receipt.retired_block.is_some() { MovementStatus::Successful } else { MovementStatus::Pending };
-		let effective = if receipt.retired_block.is_some() { -receipt.gross.to_signed()? } else { bitcoin::SignedAmount::ZERO };
+		// An authenticated payout may be discovered before its Ark output ever
+		// existed in this wallet. Keep that receipt and fee, but only debit Ark
+		// principal when this receipt actually retires a retained local source.
+		let effective = if receipt.retired_block.is_some() && !local_sources.is_empty() {
+			-receipt.gross.to_signed()?
+		} else { bitcoin::SignedAmount::ZERO };
 		let metadata = serde_json::to_value(&receipt)?;
 		let current = self.inner.db.get_movement_by_id(movement).await?;
 		let source_ids = local_sources.iter().map(|source| source.id()).collect::<Vec<_>>();
