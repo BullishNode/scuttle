@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bark::{OpenWalletArgs, Wallet, WalletSeed};
+use bark::import::ImportVtxoError;
 use bark::onchain::OnchainWallet;
 use bark::persist::{BarkPersister, sqlite::SqliteClient};
 use bark::persist::adaptor::StorageAdaptorWrapper;
@@ -551,15 +552,19 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 		assert!(!report.is_complete());
 		assert_eq!(report.failed().total_amount(), sat(40_000));
 		history_status.force_spent.store(false, Ordering::SeqCst);
+		let mut rpc = srv.get_public_rpc().await;
 		for change in &changes {
-			let unsigned = history.get_full_vtxo(change.id()).await.unwrap();
+			let raw = rpc.get_vtxo(protos::GetVtxoRequest {
+				vtxo_id: change.id().to_bytes().to_vec(),
+			}).await.unwrap().into_inner();
+			let unsigned = Vtxo::<Full>::deserialize(&raw.vtxo).unwrap();
+			assert_eq!(unsigned.id(), change.id());
 			assert!(!unsigned.has_all_witnesses());
 			assert_ne!(unsigned.serialize(), change.serialize());
-			assert_eq!(history_db.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
-			let error = history.trust_and_adopt_server_vtxo_status(change.id()).await.unwrap_err();
-			assert!(matches!(error.downcast_ref::<VtxoValidationError>(), Some(VtxoValidationError::Invalid(_))));
-			assert_eq!(history.get_full_vtxo(change.id()).await.unwrap().serialize(), unsigned.serialize());
-			assert_eq!(history_db.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
+			assert!(history_db.get_wallet_vtxo(change.id()).await.unwrap().is_none());
+			let error = history.import_vtxo(&unsigned, Default::default()).await.unwrap_err();
+			assert!(matches!(error, ImportVtxoError::Invalid { source: VtxoValidationError::Invalid(_), .. }));
+			assert!(history_db.get_wallet_vtxo(change.id()).await.unwrap().is_none());
 		}
 		assert_eq!(history.balance().await.unwrap().awaiting_settlement, sat(40_000));
 		assert_eq!(history.balance().await.unwrap().spendable, sat(0));
