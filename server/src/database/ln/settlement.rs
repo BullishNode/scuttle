@@ -76,16 +76,27 @@ impl Tx<'_> {
 				("receive", Some(id), None, attempts)
 			},
 			HtlcSettlementOrigin::Onchain(id) => {
-				let Some(row) = self.query_opt("SELECT h.payment_hash,v.lightning_htlc_subscription_id \
+				let Some(row) = self.query_opt("SELECT h.payment_hash,h.direction::TEXT,v.lightning_htlc_subscription_id \
 					FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE v.vtxo_id=$1", &[&id.to_string()]).await?
 					else { return Ok(None); };
 				if row.get::<_, &str>("payment_hash") != hash.to_string() { return Ok(None); }
 				let subscription: Option<i64> = row.get("lightning_htlc_subscription_id");
-				let attempts = self.query("SELECT a.id FROM lightning_payment_attempt a WHERE \
-					a.id IN (SELECT lightning_payment_attempt_id FROM lightning_payment_attempt_htlc_vtxo WHERE vtxo_id=$1) \
-					OR a.lightning_htlc_subscription_id=$2 ORDER BY a.id", &[&id.to_string(), &subscription]).await?
-					.into_iter().map(|r| r.get(0)).collect();
-				("onchain", subscription, Some(id), attempts)
+				match row.get::<_, &str>("direction") {
+					// A witness spends this incoming source, not the other inputs
+					// of every failed attempt in which it previously participated.
+					"incoming" if subscription.is_none() => ("onchain", None, Some(id), Vec::new()),
+					"outgoing" => {
+						let Some(subscription) = subscription else { return Ok(None); };
+						let Some(sub) = self.query_opt("SELECT payment_hash FROM lightning_htlc_subscription WHERE id=$1",
+							&[&subscription]).await? else { return Ok(None); };
+						if sub.get::<_, &str>(0) != hash.to_string() { return Ok(None); }
+						let attempts = self.query("SELECT id FROM lightning_payment_attempt \
+							WHERE lightning_htlc_subscription_id=$1 ORDER BY id", &[&subscription]).await?
+							.into_iter().map(|r| r.get(0)).collect();
+						("onchain", Some(subscription), Some(id), attempts)
+					},
+					_ => return Ok(None),
+				}
 			},
 		};
 		let mut records = BTreeSet::new();

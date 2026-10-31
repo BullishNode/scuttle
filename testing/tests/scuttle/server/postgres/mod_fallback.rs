@@ -370,6 +370,35 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 	assert_eq!(attempts.len(), 2);
 	let predicate = async |source| db.read(async |t| t.source_settlement(hash, source).await).await.unwrap();
 	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
+	// Supported retry shape: failed A={S,T}, later B={S}. An incoming S
+	// witness proves only S, not A's unspent co-input T. Roll this controlled
+	// metadata shape and its WAL back before the remaining receive controls.
+	let overlap: anyhow::Result<()> = db.write(async |t| {
+		t.execute("INSERT INTO lightning_payment_attempt_htlc_vtxo(lightning_payment_attempt_id,vtxo_id) VALUES($1,$2)",
+			&[&attempts[0], &ids[1].to_string()]).await?;
+		t.execute("UPDATE lightning_payment_attempt SET status='failed',updated_at=NOW() WHERE id=$1", &[&attempts[0]]).await?;
+		t.execute("UPDATE lightning_payment_attempt_htlc_vtxo SET vtxo_id=$2 WHERE lightning_payment_attempt_id=$1",
+			&[&attempts[1], &ids[0].to_string()]).await?;
+		assert!(t.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Onchain(ids[0])).await?.is_some());
+		assert_eq!(t.source_settlement(hash, ids[0]).await?, SourceSettlement::Funded);
+		assert_eq!(t.source_settlement(hash, ids[1]).await?, SourceSettlement::Disjoint);
+		assert_eq!(t.query_one("SELECT count(*) FROM htlc_settlement_source WHERE kind='onchain' AND attempt_id IS NOT NULL",
+			&[]).await?.get::<_, i64>(0), 0);
+		anyhow::bail!("roll back the overlapping-attempt witness control")
+	}).await;
+	assert!(overlap.is_err());
+	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
+	let outgoing: anyhow::Result<()> = db.write(async |t| {
+		t.execute("UPDATE lightning_payment_attempt SET lightning_htlc_subscription_id=$2,updated_at=NOW() WHERE id=$1",
+			&[&attempts[0], &subscription]).await?;
+		assert!(t.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Onchain(ids[2])).await?.is_some());
+		assert_eq!(t.source_settlement(hash, ids[0]).await?, SourceSettlement::Funded,
+			"the outgoing grant witness retains its actual subscription funding scope");
+		assert_eq!(t.source_settlement(hash, ids[1]).await?, SourceSettlement::Disjoint);
+		anyhow::bail!("roll back the outgoing-grant funding control")
+	}).await;
+	assert!(outgoing.is_err());
+	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
 	let rolled_back: anyhow::Result<()> = db.write(async |t| {
 		t.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Receive(subscription)).await?;
 		anyhow::bail!("roll back the original WAL and its origin together")
