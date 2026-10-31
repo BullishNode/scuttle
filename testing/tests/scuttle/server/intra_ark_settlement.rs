@@ -67,7 +67,7 @@ async fn intra_ark_settlement_completes_after_crash_between_transactions() {
 	Box::pin(payer.pay_lightning_invoice(invoice, None, false)).await.unwrap();
 	srv.wait_for_lightning_receive_accepted(hash).await;
 	assert!(matches!(Box::pin(receiver.try_claim_lightning_receive(hash, true)).await.unwrap(), LightningReceiveState::Settled(_)));
-	payer.check_lightning_payment(hash, true).await.unwrap();
+	Box::pin(payer.check_lightning_payment(hash, true)).await.unwrap();
 	let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
 	let (subscription, attempt, preimage) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
@@ -81,8 +81,8 @@ async fn intra_ark_settlement_completes_after_crash_between_transactions() {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("initial genuine intra-Ark payment must settle");
-	payer.sync().await;
-	receiver.sync().await;
+	Box::pin(payer.sync()).await;
+	Box::pin(receiver.sync()).await;
 	assert_eq!(payer.balance().await.unwrap().spendable, sat(90_000));
 	assert_eq!(receiver.balance().await.unwrap().spendable, sat(10_000));
 	let payer_history = payer.history().await.unwrap();
@@ -124,10 +124,10 @@ async fn intra_ark_settlement_completes_after_crash_between_transactions() {
 	assert_eq!(sender_snapshot(&db, hash, attempt).await, before, "no second attempt update, fee or send-finished notification");
 	// The existing daemon allocates fresh RPC ports on each start. Reopen the
 	// same wallets with only that endpoint updated, retaining keys and stores.
-	let payer = reopen(&ctx, "payer", payer_config, srv.ark_url()).await;
-	let receiver = reopen(&ctx, "receiver", receiver_config, srv.ark_url()).await;
-	payer.sync().await;
-	receiver.sync().await;
+	let payer = Box::pin(reopen(&ctx, "payer", payer_config, srv.ark_url())).await;
+	let receiver = Box::pin(reopen(&ctx, "receiver", receiver_config, srv.ark_url())).await;
+	Box::pin(payer.sync()).await;
+	Box::pin(receiver.sync()).await;
 	assert_eq!(payer.balance().await.unwrap().spendable, sat(90_000));
 	assert_eq!(receiver.balance().await.unwrap().spendable, sat(10_000));
 	assert_eq!(payer.history().await.unwrap(), payer_history);
