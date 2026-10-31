@@ -162,8 +162,9 @@ impl Wallet {
 		keypair: &Keypair,
 		args: &ImportVtxoArgs,
 	) -> Result<(VtxoState, bool), ImportVtxoError> {
-		ensure!(!args.skip_status_check,
-			"Scuttle imports require authenticated mailbox ownership and status");
+		if args.skip_status_check {
+			return Err(anyhow!("Scuttle imports require authenticated mailbox ownership and status").into());
+		}
 
 		let id = vtxo.id();
 		let spend_state = self.fetch_vtxo_spend_state(id, keypair).await?;
