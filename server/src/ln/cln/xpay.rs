@@ -746,6 +746,7 @@ fn native_xpay_error_code(error: &anyhow::Error) -> Option<i32> {
 fn select_own_payment(payments: Vec<cln_rpc::ListpaysPays>) -> anyhow::Result<cln_rpc::ListpaysPays> {
 	for payment in &payments {
 		ensure!(ListpaysPaysStatus::try_from(payment.status).is_ok(), "unknown native payment status");
+		ensure!(payment.created_index.is_some(), "native payment has no created index");
 	}
 	payments.into_iter().max_by_key(|p| {
 		let priority = match p.status() {
@@ -967,6 +968,9 @@ mod test {
 		assert_eq!(select_own_payment(vec![pending, failed, complete]).unwrap().status(), ListpaysPaysStatus::Complete);
 		assert!(select_own_payment(vec![]).is_err()); // empty is not a failed native record
 		assert!(select_own_payment(vec![cln_rpc::ListpaysPays { status: 99, ..Default::default() }]).is_err());
+		assert!(select_own_payment(vec![cln_rpc::ListpaysPays {
+			status: ListpaysPaysStatus::Failed as i32, ..Default::default()
+		}]).is_err());
 	}
 
 }
