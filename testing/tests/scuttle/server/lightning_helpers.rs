@@ -102,9 +102,61 @@ struct CheckClaim {
 	hold: hold::hold_client::HoldClient<tonic::transport::Channel>,
 	native_payment: bool,
 	checked: Arc<AtomicBool>,
+	// The forwarded claimant is created against this proxy before payment.
+	prepare_wallet: Option<Arc<std::sync::OnceLock<Wallet>>>,
+	prepare_checked: Arc<AtomicBool>,
 }
 #[async_trait::async_trait]
 impl captaind::proxy::ArkRpcProxy for CheckClaim {
+	async fn prepare_lightning_receive_claim(&self, upstream: &mut ArkClient, req: protos::PrepareLightningReceiveClaimRequest)
+		-> Result<protos::PrepareLightningReceiveClaimResponse, tonic::Status> {
+		let response = upstream.prepare_lightning_receive_claim(req.clone()).await?.into_inner();
+		let Some(wallet) = &self.prepare_wallet else { return Ok(response); };
+		if self.prepare_checked.load(Ordering::SeqCst) { return Ok(response); }
+		let wallet = wallet.get().expect("the actual claimant is installed before its invoice is paid");
+		let key = bitcoin::secp256k1::PublicKey::from_slice(&req.user_pubkey).unwrap();
+		let (_, pair) = wallet.pubkey_keypair(&key).await.unwrap().unwrap();
+		let hash = PaymentHash::try_from(req.payment_hash.as_slice()).unwrap();
+		assert_eq!(lightning_subscription_status(&self.db, hash).await.as_deref(), Some("htlcs-ready"));
+		let grants = response.htlc_vtxos.iter().map(|raw| Vtxo::<Full>::deserialize(raw).unwrap()).collect::<Vec<_>>();
+		assert!(!grants.is_empty());
+		assert!(grants.iter().all(|grant| grant.user_pubkey() == key && grant.has_all_witnesses()));
+		let source_ids = grants.iter().flat_map(|grant| grant.transactions().flat_map(|step|
+			step.tx.input.into_iter().map(|input| ark::VtxoId::from(input.previous_output))))
+			.collect::<HashSet<_>>().into_iter().collect::<Vec<_>>();
+		let before = super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await;
+		let source_before = super::expiry_admission::source_rows(&self.db, &source_ids).await;
+		assert!(!source_before.is_empty());
+		assert_ne!(wallet.mailbox_identifier().as_pubkey(), self.other_mailbox.public_key());
+		let native_request = hold::ListRequest { constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())) };
+		let mut hold = self.hold.clone();
+		let native_before = hold.list(native_request.clone()).await.unwrap().into_inner().invoices;
+		assert_eq!(native_before.len(), 1);
+		assert_eq!(native_before[0].state(), hold::InvoiceState::Accepted);
+		let mut missing = req.clone(); missing.owner_proof = None;
+		let mut invalid = req.clone(); invalid.owner_proof.as_mut().unwrap().mailbox_signature = vec![0; 64];
+		let mut conflict = req.clone();
+		conflict.owner_proof = Some(OwnerLink::new_joint(Network::Regtest, self.server.public_key(), &self.other_mailbox, &pair).unwrap().into());
+		for (request, reason) in [(missing, bark::FallbackRefusal::OwnerProofRequired),
+			(invalid, bark::FallbackRefusal::InvalidOwnerProof), (conflict, bark::FallbackRefusal::ConflictingOwnerBinding)] {
+			super::expiry_admission::assert_owner_refusal(upstream.prepare_lightning_receive_claim(request).await.unwrap_err(), key, reason);
+			assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await, before);
+			assert_eq!(super::expiry_admission::source_rows(&self.db, &source_ids).await, source_before);
+			assert_eq!(hold.list(native_request.clone()).await.unwrap().into_inner().invoices, native_before);
+		}
+		let replay = upstream.prepare_lightning_receive_claim(req).await.unwrap().into_inner();
+		let bodies = |raw: &[Vec<u8>]| raw.iter().map(|bytes|
+			(Vtxo::<Full>::deserialize(bytes).unwrap().id(), bytes.clone())).collect::<std::collections::BTreeMap<_, _>>();
+		assert_eq!(bodies(&response.htlc_vtxos).len(), grants.len());
+		assert_eq!(bodies(&replay.htlc_vtxos), bodies(&response.htlc_vtxos));
+		assert_eq!(replay.htlc_vtxos.len(), grants.len());
+		assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await, before);
+		assert_eq!(super::expiry_admission::source_rows(&self.db, &source_ids).await, source_before);
+		assert_eq!(hold.list(native_request).await.unwrap().into_inner().invoices, native_before);
+		self.prepare_checked.store(true, Ordering::SeqCst);
+		Ok(response)
+	}
+
 	async fn claim_lightning_receive(&self, upstream: &mut ArkClient, req: protos::ClaimLightningReceiveRequest)
 		-> Result<protos::ArkoorPackageCosignResponse, tonic::Status> {
 		if self.checked.load(Ordering::SeqCst) {
