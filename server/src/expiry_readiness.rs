@@ -113,7 +113,10 @@ impl Server {
 					Ok(next) => cursor = next,
 					Err(error) => warn!("Expiry readiness pass failed; no incomplete payout authorized: {:#}", error),
 				}
-				match self.db.read(async |tx| tx.expiry_hold_count().await).await {
+				match self.db.write(async |tx| {
+					tx.clear_stale_expiry_holds().await?;
+					tx.expiry_hold_count().await
+				}).await {
 					Ok(count) => crate::telemetry::set_expiry_hold_count(count),
 					Err(error) => warn!("Could not refresh expiry hold gauge: {error:#}"),
 				}

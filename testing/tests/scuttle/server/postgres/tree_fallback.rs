@@ -454,3 +454,21 @@ async fn expiry_fence_releases_only_operator_shares_of_conflicted_allocations() 
 		&[&customer, &entitlement]).await?)).await.unwrap();
 	assert!(fenced().await, "a customer entitlement stays fenced after a conflict");
 }
+
+#[tokio::test]
+async fn expiry_hold_of_a_coin_that_left_the_inventory_is_removed() {
+	let (_ctx, db) = test_db("expiry_hold_left_inventory").await;
+	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
+	let id = coin.id();
+	db.write(async |tx| tx.execute_vtxo_tree_update(
+		VtxoTreeUpdate::new().insert_spendable_vtxos([coin.clone()])).await).await.unwrap();
+	db.write(async |tx| tx.record_expiry_hold(id, "owner_binding_unresolved").await).await.unwrap();
+	assert_eq!(db.write(async |tx| tx.clear_stale_expiry_holds().await).await.unwrap(), 0);
+	assert_eq!(db.read(async |tx| tx.expiry_hold_count().await).await.unwrap(), 1);
+	// The coin is refreshed: it is a round input now and no longer a terminal.
+	let round = insert_dummy_round(&db, 7).await;
+	db.write(async |tx| Ok(tx.execute("UPDATE vtxo SET spend_state='spent', spent_in_round=$2, \
+		updated_at=NOW() WHERE vtxo_id=$1", &[&id.to_string(), &round]).await?)).await.unwrap();
+	assert_eq!(db.write(async |tx| tx.clear_stale_expiry_holds().await).await.unwrap(), 1);
+	assert_eq!(db.read(async |tx| tx.expiry_hold_count().await).await.unwrap(), 0);
+}
