@@ -937,6 +937,10 @@ struct ParkedReceive {
 
 impl ParkedReceive {
 	async fn setup(ctx: &TestContext) -> ParkedReceive {
+		Self::setup_with_failed_attempt(ctx, true).await
+	}
+
+	async fn setup_with_failed_attempt(ctx: &TestContext, failed_attempt_control: bool) -> ParkedReceive {
 		let lightning = ctx.new_lightning_setup("lightningd").await;
 
 		// An unexposed grant stays committed through its expiry in both
@@ -981,13 +985,15 @@ impl ParkedReceive {
 			.expect("the payee was granted HTLC-recv vtxos");
 
 		let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
-		db.write(async |t| {
-			t.query(
-				"UPDATE lightning_payment_attempt SET status = 'failed', updated_at = NOW() WHERE payment_hash = $1",
-				&[&payment_hash.to_string()],
-			).await?;
-			Ok(())
-		}).await.unwrap();
+		if failed_attempt_control {
+			db.write(async |t| {
+				t.query(
+					"UPDATE lightning_payment_attempt SET status = 'failed', updated_at = NOW() WHERE payment_hash = $1",
+					&[&payment_hash.to_string()],
+				).await?;
+				Ok(())
+			}).await.unwrap();
+		}
 
 		let payer = bark_payer.client().await;
 		ParkedReceive { _lightning: lightning, _proxy: proxy, srv, payer, payee, payment_hash, htlc_recv_expiry, release, payee_task }
@@ -1058,6 +1064,67 @@ impl ParkedReceive {
 			.expect_err("claim should be refused after grant expiry");
 		assert_eq!(self.payee.spendable_balance().await, Amount::ZERO);
 	}
+}
+
+#[tokio::test]
+async fn late_intra_ark_claim_does_not_let_sender_revoke() {
+	require_bark_version!(> "0.5.0");
+	let ctx = TestContext::new("server/late_intra_ark_claim_does_not_let_sender_revoke").await;
+	let mut parked = ParkedReceive::setup_with_failed_attempt(&ctx, false).await;
+	let grants = parked.srv.htlc_vtxos(parked.payment_hash).await.into_iter()
+		.filter(|htlc| htlc.direction() == HtlcDirection::Outgoing).collect::<Vec<_>>();
+	let lowest = grants.iter().map(|grant| grant.htlc_expiry()).min().unwrap();
+	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+	let boundary = lowest.saturating_sub(BlockDelta::new(3));
+	assert!(boundary > tip);
+	let tip = ctx.generate_blocks(boundary.checked_blocks_since(tip).unwrap()).await;
+	parked.srv.wait_for_sync_height(tip).await;
+	parked.srv.watchmand().wait_for_sync_height(tip).await;
+	parked.release.notify_one();
+	(&mut parked.payee_task).wait_millis(120_000).await.unwrap().unwrap();
+	let tip = ctx.generate_blocks(lowest.to_u32() + 1 - tip.to_u32()).await;
+	parked.srv.wait_for_sync_height(tip).await;
+	parked.srv.watchmand().wait_for_sync_height(tip).await;
+	let db = Db::connect(&parked.srv.config().postgres, Network::Regtest).await.unwrap();
+	assert_eq!(lightning_subscription_status(&db, parked.payment_hash).await.as_deref(), Some("settled"));
+	assert!(parked.srv.htlc_vtxos(parked.payment_hash).await.iter()
+		.filter(|htlc| htlc.direction() == HtlcDirection::Outgoing)
+		.all(|htlc| htlc.htlc.resolution() == Some(server::database::htlc_vtxo::HtlcResolution::Fulfilled)));
+	let refusal = parked.revoke().await.expect_err("a fulfilled grant never releases the sender's refund");
+	assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
+	Box::pin(parked.payer.check_lightning_payment(parked.payment_hash, true)).wait_millis(30_000).await.unwrap();
+	assert_eq!(parked.payee.spendable_balance().await, btc(1));
+	assert_eq!(parked.payer.balance().await.unwrap().spendable, btc(1));
+}
+
+#[tokio::test]
+async fn claim_refused_past_grant_expiry() {
+	require_bark_version!(> "0.5.0");
+	let ctx = TestContext::new("server/claim_refused_past_grant_expiry").await;
+	let mut parked = ParkedReceive::setup_with_failed_attempt(&ctx, false).await;
+	let grants = parked.srv.htlc_vtxos(parked.payment_hash).await.into_iter()
+		.filter(|htlc| htlc.direction() == HtlcDirection::Outgoing).collect::<Vec<_>>();
+	let lowest = grants.iter().map(|grant| grant.htlc_expiry()).min().unwrap();
+	let db = Db::connect(&parked.srv.config().postgres, Network::Regtest).await.unwrap();
+	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(parked.payment_hash).await).await.unwrap().unwrap();
+	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+	// The existing three-block margin closes before the incoming-side guard.
+	let refused = lowest.saturating_sub(BlockDelta::new(2));
+	assert!(refused > tip);
+	assert!(refused + parked.srv.config().htlc_expiry_delta <= sub.lowest_incoming_htlc_expiry.unwrap());
+	let tip = ctx.generate_blocks(refused.checked_blocks_since(tip).unwrap()).await;
+	parked.srv.wait_for_sync_height(tip).await;
+	parked.srv.watchmand().wait_for_sync_height(tip).await;
+	parked.release.notify_one();
+	let error = (&mut parked.payee_task).wait_millis(120_000).await.unwrap()
+		.expect_err("the original claim must be refused past its granted expiry margin");
+	assert!(format!("{error:#}").contains("HTLC receive grant is too close to expiry"), "{error:#}");
+	assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(parked.payment_hash).await).await.unwrap().is_none());
+	assert_eq!(parked.payee.spendable_balance().await, Amount::ZERO);
+	assert_eq!(parked.payer.balance().await.unwrap().pending_lightning_send, btc(1));
+	assert!(parked.srv.htlc_vtxos(parked.payment_hash).await.iter()
+		.filter(|htlc| htlc.direction() == HtlcDirection::Outgoing)
+		.all(|grant| grant.htlc.resolution().is_none()));
 }
 
 /// The payer of an intra-ark payment tries to revoke at every block height

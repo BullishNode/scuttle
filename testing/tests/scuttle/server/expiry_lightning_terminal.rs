@@ -362,6 +362,12 @@ async fn exposed_small_receive_grant_refunds_absent_sender_after_six_confirmatio
 }
 
 #[tokio::test]
+async fn grant_sweep_waits_for_revoked_depth() {
+	tokio::time::timeout(Duration::from_secs(180), internal_safe_pool_grants(false, true, false)).await
+		.expect("revoked grant depth and original sender payout timed out");
+}
+
+#[tokio::test]
 async fn expired_internal_source_waits_for_six_confirmed_grant_reclamations() {
 	internal_safe_pool_grants(false, false, true).await;
 }
@@ -597,7 +603,47 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 			 JOIN expiry_entitlement e ON e.id = c.entitlement_id
 			 WHERE e.vtxo_id = $1 AND c.disposition = 'customer'",
 			&[&source.to_string()]).await?)).await.unwrap().is_none(), "sender refund must wait for six grant confirmations");
-		ctx.generate_blocks(1).await;
+		let fact = db.read(async |t| {
+			let snapshot = t.backing_snapshot(&[ark::ServerVtxo::from(incoming[0].clone()).to_bare()],
+				server::database::expiry_inventory::BackingSnapshotLimits {
+					max_rows: 250_000, max_serialized_bytes: 256 * 1024 * 1024,
+				}).await?;
+			Ok(snapshot.regular.into_iter().find(|fact| fact.state.vtxo_id == source).unwrap())
+		}).await.unwrap();
+		let funding = ctx.bitcoind().await_transaction(incoming[0].chain_anchor().txid).await;
+		let proposal = db.read(async |t| t.propose_expiry_ownership(&fact, &funding, height, Some(height)).await).await.unwrap();
+		assert!(matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Unresolved(_)));
+		let height = ctx.generate_blocks(1).await;
+		srv.wait_for_sync_height(height).await;
+		srv.watchmand().wait_for_sync_height(height).await;
+		let mut least_depth = u32::MAX;
+		for grant in &grants {
+			let row = db.read(async |t| Ok(t.query_one("SELECT chain_resolution::TEXT,chain_resolution_height \
+				FROM htlc_vtxo h JOIN vtxo v ON v.id=h.id WHERE v.vtxo_id=$1", &[&grant.id().to_string()]).await?)).await.unwrap();
+			assert_eq!(row.get::<_, &str>("chain_resolution"), "revoked");
+			let resolved = u32::try_from(row.get::<_, i32>("chain_resolution_height")).unwrap();
+			least_depth = least_depth.min(height.to_u32() - resolved + 1);
+		}
+		assert_eq!(least_depth, 6);
+		let point = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
+		tokio::time::timeout(Duration::from_secs(10), async {
+			loop {
+				let proposal = db.read(async |t| {
+					let Some(view) = t.expiry_rebuild_token().await? else { return Ok(None); };
+					if view.captaind != point || view.watchmand != point { return Ok(None); }
+					Ok(Some(t.propose_expiry_ownership(&fact, &funding,
+						view.captaind.height, Some(view.watchmand.height)).await?))
+				}).await.unwrap();
+				if let Some(proposal) = proposal {
+					if matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Customer { user_pubkey } if user_pubkey == key.public_key()) {
+						assert!(matches!(proposal.evidence,
+							Some(server::database::expiry_ownership::OwnershipEvidence::HtlcInternalGrantsReclaimed { payment_hash, .. }) if payment_hash == hash));
+						break;
+					}
+				}
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+		}).await.expect("at N6 the actual revoked grants must release their exact failed funding source");
 	}
 	// Reach the original 100-block reaction window for this long-lived source.
 	if !past_source_expiry {
