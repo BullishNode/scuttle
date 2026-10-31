@@ -851,7 +851,7 @@ impl Server {
 			LightningHtlcSubscriptionStatus::Accepted => {}, // we continue
 			LightningHtlcSubscriptionStatus::HtlcsReady => {
 				// we already did this, let's fetch the vtxos and return them
-				let vtxos = self.db.read(async |t| {
+				let vtxos = self.db.write(async |t| {
 					let vtxos = t.get_user_vtxos_by_id(&sub.htlc_vtxos).await?.into_iter()
 						.map(|v| v.vtxo).collect::<Vec<_>>();
 					owner_links.verify_existing_grant(t, user_pubkey, &vtxos,
