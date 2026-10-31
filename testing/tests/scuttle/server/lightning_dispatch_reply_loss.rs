@@ -202,7 +202,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 	let refund_amount = source_amount - refund_fee;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).lightningd(&lightning.internal)
 		.no_vtxo_pool().funded(btc(10)).cfg(move |config| {
-			config.vtxo_lifetime = BlockDelta::new(24);
+			config.vtxo_lifetime = BlockDelta::new(if no_delay_room || initial_zero_delay { 400 } else { 24 });
 			config.vtxo_exit_delta = BlockDelta::new(3);
 			// Final CLTV18 plus at most one regtest forwarding delta6 fits
 			// the existing native margin; no production deadline is qualified.
@@ -253,7 +253,11 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 	}
 	assert_ne!(roots[0], roots[1]);
 	assert_eq!(grants[0].expiry_height(), grants[1].expiry_height());
-	assert!(deadline > grants[0].expiry_height());
+	if no_delay_room || initial_zero_delay {
+		assert!(grants[0].expiry_height() > deadline, "zero-room cases need a still-live signed source");
+	} else {
+		assert!(deadline > grants[0].expiry_height());
+	}
 	// Fund the invoice and declared user fee exactly; forwarding cost is
 	// paid from that fee rather than silently taking extra principal.
 	let fee = srv.config().fees.lightning_send.calculate(sat(100_000),
@@ -430,7 +434,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 			super::expiry_internal_partial_terminal::confirm_actual_path(&ctx, source, &mut seen).await;
 			let clause = source.policy().as_server_htlc_send().unwrap().user_claim_after_expiry_clause(source.exit_delta());
 			let height = ctx.bitcoind().get_block_count().await as u32;
-			let target = clause.timelock_height.to_u32().max(height + source.exit_delta().to_u32());
+			let target = clause.timelock_height.to_u32().max(height + clause.block_delta.to_u32());
 			ctx.generate_blocks(target - height).await;
 			let mut claim = Transaction {
 				version: bitcoin::transaction::Version::TWO,
