@@ -532,6 +532,18 @@ async fn original_signed_xpay_invoice_survives_reopen_and_outcome_writes() {
 	assert_eq!(restored, row);
 	assert_eq!(restored.signed_invoice.as_deref(), Some(BOLT11_INVOICE));
 	assert_eq!(restored.original_invoice().unwrap(), invoice);
+	assert_eq!(restored.dispatch_count, Some(0));
+	let first = db.write(async |tx| xpay::increment_xpay_dispatch(&**tx, &restored).await).await.unwrap().unwrap();
+	assert_eq!(first.dispatch_count, Some(1));
+	let (left, right) = tokio::join!(
+		db.write(async |tx| xpay::increment_xpay_dispatch(&**tx, &first).await),
+		db.write(async |tx| xpay::increment_xpay_dispatch(&**tx, &first).await),
+	);
+	let (left, right) = (left.unwrap(), right.unwrap());
+	assert_eq!(usize::from(left.is_some()) + usize::from(right.is_some()), 1, "one stale admission loses its counter CAS");
+	let second = left.or(right).unwrap();
+	assert_eq!(second.dispatch_count, Some(2));
+	assert!(db.write(async |tx| xpay::increment_xpay_dispatch(&**tx, &restored).await).await.unwrap().is_none());
 	let original_attempt = db.read(async |tx| tx.get_open_lightning_payment_attempt_by_payment_hash(new.payment_hash).await).await.unwrap().unwrap();
 	assert_eq!(restored.label, Some(original_attempt.id.to_string()));
 	assert_eq!(restored.payment_amount_msat, original_attempt.amount_msat);
@@ -549,4 +561,16 @@ async fn original_signed_xpay_invoice_survives_reopen_and_outcome_writes() {
 	let ended = db.write(async |tx| xpay::mark_xpay_fail(&**tx, row.id, None).await).await.unwrap().unwrap();
 	assert_eq!(ended.signed_invoice, restored.signed_invoice);
 	assert_eq!(ended.original_invoice().unwrap(), invoice);
+	assert_eq!(ended.dispatch_count, Some(2));
+	assert!(db.write(async |tx| xpay::increment_xpay_dispatch(&**tx, &second).await).await.unwrap().is_none(), "a terminal row admits no new call");
+	// A raw imported/backfill-shaped row omits the new column. No DEFAULT may
+	// turn unknown history into a certified first dispatch.
+	let unknown_id = db.write(async |tx| Ok(tx.query_one("INSERT INTO cln_xpay \
+		(lightning_node_id,payment_amount_msat,attempt_expiry,payment_hash,label,signed_invoice) \
+		VALUES($1,2000,NOW(),$2,'unqualified-import',$3) RETURNING id",
+		&[&node, &new.payment_hash.to_string(), &invoice.to_string()]).await?.get::<_, i64>(0))).await.unwrap();
+	let unknown = db.read(async |tx| xpay::get_xpay_by_id(&**tx, unknown_id).await).await.unwrap().unwrap();
+	assert_eq!(unknown.dispatch_count, None);
+	let error = db.write(async |tx| xpay::increment_xpay_dispatch(&**tx, &unknown).await).await.unwrap_err();
+	assert!(format!("{error:#}").contains("unknown xpay dispatch history"));
 }
