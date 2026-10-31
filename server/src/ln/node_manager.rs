@@ -32,7 +32,7 @@
 //! broadcasts the result without making a backend round-trip.
 
 use std::fmt;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1171,6 +1171,27 @@ impl LightningManagerProcess {
 		// Republish the snapshot so the manager's getters see the latest set
 		// of online nodes.
 		self.publish();
+		self.alarm_unreachable_obligations().await;
+	}
+
+	/// Payments and receives stay open while their node is unreachable: only
+	/// that node can tell whether a payment went out or cancel a hold invoice.
+	/// Keep them open and say so on every pass, so a removed or failing node
+	/// is noticed before its obligations reach their expiry.
+	async fn alarm_unreachable_obligations(&self) {
+		let online = self.nodes.values().filter_map(|node| match node.state {
+			NodeState::Online(ref state) => Some(state.id),
+			_ => None,
+		}).collect::<HashSet<_>>();
+		match self.db.read(async |t| t.open_lightning_obligations_by_node().await).await {
+			Ok(nodes) => for (id, attempts, receives) in nodes {
+				if !online.contains(&id) && attempts + receives > 0 {
+					error!("Lightning node {id} is not online but has {attempts} open payment attempts \
+						and {receives} open receives; they stay open until the node is back");
+				}
+			},
+			Err(e) => warn!("Could not count open Lightning obligations per node: {e:#}"),
+		}
 	}
 
 	async fn disable_node(&mut self, uri: &Uri) {
