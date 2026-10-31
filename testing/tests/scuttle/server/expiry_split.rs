@@ -81,12 +81,16 @@ async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
 			let result = db.write(async |t| {
 				let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
 				if !t.expiry_view_is_rebuilt(view).await? { return Ok(false); }
-				t.request_expiry_split(view, &root).await
+				let requested = t.request_expiry_split(view, &root).await?;
+				if requested { t.record_expiry_hold(root.id(), "output_requires_split").await?; }
+				Ok(requested)
 			}).await.unwrap();
 			if result { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("actual signed checkpoint paths should authorize this split");
+	assert!(db.read(async |t| t.list_expiry_holds().await).await.unwrap().iter()
+		.any(|hold| hold.vtxo_id == root.id() && hold.reason == "output_requires_split"));
 	ctx.bitcoind().await_transaction(input.point().txid).await;
 	// Confirm the board exit, then allow the configured watchtower grace
 	// period to pass. Waiting in wall-clock time cannot advance this policy.
@@ -95,6 +99,8 @@ async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
 	let progressed = ctx.generate_blocks(1).await;
 	srv.wait_for_sync_height(progressed).await;
 	srv.watchmand().wait_for_sync_height(progressed).await;
+	assert!(!db.read(async |t| t.list_expiry_holds().await).await.unwrap().iter()
+		.any(|hold| hold.vtxo_id == root.id()), "a confirmed matching prefix resolves its old physical-parent split hold");
 	let first = payout(&db, ordinary).await;
 	assert_eq!(ctx.bitcoind().await_transaction(first.compute_txid()).await, first);
 	let backing = first.input.iter().map(|i| ark::VtxoId::from(i.previous_output)).collect::<Vec<_>>();

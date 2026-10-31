@@ -104,6 +104,7 @@ impl VtxoExitFrontier {
 						crate::database::ln::HtlcSettlementOrigin::Onchain(vtxo_id)).await?
 				} else { None };
 				t.register_vtxo_spend(vtxo_id, spent_height, spent_txid).await?;
+				t.clear_completed_split_hold(vtxo_id, spent_txid).await?;
 				if let Some(resolution) = chain_resolution {
 					htlc_vtxo::set_htlc_vtxo_chain_resolution(
 						&t, vtxo_id, resolution, spent_height,
