@@ -20,7 +20,7 @@ use bitcoin_ext::{BlockDelta, BlockHeight, TxOutExt};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use ark::arkoor::ArkoorDestination;
 use ark::attestations::ArkoorCosignAttestation;
-use ark::vtxo::Full;
+use ark::vtxo::{Full, HashDelaySignClause};
 use ark::vtxo::TapScriptClause;
 use ark::vtxo::policy::VtxoPolicyKind;
 use bark::Wallet;
@@ -30,6 +30,7 @@ use server_log::{LightningReceiveCanceled, LightningReceiveKeptCommitted};
 use server_rpc::protos;
 use server::database::Db;
 use server::database::htlc_vtxo::HtlcDirection;
+use server::database::ln::SourceSettlement;
 use server::vtxopool::VtxoTarget;
 
 use ark_testing::{Bark, Captaind, TestContext, btc, lightning_test, require_bark_version, sat};
@@ -233,6 +234,66 @@ async fn server_settles_invoice_from_on_chain_htlc_preimage(
 			ctx.generate_blocks(1).await;
 		},
 	);
+
+	if ctx.test_name == "lightningd/intra_server_settles_invoice_from_on_chain_htlc_preimage" {
+		let hash = PaymentHash::from(&Bolt11Invoice::from_str(&invoice_info.invoice).unwrap());
+		let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+		let subscription = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
+			.await.unwrap().unwrap();
+		assert_eq!(subscription.payment_hash, hash);
+		assert!(!subscription.htlc_vtxos.is_empty());
+		let attempt = db.read(async |tx| tx.get_lightning_payment_attempt_by_subscription_id(subscription.id).await)
+			.await.unwrap().expect("this intra-Ark receive has an actual funding attempt");
+		assert_eq!(attempt.payment_hash, hash);
+		assert_eq!(attempt.lightning_htlc_subscription_id, Some(subscription.id));
+		let sources = db.read(async |tx| Ok(tx.query("SELECT l.vtxo_id,h.payment_hash,h.direction::TEXT \
+			FROM lightning_payment_attempt_htlc_vtxo l JOIN vtxo v ON v.vtxo_id=l.vtxo_id \
+			JOIN htlc_vtxo h ON h.id=v.id WHERE l.lightning_payment_attempt_id=$1 ORDER BY l.vtxo_id",
+			&[&attempt.id]).await?)).await.unwrap();
+		assert!(!sources.is_empty());
+		for grant_id in &subscription.htlc_vtxos {
+			let grant = db.read(async |tx| server::database::htlc_vtxo::get_htlc_vtxo(tx, *grant_id).await)
+				.await.unwrap().unwrap();
+			assert_eq!(grant.direction(), HtlcDirection::Outgoing);
+			assert_eq!(grant.htlc.payment_hash, hash);
+			assert_eq!(grant.htlc.chain_resolution, Some(server::database::htlc_vtxo::HtlcResolution::Fulfilled));
+			let spent = db.read(async |tx| Ok(tx.query_one("SELECT onchain_spent_txid,onchain_spent_height,lightning_htlc_subscription_id \
+				FROM vtxo WHERE vtxo_id=$1", &[&grant_id.to_string()]).await?)).await.unwrap();
+			assert_eq!(spent.get::<_, Option<i64>>("lightning_htlc_subscription_id"), Some(subscription.id));
+			let txid = spent.get::<_, Option<&str>>("onchain_spent_txid").unwrap().parse().unwrap();
+			let height = BlockHeight::try_from(spent.get::<_, Option<i32>>("onchain_spent_height").unwrap()).unwrap();
+			assert_eq!(grant.htlc.chain_resolution_height, Some(height));
+			let actual = ctx.bitcoind().await_transaction(txid).await;
+			let block = ctx.bitcoind().sync_client().get_block(&ctx.bitcoind().sync_client()
+				.get_block_hash(u64::from(height.to_u32())).unwrap()).unwrap();
+			assert!(block.txdata.contains(&actual), "the recorded grant resolution must be in its actual canonical block");
+			let input = actual.input.iter().find(|input| input.previous_output == grant_id.to_point()).unwrap();
+			let preimage = HashDelaySignClause::extract_preimage_from_witness(&input.witness, hash)
+				.expect("the actual outgoing grant spend reveals this payment's preimage");
+			let clause = grant.vtxo.vtxo.policy().as_server_htlc_recv().unwrap()
+				.user_reveals_preimage_clause(grant.vtxo.vtxo.exit_delta());
+			let leaf = input.witness.taproot_leaf_script().unwrap();
+			assert_eq!(leaf.version, bitcoin::taproot::LeafVersion::TapScript);
+			assert_eq!(leaf.script, clause.tapscript().as_script());
+			let origins = db.read(async |tx| Ok(tx.query("SELECT p.attempt_id,p.subscription_id,s.preimage \
+				FROM htlc_settlement_source p JOIN htlc_settlement s ON s.id=p.settlement_id \
+				WHERE s.payment_hash=$1 AND p.kind='onchain' AND p.vtxo_id=$2",
+				&[&hash.to_string(), &grant_id.to_string()]).await?)).await.unwrap();
+			assert_eq!(origins.len(), 2, "the witness retains its own origin and its authentic funding-attempt link");
+			assert_eq!(origins.iter().map(|row| row.get::<_, Option<i64>>("attempt_id")).collect::<HashSet<_>>(),
+				HashSet::from([None, Some(attempt.id)]));
+			for origin in origins {
+				assert_eq!(origin.get::<_, Option<i64>>("subscription_id"), Some(subscription.id));
+				assert_eq!(origin.get::<_, &str>("preimage"), preimage.to_string());
+			}
+		}
+		for source in sources {
+			assert_eq!(source.get::<_, &str>("payment_hash"), hash.to_string());
+			assert_eq!(source.get::<_, &str>("direction"), "incoming");
+			let id = source.get::<_, &str>("vtxo_id").parse().unwrap();
+			assert_eq!(db.read(async |tx| tx.source_settlement(hash, id).await).await.unwrap(), SourceSettlement::Funded);
+		}
+	}
 
 	assert_vtxopool_consistency(srv).await;
 }
