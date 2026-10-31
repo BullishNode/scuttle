@@ -40,9 +40,11 @@ async fn fallback_links_are_authenticated_conflict_safe_and_transactional() {
 	let script = ScriptBuf::new_p2tr(&SECP, mailbox.x_only_public_key().0, None);
 	let link = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap();
 	let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!("../../../../lib/testdata/owner-joint-v2.json")).unwrap();
-	let resigned = vectors.iter().find(|vector| vector["network"] == "regtest"
+	let vector = vectors.iter().find(|vector| vector["network"] == "regtest"
 		&& vector["mailbox"] == mailbox.public_key().to_string()).unwrap();
-	let resigned = ark::fallback::OwnerLink::deserialize_hex(resigned["resigned_proof"].as_str().unwrap()).unwrap();
+	// The server's payout script for this mailbox is the frozen BIP86 vector.
+	assert_eq!(script.to_hex_string(), vector["payout_script"]);
+	let resigned = ark::fallback::OwnerLink::deserialize_hex(vector["resigned_proof"].as_str().unwrap()).unwrap();
 	assert_ne!(link.signature, resigned.signature);
 	assert_eq!(resigned.verify_joint(Network::Regtest, &server, coin.public_key()).unwrap().as_pubkey(), mailbox.public_key());
 	let binding_rows = async |key: PublicKey| db.read(async |tx| Ok(tx.query(

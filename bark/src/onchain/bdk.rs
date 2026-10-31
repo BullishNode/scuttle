@@ -657,7 +657,7 @@ mod fallback_tests {
 			let mailbox = master.derive_priv(&secp, &path).unwrap().to_keypair(&secp);
 			let sdk_seed = crate::WalletSeed::new_from_mnemonic(network, &mnemonic);
 			assert_eq!(sdk_seed.to_mailbox_keypair().public_key(), mailbox.public_key());
-			let script = ScriptBuf::new_p2tr(&secp, mailbox.x_only_public_key().0, None);
+			let script = ark::fallback::payout_script(mailbox.public_key());
 			let native = BdkWallet::create_single(bdk_wallet::template::Bip86(master, KeychainKind::External))
 				.network(network).create_wallet_no_persist().unwrap();
 			assert_eq!(native.peek_address(KeychainKind::External, 0).address.script_pubkey(), script);
