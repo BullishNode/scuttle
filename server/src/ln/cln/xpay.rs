@@ -870,6 +870,7 @@ fn maxdelay_until(
 ) -> anyhow::Result<BlockDelta> {
 	let tip = cln_tip.max(server_tip).max(attempt_height);
 	let blocks = deadline.checked_blocks_since(tip).context("source deadline passed before xpay dispatch")?;
+	ensure!(blocks > 0, "no source delay remains before xpay dispatch");
 	Ok(BlockDelta::try_from(blocks).unwrap_or(BlockDelta::MAX))
 }
 
@@ -902,6 +903,7 @@ fn request_matches(
 		&& record.max_routing_fee_msat == request.maxfee.as_ref().map(|v| v.msat)
 		&& attempt.max_routing_fee.map(|v| v.to_msat()) == record.max_routing_fee_msat
 		&& attempt.retry_for == Some(retry_for) && request.retry_for == u32::try_from(retry_for.as_secs()).ok()
+		&& request.maxdelay.is_some_and(|blocks| blocks > 0)
 		&& request.partial_msat.is_none() && request.layers.is_empty()
 		&& request.payer_note.is_none() && request.localinvreqid.is_none() && request.dev_use_shadow.is_none()
 }
@@ -1097,6 +1099,12 @@ mod test {
 		assert_eq!(maxdelay_until(height(200), height(130), height(120), height(110)).unwrap(), BlockDelta::new(70));
 		assert_eq!(maxdelay_until(height(200), height(90), height(120), height(140)).unwrap(), BlockDelta::new(60));
 		assert!(maxdelay_until(height(200), height(90), height(201), height(110)).is_err());
+		assert!(maxdelay_until(height(200), height(200), height(120), height(110)).is_err());
+		assert!(maxdelay_until(height(200), height(90), height(200), height(110)).is_err());
+		assert!(maxdelay_until(height(200), height(90), height(120), height(200)).is_err());
+		assert_eq!(maxdelay_until(height(200), height(199), height(120), height(110)).unwrap(), BlockDelta::new(1));
+		assert_eq!(maxdelay_until(height(200), height(90), height(199), height(110)).unwrap(), BlockDelta::new(1));
+		assert_eq!(maxdelay_until(height(200), height(90), height(120), height(199)).unwrap(), BlockDelta::new(1));
 	}
 
 	#[test]
@@ -1199,6 +1207,10 @@ mod test {
 			let request = xpay_request(&invoice, amount, fee, BlockDelta::new(20), retry, "42".into());
 			assert_eq!(request.amount_msat.as_ref().map(|a| a.msat), if fixed_msat.is_some() { None } else { Some(amount.to_msat()) });
 			assert!(request_matches(&record, &attempt, &request, amount, retry));
+			for maxdelay in [None, Some(0)] {
+				let mut no_room = request.clone(); no_room.maxdelay = maxdelay;
+				assert!(!request_matches(&record, &attempt, &no_room, amount, retry));
+			}
 			for count in [None, Some(0), Some(1), Some(2), Some(100)] {
 				let mut historical = record.clone(); historical.dispatch_count = count;
 				assert_eq!(first_dispatch_only(&historical), count == Some(1));
