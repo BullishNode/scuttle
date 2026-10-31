@@ -783,12 +783,18 @@ fn request_matches(
 	record: &ClnXpayRecord, attempt: &LightningPaymentAttempt,
 	request: &cln_rpc::XpayRequest, amount: Amount, retry_for: Duration,
 ) -> bool {
+	let Ok(invoice) = record.original_invoice() else { return false; };
+	let expected_amount = match invoice.amount_msat() {
+		Some(msat) if msat == record.payment_amount_msat => None,
+		Some(_) => return false,
+		None => Some(record.payment_amount_msat),
+	};
 	record.status == ClnXpayStatus::Pending && record.error_code.is_none()
 		&& !attempt.is_self_payment() && !attempt.status.is_final()
 		&& record.lightning_node_id == attempt.lightning_node_id
 		&& record.payment_hash == attempt.payment_hash
 		&& record.payment_amount_msat == amount.to_msat() && attempt.amount_msat == amount.to_msat()
-		&& request.amount_msat.as_ref().map(|value| value.msat) == Some(record.payment_amount_msat)
+		&& request.amount_msat.as_ref().map(|value| value.msat) == expected_amount
 		&& record.label.as_deref() == Some(attempt.id.to_string().as_str())
 		&& record.signed_invoice.as_deref() == Some(request.invstring.as_str())
 		&& request.label == record.label && record.partial_msat.is_none()
@@ -934,6 +940,24 @@ async fn call_xpay(
 #[cfg(test)]
 mod test {
 	use super::*;
+	use bitcoin::hashes::{sha256, Hash};
+	use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+	use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+
+	fn binding_invoice(fixed_amount: bool, amount: Amount) -> Invoice {
+		let secp = Secp256k1::new();
+		let key = SecretKey::from_slice(&[3; 32]).unwrap();
+		let builder = InvoiceBuilder::new(Currency::Regtest)
+			.description("original request binding".into())
+			.payment_hash(sha256::Hash::hash(b"request binding preimage"))
+			.payment_secret(PaymentSecret([42; 32]))
+			.duration_since_epoch(Duration::from_secs(1_700_000_000))
+			.min_final_cltv_expiry_delta(144);
+		let sign = |hash: &Message| secp.sign_ecdsa_recoverable(hash, &key);
+		Invoice::Bolt11(if fixed_amount {
+			builder.amount_milli_satoshis(amount.to_msat()).build_signed(sign)
+		} else { builder.build_signed(sign) }.unwrap())
+	}
 
 	#[test]
 	fn maxdelay_is_bounded_by_every_observed_or_recorded_height() {
@@ -1018,52 +1042,54 @@ mod test {
 
 	#[test]
 	fn native_no_route_cannot_certify_a_stale_or_different_request() {
-		let now = Local::now();
-		let hash = Preimage::random().compute_payment_hash();
-		let retry = Duration::from_secs(5);
-		let amount = Amount::from_sat(90_000);
-		let fee = Amount::from_sat(1_000);
-		let attempt = LightningPaymentAttempt {
-			id: 42, lightning_node_id: 7, payment_hash: hash, amount_msat: amount.to_msat(),
-			final_amount_msat: None, status: LightningPaymentStatus::Requested,
-			lightning_htlc_subscription_id: None, error: None, block_height: None,
-			user_fee: None, user_agent: None, retry_for: Some(retry), max_routing_fee: Some(fee),
-			created_at: now, updated_at: now,
-		};
-		let record = ClnXpayRecord {
-			id: 8, lightning_node_id: 7, payment_hash: hash, payment_amount_msat: amount.to_msat(),
-			signed_invoice: Some("original request".into()),
-			max_routing_fee_msat: Some(fee.to_msat()), attempt_expiry: now,
-			partial_msat: None, htlc_expiry: Some(bitcoin_ext::BlockHeight::new(200)), label: Some("42".into()),
-			user_fee_msat: None, user_agent: None, status: ClnXpayStatus::Pending,
-			routing_fee_msat: None, error_code: None, created_at: now, updated_at: now,
-		};
-		let request = cln_rpc::XpayRequest {
-			invstring: "original request".into(), amount_msat: Some(amount.into()), maxfee: Some(fee.into()), retry_for: Some(5),
-			maxdelay: Some(20), label: Some("42".into()), ..Default::default()
-		};
-		assert!(request_matches(&record, &attempt, &request, amount, retry));
-		for change in 0..8 {
-			let mut bad = record.clone();
-			match change {
-				0 => bad.label = Some("41".into()),
-				1 => bad.lightning_node_id += 1,
-				2 => bad.payment_hash = Preimage::random().compute_payment_hash(),
-				3 => bad.payment_amount_msat += 1,
-				4 => bad.status = ClnXpayStatus::Fail,
-				5 => bad.error_code = Some(205), // copied/old receipt is never fresh authority
-				6 => bad.signed_invoice = None,
-				7 => bad.signed_invoice = Some("substituted invoice".into()),
-				_ => unreachable!(),
+		for fixed_amount in [false, true] {
+			let now = Local::now();
+					let retry = Duration::from_secs(5);
+			let amount = Amount::from_sat(90_000);
+			let fee = Amount::from_sat(1_000);
+			let invoice = binding_invoice(fixed_amount, amount);
+			let hash = invoice.payment_hash();
+			let attempt = LightningPaymentAttempt {
+				id: 42, lightning_node_id: 7, payment_hash: hash, amount_msat: amount.to_msat(),
+				final_amount_msat: None, status: LightningPaymentStatus::Requested,
+				lightning_htlc_subscription_id: None, error: None, block_height: None,
+				user_fee: None, user_agent: None, retry_for: Some(retry), max_routing_fee: Some(fee),
+				created_at: now, updated_at: now,
+			};
+			let record = ClnXpayRecord {
+				id: 8, lightning_node_id: 7, payment_hash: hash, payment_amount_msat: amount.to_msat(),
+				signed_invoice: Some(invoice.to_string()),
+				max_routing_fee_msat: Some(fee.to_msat()), attempt_expiry: now,
+				partial_msat: None, htlc_expiry: Some(bitcoin_ext::BlockHeight::new(200)), label: Some("42".into()),
+				user_fee_msat: None, user_agent: None, status: ClnXpayStatus::Pending,
+				routing_fee_msat: None, error_code: None, created_at: now, updated_at: now,
+			};
+			let request = xpay_request(&invoice, amount, fee, BlockDelta::new(20), retry, "42".into());
+			assert_eq!(request.amount_msat.as_ref().map(|a| a.msat), if fixed_amount { None } else { Some(amount.to_msat()) });
+			assert!(request_matches(&record, &attempt, &request, amount, retry));
+			for change in 0..8 {
+				let mut bad = record.clone();
+				match change {
+					0 => bad.label = Some("41".into()),
+					1 => bad.lightning_node_id += 1,
+					2 => bad.payment_hash = Preimage::random().compute_payment_hash(),
+					3 => bad.payment_amount_msat += 1,
+					4 => bad.status = ClnXpayStatus::Fail,
+					5 => bad.error_code = Some(205), // copied/old receipt is never fresh authority
+					6 => bad.signed_invoice = None,
+					7 => bad.signed_invoice = Some("substituted invoice".into()),
+					_ => unreachable!(),
+				}
+				assert!(!request_matches(&bad, &attempt, &request, amount, retry));
 			}
-			assert!(!request_matches(&bad, &attempt, &request, amount, retry));
+			let mut stale = request.clone();
+			stale.label = Some("41".into());
+			assert!(!request_matches(&record, &attempt, &stale, amount, retry));
+			stale = request.clone();
+			stale.amount_msat = if fixed_amount { Some(amount.into()) } else { None };
+			assert!(!request_matches(&record, &attempt, &stale, amount, retry));
+			assert!(!request_matches(&record, &attempt, &request, amount, retry + Duration::from_secs(1)));
 		}
-		let mut stale = request.clone();
-		stale.label = Some("41".into());
-		assert!(!request_matches(&record, &attempt, &stale, amount, retry));
-		stale = request.clone(); stale.amount_msat = None;
-		assert!(!request_matches(&record, &attempt, &stale, amount, retry));
-		assert!(!request_matches(&record, &attempt, &request, amount, retry + Duration::from_secs(1)));
 	}
 
 	#[test]
