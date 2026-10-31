@@ -309,6 +309,169 @@ lightning_test!(server_settles_invoice_from_on_chain_htlc_preimage, watchmand, |
 	cfg.vtxopool.vtxo_lifetime = BlockDelta::new(2048);
 });
 
+#[tokio::test]
+async fn hold_cancel_error_does_not_block_pass() {
+	isolated_hold_failures(false).await;
+}
+
+#[tokio::test]
+async fn failing_settlement_is_requeued() {
+	isolated_hold_failures(true).await;
+}
+
+async fn isolated_hold_failures(check_requeue: bool) {
+	require_bark_version!(> "0.5.0");
+	let ctx = TestContext::new(if check_requeue { "server/failing_settlement_is_requeued" }
+		else { "server/hold_cancel_error_does_not_block_pass" }).await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
+		.cfg(|cfg| cfg.invoice_check_interval = Duration::from_secs(1)).create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+	let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+	let mut rpc = srv.get_public_rpc().await;
+	// This older, genuinely unpaid invoice must expire after the bad newer
+	// receive enters HtlcsReady. No timestamp or payment outcome is rewritten.
+	let expired_hash = ark::lightning::Preimage::random().compute_payment_hash();
+	let unpaid = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
+		payment_hash: expired_hash.to_vec(), amount_sat: 1_000, min_cltv_delta: 58,
+		expiry_secs: Some(30), claim_destination: None, mailbox_id: None, description: None,
+	}).await.unwrap().into_inner().bolt11;
+	let arrived = Arc::new(tokio::sync::Notify::new());
+	let release = Arc::new(tokio::sync::Notify::new());
+	let proxy = srv.start_proxy_no_mailbox(HoldClaim { held: Arc::new(AtomicBool::new(false)),
+		arrived: arrived.clone(), release: release.clone() }).await;
+	let receiver = Arc::new(ctx.bark_sdk("receiver", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true).create().await);
+	receiver.stop_daemon_wait().await.unwrap();
+	let invoice = receiver.bolt11_invoice(sat(50_000), None, None).await.unwrap();
+	let hash = PaymentHash::from(&invoice);
+	let payer = Arc::new(lightning.external);
+	let native_payer = payer.clone();
+	let payment = tokio::spawn(async move { native_payer.try_pay_bolt11(invoice.to_string()).await });
+	srv.wait_for_lightning_receive_accepted(hash).await;
+	let claimant = receiver.clone();
+	let claim = tokio::spawn(async move { claimant.try_claim_lightning_receive(hash, false).await });
+	arrived.notified().wait_millis(30_000).await;
+	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().unwrap();
+	assert_eq!(sub.status, server::database::ln::LightningHtlcSubscriptionStatus::HtlcsReady);
+	assert!(!sub.htlc_vtxos.is_empty());
+	assert!(!Bolt11Invoice::from_str(&unpaid).unwrap().is_expired(), "the timeout-isolation premise was missed");
+	let grant = sub.htlc_vtxos[0];
+	let original = db.read(async |tx| Ok(tx.query_one("SELECT to_jsonb(h)::TEXT,htlc_expiry FROM htlc_vtxo h \
+		JOIN vtxo v ON v.id=h.id WHERE v.vtxo_id=$1", &[&grant.to_string()]).await?)).await.unwrap();
+	let original_row = original.get::<_, String>(0);
+	let original_expiry = original.get::<_, i32>(1);
+	let (alarm_tx, mut alarm_rx) = tokio::sync::mpsc::unbounded_channel();
+	srv.add_stdout_handler(move |line: &str| {
+		if let Ok(record) = server_log::parse_record(line) {
+			if record.message == "Hold invoice timeout handling failed; will retry independently" && record.level == "ERROR"
+				&& record.extra.get("subscription_id").and_then(|v| v.as_i64()) == Some(sub.id)
+				&& record.extra.get("error").and_then(|v| v.as_str()).is_some_and(|error| error.contains("htlc_expiry out of range")) {
+				let _ = alarm_tx.send(()); return true;
+			}
+		}
+		false
+	});
+	// A real PostgreSQL reader failure, not a fake native payment status:
+	// retain the original signed body and restore this exact metadata below.
+	db.write(async |tx| {
+		assert_eq!(tx.execute("UPDATE htlc_vtxo SET htlc_expiry=-1 WHERE id=(SELECT id FROM vtxo WHERE vtxo_id=$1)",
+			&[&grant.to_string()]).await?, 1); Ok(())
+	}).await.unwrap();
+	alarm_rx.recv().wait_millis(10_000).await.unwrap();
+	async {
+		while lightning_subscription_status(&db, expired_hash).await.as_deref() != Some("canceled") {
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	}.wait_millis(40_000).await;
+	let mut hold = lightning.internal.hold_client().await;
+	let canceled = hold.list(hold::ListRequest { constraint: Some(hold::list_request::Constraint::PaymentHash(expired_hash.to_vec())) })
+		.await.unwrap().into_inner().invoices;
+	assert_eq!(canceled.len(), 1);
+	assert_eq!(canceled[0].state(), hold::InvoiceState::Cancelled);
+	let native = hold.list(hold::ListRequest { constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())) })
+		.await.unwrap().into_inner().invoices;
+	assert_eq!(native.len(), 1);
+	assert_eq!(native[0].state(), hold::InvoiceState::Accepted);
+	assert!(!payment.is_finished());
+	assert_eq!(lightning_subscription_status(&db, hash).await.as_deref(), Some("htlcs-ready"));
+	assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+	db.write(async |tx| { tx.execute("UPDATE htlc_vtxo SET htlc_expiry=$2 WHERE id=(SELECT id FROM vtxo WHERE vtxo_id=$1)",
+		&[&grant.to_string(), &original_expiry]).await?; Ok(()) }).await.unwrap();
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT to_jsonb(h)::TEXT FROM htlc_vtxo h \
+		JOIN vtxo v ON v.id=h.id WHERE v.vtxo_id=$1", &[&grant.to_string()]).await?.get::<_, String>(0))).await.unwrap(), original_row);
+	let later = if check_requeue {
+		let recipient = ctx.bark_sdk("later-recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
+		let sender = ctx.bark_sdk("later-sender", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).boarded(sat(100_000)).create().await;
+		recipient.stop_daemon_wait().await.unwrap(); sender.stop_daemon_wait().await.unwrap();
+		let invoice = recipient.bolt11_invoice(sat(10_000), None, None).await.unwrap();
+		let hash = PaymentHash::from(&invoice);
+		Box::pin(sender.pay_lightning_invoice(invoice, None, false)).await.unwrap();
+		srv.wait_for_lightning_receive_accepted(hash).await;
+		Some((sender, recipient, hash))
+	} else { None };
+	let uri = srv.config().cln_array[0].uri.to_string();
+	let mut admin = server_rpc::admin::LightningAdminServiceClient::connect(format!("http://{}", srv.config().rpc.admin_address.unwrap())).await.unwrap();
+	let (failed_tx, mut failed_rx) = tokio::sync::mpsc::unbounded_channel();
+	if check_requeue {
+		let (disabled_tx, mut disabled_rx) = tokio::sync::mpsc::unbounded_channel();
+		let disabled = format!("ClnNode {uri} was Online and is now disabled.");
+		srv.add_stdout_handler(move |line: &str| {
+			if server_log::parse_record(line).is_ok_and(|record| record.message == disabled) {
+				let _ = disabled_tx.send(()); return true;
+			}
+			false
+		});
+		let failure = format!("Hold invoice settlement failed for {hash}, will retry:");
+		srv.add_stdout_handler(move |line: &str| {
+			if server_log::parse_record(line).is_ok_and(|record| record.message.starts_with(&failure) && record.message.contains("node is now offline")) {
+				let _ = failed_tx.send(()); return true;
+			}
+			false
+		});
+		admin.stop_lightning_node(protos::LightningNodeUri { uri: uri.clone() }).await.unwrap();
+		disabled_rx.recv().wait_millis(10_000).await.unwrap();
+	}
+	release.notify_one();
+	if let Some((sender, recipient, later_hash)) = &later {
+		let failure = claim.await.unwrap().expect_err("the first actual settlement must find its backend disabled");
+		assert!(format!("{failure:#}").contains("node is now offline"), "{failure:#}");
+		failed_rx.recv().wait_millis(10_000).await.unwrap();
+		let first = db.read(async |tx| Ok(tx.query_one("SELECT id FROM htlc_settlement WHERE payment_hash=$1", &[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap();
+		Box::pin(recipient.try_claim_lightning_receive(*later_hash, false)).await.unwrap();
+		wait_for_subscription_status(&db, *later_hash, "settled").await;
+		assert_eq!(lightning_subscription_status(&db, hash).await.as_deref(), Some("htlcs-ready"));
+		assert_eq!(receiver.balance().await.unwrap().spendable, Amount::ZERO);
+		assert!(!payment.is_finished());
+		assert_eq!(hold.list(hold::ListRequest { constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())) })
+			.await.unwrap().into_inner().invoices, native);
+		let second = db.read(async |tx| Ok(tx.query_one("SELECT id FROM htlc_settlement WHERE payment_hash=$1", &[&later_hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap();
+		assert!(second > first);
+		Box::pin(sender.check_lightning_payment(*later_hash, true)).wait_millis(30_000).await.unwrap();
+		assert_eq!(sender.balance().await.unwrap().spendable, sat(90_000));
+		assert_eq!(recipient.balance().await.unwrap().spendable, sat(10_000));
+		admin.start_lightning_node(protos::LightningNodeUri { uri }).await.unwrap();
+		// No claimant driver is running now: the retained WAL queue must retry.
+		wait_for_subscription_status(&db, hash, "settled").await;
+		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT id FROM htlc_settlement WHERE payment_hash=$1", &[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), first);
+		Box::pin(receiver.try_claim_lightning_receive(hash, true)).await.unwrap();
+	} else {
+		claim.await.unwrap().unwrap();
+	}
+	payment.wait_millis(30_000).await.unwrap().unwrap();
+	assert_eq!(receiver.balance().await.unwrap().spendable, sat(50_000));
+	let native_paid = hold.list(hold::ListRequest { constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())) })
+		.await.unwrap().into_inner().invoices;
+	assert_eq!(native_paid.len(), 1);
+	assert_eq!(native_paid[0].state(), hold::InvoiceState::Paid);
+	let history = receiver.history().await.unwrap();
+	let ids = receiver.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<HashSet<_>>();
+	Box::pin(receiver.try_claim_lightning_receive(hash, true)).await.unwrap();
+	assert_eq!(receiver.history().await.unwrap(), history);
+	assert_eq!(receiver.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<HashSet<_>>(), ids);
+	assert_eq!(hold.list(hold::ListRequest { constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())) })
+		.await.unwrap().into_inner().invoices, native_paid);
+}
+
 /// The server must refuse `request_lightning_pay_htlc_revocation` for a
 /// payment that has already settled.
 ///
