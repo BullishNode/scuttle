@@ -2,3 +2,6 @@
   The network-bound domains and address type `0x03` remain unchanged.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
   - **BREAKING:** Legacy 97-byte links and address type `0x02` are refused.
+- Add `fallback::payout_script`, the BIP86 output paid for a mailbox key.
+  The server and the wallet use the same function.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)

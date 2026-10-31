@@ -27,7 +27,7 @@ fn tagged_message(tag: &str, fields: &[&[u8]]) -> Message {
 
 /// The BIP86 output that expired coins of mailbox `M` are paid to: `M` lifted
 /// to even Y, tweaked with `TapTweak` and an empty script tree. This is the
-/// wallet's ordinary BIP86 receive script when `M` is a BIP86 account key.
+/// wallet's ordinary BIP86 receive script when `M` is its external index-zero key.
 pub fn payout_script(mailbox: PublicKey) -> ScriptBuf {
 	ScriptBuf::new_p2tr(&SECP, mailbox.x_only_public_key().0, None)
 }

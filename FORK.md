@@ -2,7 +2,7 @@
 
 Scuttle builds on upstream `51781ef693f5da15c9a5aa5720af8c5387652f23`. The
 history retains upstream commits and separates fork work by subsystem.
-This branch is not released yet.
+This branch is not released yet. Implementation and qualification are incomplete.
 
 | Topic | Purpose and principal touchpoints |
 | --- | --- |
@@ -40,6 +40,8 @@ is a conflict/maintenance canary, not evidence that money or signatures are
 correct. A production-line comparison must separately exclude tests, docs,
 generated code and inline tests; it is a different metric from upstream hunks.
 
-Run `just checks`, `just unit` and `just int-scuttle` before a release. A
-canary pass does not replace the integration tests. Build the server and the
-client from the same source and test them with fresh stores before a release.
+Run `just checks`, `just unit` and `just int-scuttle` on exact source and runtime
+identities. A canary or source review does not replace the required financial,
+failure, recovery and Signet qualification. Preserve failures and funded stores.
+Build the server and client from the same source and qualify fresh matched stores
+before a release.
