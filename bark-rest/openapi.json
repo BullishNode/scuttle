@@ -2646,15 +2646,15 @@
         "tags": [
           "wallet"
         ],
-        "summary": "Get fallback registration and payout address",
-        "operationId": "fallback_registration",
+        "summary": "Get the mailbox-derived Bitcoin fallback address",
+        "operationId": "fallback_destination",
         "responses": {
           "200": {
-            "description": "Authenticated fallback registration, if present",
+            "description": "Mailbox identity and BIP86 payout address",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/FallbackRegistrationInfo"
+                  "$ref": "#/components/schemas/FallbackInfo"
                 }
               }
             }
@@ -2670,7 +2670,7 @@
             }
           },
           "500": {
-            "description": "Registration cannot be authenticated",
+            "description": "Wallet identity cannot be read",
             "content": {
               "application/json": {
                 "schema": {
@@ -3818,7 +3818,8 @@
           "message": {
             "type": "string"
           }
-        }
+        },
+        "additionalProperties": false
       },
       "Balance": {
         "type": "object",
@@ -5948,6 +5949,22 @@
           }
         }
       },
+      "FallbackInfo": {
+        "type": "object",
+        "description": "The app-selected fallback destination authenticated by this wallet.",
+        "required": [
+          "mailbox_public_key",
+          "payout_address"
+        ],
+        "properties": {
+          "mailbox_public_key": {
+            "type": "string"
+          },
+          "payout_address": {
+            "type": "string"
+          }
+        }
+      },
       "FallbackRefusalError": {
         "type": "object",
         "description": "Stable native SDK refusal. Consumers select the code, never diagnostic text.",
@@ -5961,24 +5978,6 @@
           },
           "message": {
             "type": "string"
-          }
-        }
-      },
-      "FallbackRegistrationInfo": {
-        "type": "object",
-        "description": "The app-selected fallback destination authenticated by this wallet.",
-        "required": [
-          "registered"
-        ],
-        "properties": {
-          "payout_address": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "registered": {
-            "type": "boolean"
           }
         }
       },
