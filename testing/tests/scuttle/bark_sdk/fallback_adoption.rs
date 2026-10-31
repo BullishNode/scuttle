@@ -827,3 +827,87 @@ async fn expired_status_retirement(paused: bool) {
 		assert_eq!(stale.get_full_vtxo(id).await.unwrap().serialize(), current.get_full_vtxo(id).await.unwrap().serialize());
 	}
 }
+
+#[tokio::test]
+async fn authenticated_sync_preserves_multidevice_original_change_and_grandchild() {
+	Box::pin(real_multidevice_authenticated_sync()).await;
+}
+
+async fn real_multidevice_authenticated_sync() {
+	let ctx = TestContext::new("bark_sdk/authenticated_multidevice_original_change_grandchild").await;
+	let srv = ctx.captaind("server").create().await;
+	let source = Box::pin(ctx.bark_sdk("source", &srv).cfg(config).boarded(sat(200_000)).create()).await;
+	let target = Box::pin(ctx.bark_sdk("target", &srv).cfg(config).create()).await;
+	source.send_arkoor_payment(&target.new_address().await.unwrap(), sat(100_000)).await.unwrap();
+	Box::pin(target.sync()).await;
+	let original = target.spendable_vtxos().await.unwrap().remove(0);
+	assert_eq!(original.amount(), sat(100_000));
+	let signed = target.get_full_vtxo(original.id()).await.unwrap();
+	let seed = mnemonic(&ctx, "target").await;
+	// The second device has the same genuine identity and signed original
+	// before the first device spends. No response or local marker is faulted.
+	let older = Box::pin(ctx.bark_sdk("older-device", &srv).cfg(config).mnemonic(seed).create()).await;
+	let older_db = SqliteClient::open(ctx.datadir.join("older-device/db.sqlite")).unwrap();
+	assert_eq!(older.mailbox_identifier(), target.mailbox_identifier());
+	assert_eq!(older.balance().await.unwrap().total(), sat(100_000));
+	assert_eq!(older.get_full_vtxo(original.id()).await.unwrap().serialize(), signed.serialize());
+
+	target.send_arkoor_payment(&source.new_address().await.unwrap(), sat(60_000)).await.unwrap();
+	assert_eq!(target.balance().await.unwrap().total(), sat(40_000));
+	let intermediate = target.spendable_vtxos().await.unwrap();
+	assert!(!intermediate.is_empty());
+	assert_eq!(intermediate.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(40_000));
+	let intermediate_bodies = target.get_full_vtxos(intermediate.iter()).await.unwrap();
+	let first = older.recover_vtxos(std::iter::once(original.id())
+		.chain(intermediate.iter().map(|coin| coin.id())), None).await.unwrap();
+	assert!(first.is_complete());
+	Box::pin(older.sync()).await;
+	assert_eq!(older_db.get_wallet_vtxo(original.id()).await.unwrap().unwrap().state, VtxoState::Spent);
+	assert_eq!(older.balance().await.unwrap().spendable, sat(40_000));
+	assert_eq!(older.balance().await.unwrap().awaiting_settlement, sat(0));
+	assert_eq!(older.balance().await.unwrap().total(), sat(40_000), "the spent original cannot add another 100k");
+	assert_eq!(older.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<BTreeSet<_>>(),
+		intermediate.iter().map(|coin| coin.id()).collect());
+
+	target.send_arkoor_payment(&source.new_address().await.unwrap(), sat(10_000)).await.unwrap();
+	let newest = target.spendable_vtxos().await.unwrap();
+	assert_eq!(newest.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(30_000));
+	let current_ids = newest.iter().map(|coin| coin.id()).collect::<BTreeSet<_>>();
+	assert_eq!(current_ids.len(), newest.len());
+	let stale = intermediate.iter().filter(|coin| !current_ids.contains(&coin.id())).collect::<Vec<_>>();
+	assert!(!stale.is_empty());
+	let newest_bodies = target.get_full_vtxos(newest.iter()).await.unwrap();
+	// These are assertions about the fixture's actual signed transitions.
+	// Client state below comes from each authenticated status, not this graph.
+	assert!(newest_bodies.iter().all(|coin| coin.ancestor_ids().contains(&original.id())));
+	assert!(stale.iter().any(|middle| newest_bodies.iter().any(|coin| coin.ancestor_ids().contains(&middle.id()))));
+	drop(target);
+	let latest = older.recover_vtxos(std::iter::once(original.id())
+		.chain(intermediate.iter().map(|coin| coin.id())).chain(current_ids.iter().copied()), None).await.unwrap();
+	assert!(latest.is_complete());
+	Box::pin(older.sync()).await;
+	for coin in &stale {
+		assert_eq!(older_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spent);
+	}
+	for body in intermediate_bodies.iter().chain(&newest_bodies).chain(std::iter::once(&signed)) {
+		assert_eq!(older.get_full_vtxo(body.id()).await.unwrap().serialize(), body.serialize());
+	}
+	assert_eq!(older.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<BTreeSet<_>>(), current_ids);
+	assert_eq!(older.balance().await.unwrap().spendable, sat(30_000));
+	assert_eq!(older.balance().await.unwrap().awaiting_settlement, sat(0));
+	assert_eq!(older.balance().await.unwrap().total(), sat(30_000), "original, middle and grandchild are one current principal cut");
+	assert!(older.fallback_receipts().await.unwrap().is_empty());
+	assert!(older.awaiting_settlement_vtxos().await.unwrap().is_empty());
+	Box::pin(source.sync()).await;
+	assert_eq!(source.balance().await.unwrap().total(), sat(170_000));
+	assert_eq!(source.balance().await.unwrap().total() + older.balance().await.unwrap().total(), sat(200_000));
+	let history = older.history().await.unwrap();
+	for _ in 0..2 {
+		assert!(older.recover_vtxos(std::iter::once(original.id())
+			.chain(intermediate.iter().map(|coin| coin.id())).chain(current_ids.iter().copied()), None).await.unwrap().is_complete());
+		Box::pin(older.sync()).await;
+		assert_eq!(older.history().await.unwrap(), history);
+		assert_eq!(older.balance().await.unwrap().total(), sat(30_000));
+		assert_eq!(older.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<BTreeSet<_>>(), current_ids);
+	}
+}
