@@ -90,3 +90,18 @@ impl Tx<'_> {
 			spk: ark::fallback::payout_script(mailbox) })
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use ark::{ProtocolEncoding, ServerVtxoPolicy, VtxoPolicy};
+	use bitcoin::hex::DisplayHex;
+
+	/// The customer-birth trigger repeats the round padding policy as a byte
+	/// literal. Fail here, not at the first padded round, if the key changes.
+	#[test]
+	fn customer_coin_owner_trigger_exempts_the_round_padding_policy() {
+		let policy = ServerVtxoPolicy::User(VtxoPolicy::new_pubkey(*crate::round::UNSPENDABLE));
+		let literal = format!("decode('{}', 'hex')", policy.serialize().as_hex());
+		assert!(include_str!("scuttle.sql").contains(&literal), "{literal}");
+	}
+}
