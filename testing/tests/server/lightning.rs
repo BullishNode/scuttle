@@ -236,6 +236,10 @@ async fn server_settles_invoice_from_on_chain_htlc_preimage(
 	);
 
 	if ctx.test_name == "lightningd/intra_server_settles_invoice_from_on_chain_htlc_preimage" {
+		// Payment completion may follow the first witness while the remaining
+		// spends in that block are still being visited by watchmand.
+		let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+		srv.watchmand().wait_for_sync_height(tip).await;
 		let hash = PaymentHash::from(&Bolt11Invoice::from_str(&invoice_info.invoice).unwrap());
 		let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
 		let subscription = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
