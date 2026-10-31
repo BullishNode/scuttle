@@ -172,8 +172,9 @@ impl Server {
 				}
 				if !ReadyOutput::group_fits(&[&output])? {
 					self.db.write(async |t| {
+						let requested = t.request_expiry_split(view, output.root()).await?;
 						t.record_expiry_hold(output.root().id(), "output_requires_split").await?;
-						t.request_expiry_split(view, output.root()).await
+						Ok(requested)
 					}).await?;
 				} else {
 					group.push(output);
