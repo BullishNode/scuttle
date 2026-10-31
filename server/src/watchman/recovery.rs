@@ -179,6 +179,9 @@ impl Watchman {
 						WHERE b.height = (c.evidence->>'height')::BIGINT
 						AND b.hash = c.evidence->>'hash'))
 			", &[]).await?;
+			let paid_ids = paid_claims.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
+			t.query("SELECT v.vtxo_id FROM vtxo v JOIN expiry_entitlement e ON e.vtxo_id=v.vtxo_id \
+				WHERE e.id=ANY($1) ORDER BY v.vtxo_id FOR UPDATE OF v", &[&paid_ids]).await?;
 			for (id, txid, point) in &paid_claims {
 				t.execute("
 					INSERT INTO expiry_terminal_claim(entitlement_id, txid, height, hash)
