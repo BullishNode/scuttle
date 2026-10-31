@@ -69,6 +69,24 @@ pub struct PausedNativeDaemon {
 impl PausedNativeDaemon {
 	pub fn identity(&self) -> &NativeProcessIdentity { &self.identity }
 
+	pub(crate) async fn acquire(identity: NativeProcessIdentity) -> anyhow::Result<Self> {
+		let (actual, state, _) = native_process(identity.pid)?;
+		ensure!(actual == identity, "daemon identity changed before STOP");
+		ensure!(!matches!(state, 'T' | 't'), "daemon is already stopped; STOP ownership refused");
+		let guard = Self { identity, resume_required: true };
+		info!("Pausing owned daemon {:?}", guard.identity);
+		signal::kill(Pid::from_raw(guard.identity.pid.try_into()?), signal::Signal::SIGSTOP)?;
+		tokio::time::timeout(Duration::from_secs(2), async {
+			loop {
+				let (actual, state, _) = native_process(guard.identity.pid)?;
+				ensure!(actual == guard.identity, "daemon changed while acquiring STOP");
+				if matches!(state, 'T' | 't') { return anyhow::Ok(()); }
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		}).await.context("daemon did not acknowledge STOP")??;
+		Ok(guard)
+	}
+
 	pub fn resume(mut self) -> anyhow::Result<()> {
 		let (actual, state, _) = native_process(self.identity.pid)?;
 		ensure!(actual == self.identity && matches!(state, 'T' | 't'), "paused daemon identity/state changed");
@@ -300,20 +318,7 @@ impl<T> Daemon<T>
 		let child = child.as_mut().context("daemon has no child")?;
 		ensure!(child.try_wait()?.is_none(), "daemon child already exited");
 		let pid = child.id().context("daemon PID missing")?;
-		let (identity, state, _) = native_process(pid)?;
-		ensure!(!matches!(state, 'T' | 't'), "daemon is already stopped; STOP ownership refused");
-		let guard = PausedNativeDaemon { identity, resume_required: true };
-		info!("Pausing owned daemon {:?}", guard.identity);
-		signal::kill(Pid::from_raw(pid.try_into()?), signal::Signal::SIGSTOP)?;
-		tokio::time::timeout(Duration::from_secs(2), async {
-			loop {
-				let (actual, state, _) = native_process(pid)?;
-				ensure!(actual == guard.identity, "daemon changed while acquiring STOP");
-				if matches!(state, 'T' | 't') { return anyhow::Ok(()); }
-				tokio::time::sleep(Duration::from_millis(10)).await;
-			}
-		}).await.context("daemon did not acknowledge STOP")??;
-		Ok(guard)
+		PausedNativeDaemon::acquire(native_process(pid)?.0).await
 	}
 
 	/// Reap an already exiting child without sending another signal.

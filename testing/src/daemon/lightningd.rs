@@ -459,6 +459,42 @@ impl Lightningd {
 		Daemon::wrap(inner)
 	}
 
+	/// Pause this node's exact configured hold plugin, retaining its live gRPC connection.
+	#[cfg(target_os = "linux")]
+	pub async fn pause_owned_hold(&self) -> anyhow::Result<crate::daemon::PausedNativeDaemon> {
+		ensure!(!Self::should_use_docker(), "hold fault requires native owned processes");
+		let provider = self.native_child().await?;
+		ensure!(provider.exe == Self::exec().context("native lightningd executable missing")?.canonicalize()?,
+			"provider executable differs from the configured native node");
+		let configured = PathBuf::from(env::var(LIGHTNINGD_PLUGIN_DIR)?).join("hold");
+		let expected = configured.canonicalize()?;
+		let config = std::fs::read_to_string(self.inner.config.lightning_dir.join("config"))?;
+		ensure!(config.lines().any(|line| line == format!("important-plugin={}", configured.display())),
+			"owned node does not configure this important hold plugin");
+		let cmdline = std::fs::read(format!("/proc/{}/cmdline", provider.pid))?;
+		let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+		ensure!(args.windows(2).any(|pair| pair[0] == b"--lightning-dir"
+			&& pair[1] == self.inner.config.lightning_dir.as_os_str().as_encoded_bytes()),
+			"provider does not use this test's exact node config");
+		let children = std::fs::read_to_string(format!("/proc/{}/task/{}/children", provider.pid, provider.pid))?;
+		let mut selected = Vec::new();
+		for pid in children.split_whitespace() {
+			if let Ok((identity, _, parent)) = crate::daemon::native_process(pid.parse()?) {
+				if parent == provider.pid && identity.exe == expected { selected.push(identity); }
+			}
+		}
+		ensure!(selected.len() == 1, "expected exactly one owned configured hold child");
+		let child = selected.pop().unwrap();
+		ensure!(self.native_child().await? == provider, "provider identity changed before hold STOP");
+		let (actual, _, parent) = crate::daemon::native_process(child.pid)?;
+		ensure!(actual == child && parent == provider.pid, "hold identity/parent changed before STOP");
+		let guard = crate::daemon::PausedNativeDaemon::acquire(child).await?;
+		ensure!(self.native_child().await? == provider, "provider identity changed during hold STOP");
+		let (actual, _, parent) = crate::daemon::native_process(guard.identity().pid)?;
+		ensure!(&actual == guard.identity() && parent == provider.pid, "hold ownership changed during STOP");
+		Ok(guard)
+	}
+
 	/// Kill only the unique installed xpay child of this owned native node.
 	#[cfg(target_os = "linux")]
 	pub async fn kill_owned_xpay(&self) -> anyhow::Result<crate::daemon::NativeProcessIdentity> {
