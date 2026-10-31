@@ -7,7 +7,7 @@ use rusqlite::Connection;
 pub(super) fn is_fresh(conn: &Connection) -> anyhow::Result<bool> {
 	let legacy: bool = conn.query_row(
 		"SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' \
-		 AND name = 'scuttle_schema_history')", [], |row| row.get(0),
+		 AND name IN ('scuttle_schema_history', 'bark_fallback_record', 'bark_fallback_snapshot'))", [], |row| row.get(0),
 	)?;
 	ensure!(!legacy, "existing wallet is not a fresh Scuttle store; initialization refused");
 	let initialized: bool = conn.query_row(
@@ -24,10 +24,10 @@ pub(super) fn is_fresh(conn: &Connection) -> anyhow::Result<bool> {
 	}
 	let tables: i64 = conn.query_row(
 		"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
-		 AND name IN ('bark_fallback_record', 'bark_fallback_snapshot', 'bark_mailbox_identity')",
+		 AND name IN ('bark_fallback_receipt', 'bark_mailbox_identity')",
 		[], |row| row.get(0),
 	)?;
-	ensure!(tables == 3, "incomplete Scuttle wallet schema; use a fresh store");
+	ensure!(tables == 2, "incomplete Scuttle wallet schema; use a fresh store");
 	let version: i64 = conn.query_row("SELECT MAX(value) FROM migrations", [], |row| row.get(0))?;
 	ensure!(version == 42, "unrecognized wallet migration history; use a fresh Scuttle store");
 	Ok(false)
@@ -35,21 +35,16 @@ pub(super) fn is_fresh(conn: &Connection) -> anyhow::Result<bool> {
 
 pub(super) fn initialize(conn: &mut Connection) -> anyhow::Result<()> {
 	let tx = conn.transaction()?;
-	tx.execute_batch("CREATE TABLE bark_fallback_record (
-		id INTEGER PRIMARY KEY CHECK (id = 1),
-		record BLOB NOT NULL,
-		spk BLOB NOT NULL,
-		registered INTEGER NOT NULL DEFAULT 1
-	);
-	CREATE TABLE bark_fallback_snapshot (
-		id INTEGER PRIMARY KEY CHECK (id = 1), snapshot BLOB NOT NULL
+	tx.execute_batch("CREATE TABLE bark_fallback_receipt (
+		vtxo_id TEXT PRIMARY KEY,
+		owner_mailbox TEXT NOT NULL CHECK (length(owner_mailbox) = 66),
+		gross_sat INTEGER NOT NULL CHECK (gross_sat > 0),
+		receipt BLOB NOT NULL
 	);
 	CREATE TABLE bark_mailbox_identity (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
-		public_key TEXT CHECK (public_key IS NULL OR length(public_key) = 66),
-		network TEXT,
-		CHECK ((public_key IS NULL AND network IS NULL)
-			OR (public_key IS NOT NULL AND network IS NOT NULL))
+		public_key TEXT NOT NULL CHECK (length(public_key) = 66),
+		network TEXT NOT NULL
 	);")
 		.context("initialize fresh Scuttle wallet state")?;
 	tx.commit()?;

@@ -13,8 +13,7 @@ async fn recovery_posts_do_not_create_or_change_coin_ownership() {
 	let coin = DummyTestVtxoSpec { user_keypair: coin_key, ..Default::default() }.build().1;
 	let unknown = DummyTestVtxoSpec { user_keypair: unknown_key, ..Default::default() }.build().1;
 	assert_ne!(coin.id(), unknown.id());
-	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(coin.clone())],
-		Some((bitcoin::Network::Regtest, &server_key))).await).await.unwrap();
+	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(coin.clone())]).await).await.unwrap();
 	let ids = [coin.id().to_string(), unknown.id().to_string()];
 	let keys = [coin_key.public_key().to_string(), unknown_key.public_key().to_string()];
 	let snapshot = async || db.read(async |tx| {
@@ -54,6 +53,7 @@ async fn recovery_posts_do_not_create_or_change_coin_ownership() {
 	assert_eq!(snapshot().await, before_refusal,
 		"an unknown recovery ID must not partially write hints or change ownership");
 	let messages = rpc.read_mailbox(protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 		mailbox_id: mailbox.serialize(), authorization: Some(authorization.clone()), checkpoint: 0,
 	}).await.unwrap().into_inner().messages;
 	assert_eq!(messages.len(), 1);
@@ -84,8 +84,7 @@ async fn delivery_owner_check_rejects_an_incomplete_or_mixed_batch() {
 	let one = DummyTestVtxoSpec { user_keypair: a, ..Default::default() }.build().1;
 	let two = DummyTestVtxoSpec { user_keypair: b, ..Default::default() }.build().1;
 	let unknown = DummyTestVtxoSpec { ..Default::default() }.build().1;
-	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(one.clone()), ServerVtxo::from(two.clone())],
-		Some((bitcoin::Network::Regtest, server))).await).await.unwrap();
+	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(one.clone()), ServerVtxo::from(two.clone())]).await).await.unwrap();
 	let mailbox = MailboxIdentifier::from_pubkey(first.public_key());
 	let snapshot = async || db.read(async |tx| {
 		let row = tx.query_one("SELECT (SELECT count(*) FROM mailbox),
@@ -95,17 +94,12 @@ async fn delivery_owner_check_rejects_an_incomplete_or_mixed_batch() {
 	let before = snapshot().await;
 	for batch in [vec![one.clone(), two.clone()], vec![one.clone(), unknown]] {
 		let refused = db.write(async |tx| {
-			let ids = batch.iter().map(|vtxo| vtxo.id()).collect::<Vec<_>>();
-			// This exercises the strict same-transaction contract before its
-			// coordinated activation at the public delivery endpoint.
-			anyhow::ensure!(tx.delivery_owners_match(&ids, mailbox).await?, "delivery owner mismatch");
 			tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &batch).await
 		}).await.unwrap_err();
-		assert_eq!(refused.root_cause().to_string(), "delivery owner mismatch");
+		assert!(refused.root_cause().to_string().contains("mailbox delivery has missing or mismatched coin ownership"));
 		assert_eq!(snapshot().await, before, "no partial message or checkpoint may be consumed");
 	}
 	let post = async || db.write(async |tx| {
-		anyhow::ensure!(tx.delivery_owners_match(&[one.id(), one.id()], mailbox).await?, "delivery owner mismatch");
 		tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[one.clone(), one.clone()]).await
 	}).await.unwrap();
 	assert!(post().await.is_some());
@@ -114,8 +108,8 @@ async fn delivery_owner_check_rejects_an_incomplete_or_mixed_batch() {
 }
 
 #[tokio::test]
-async fn mailbox_registration_and_commit_notifications() {
-	let ctx = TestContext::new("server/mailbox_registration_and_commit_notifications").await;
+async fn mailbox_authorization_delivery_and_commit_notifications() {
+	let ctx = TestContext::new("server/mailbox_authorization_delivery_and_commit_notifications").await;
 	let srv = ctx.captaind("server").create().await;
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let server_key = srv.mailbox_keypair();
@@ -123,12 +117,12 @@ async fn mailbox_registration_and_commit_notifications() {
 	let registered_key = Keypair::new(&SECP, &mut thread_rng());
 	super::register_test_owners(&db, &server_key, &registered_key, &[coin_key]).await;
 	let (_, coin) = DummyTestVtxoSpec { user_keypair: coin_key, ..Default::default() }.build();
-	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(coin.clone())],
-		Some((bitcoin::Network::Regtest, &server_key))).await).await.unwrap();
-	let target_key = Keypair::new(&SECP, &mut thread_rng());
+	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(coin.clone())]).await).await.unwrap();
+	let target_key = registered_key;
 	let target = MailboxIdentifier::from_pubkey(target_key.public_key());
 	let authorization = MailboxAuthorization::new(&target_key, chrono::Local::now() + Duration::from_secs(300)).serialize();
 	let request = || protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 		mailbox_id: target.serialize(), authorization: Some(authorization.clone()), checkpoint: 0,
 	};
 	let blinded_id = target.to_blinded(server_key.public_key(), &coin_key).unwrap().serialize();
@@ -136,19 +130,18 @@ async fn mailbox_registration_and_commit_notifications() {
 		blinded_id: blinded_id.clone(), vtxos: vec![coin.serialize()],
 	};
 	let mut rpc = srv.get_mailbox_public_rpc().await;
-	let refuse = |error: tonic::Status| {
-		assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error}");
-		assert_eq!(error.metadata().get("abandon-reason").unwrap().to_str().unwrap(), "unregistered_mailbox");
+	let mut unauthenticated = request();
+	unauthenticated.authorization = None;
+	assert_eq!(rpc.read_mailbox(unauthenticated.clone()).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+	assert_eq!(rpc.subscribe_mailbox(unauthenticated).await.err().expect("unauthorized stream refused").code(), tonic::Code::InvalidArgument);
+	let foreign = Keypair::new(&SECP, &mut thread_rng());
+	let foreign_mailbox = MailboxIdentifier::from_pubkey(foreign.public_key());
+	let foreign_post = protos::mailbox_server::PostArkoorMessageRequest {
+		blinded_id: foreign_mailbox.to_blinded(server_key.public_key(), &coin_key).unwrap().serialize(),
+		vtxos: vec![coin.serialize()],
 	};
-	refuse(rpc.read_mailbox(request()).await.unwrap_err());
-	refuse(rpc.subscribe_mailbox(request()).await.err().expect("unregistered stream refused"));
-	refuse(rpc.post_arkoor_message(post()).await.unwrap_err());
-	refuse(rpc.post_recovery_vtxo_ids(protos::mailbox_server::PostRecoveryVtxoIdsRequest {
-		mailbox_id: target.serialize(), vtxo_ids: vec![coin.id().to_bytes().to_vec()], authorization: Some(authorization.clone()),
-	}).await.unwrap_err());
+	assert_eq!(rpc.post_arkoor_message(foreign_post).await.unwrap_err().code(), tonic::Code::InvalidArgument);
 	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM mailbox", &[]).await?.get::<_, i64>(0))).await.unwrap(), 0);
-
-	super::register_test_owners(&db, &server_key, &target_key, &[]).await;
 	assert!(rpc.read_mailbox(request()).await.unwrap().into_inner().messages.is_empty());
 	let mut stream = rpc.subscribe_mailbox(request()).await.unwrap().into_inner();
 	// Force an error at commit, after the real writer produced its checkpoint.

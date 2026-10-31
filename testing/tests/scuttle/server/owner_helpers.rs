@@ -1,18 +1,13 @@
 use ark::ProtocolEncoding;
-use ark::fallback::{FallbackRegistration, OwnerLink};
+use ark::fallback::OwnerLink;
 use ark::lightning::PaymentHash;
-use bitcoin::{Network, ScriptBuf};
+use bitcoin::Network;
 use bitcoin::secp256k1::{Keypair, PublicKey};
 use ark_testing::daemon::captaind::Captaind;
 use server::database::Db;
 use server_rpc::protos;
 
 pub(super) async fn unmapped_owner_link(srv: &Captaind, coin: &Keypair, mailbox: &Keypair) -> OwnerLink {
-	let script = ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None);
-	let record = FallbackRegistration::new(Network::Regtest, script, mailbox).unwrap();
-	srv.get_public_rpc().await.set_fallback(protos::SetFallbackRequest {
-		mailbox_pk: mailbox.public_key().serialize().to_vec(), record: record.serialize(),
-	}).await.unwrap();
 	OwnerLink::new_joint(Network::Regtest, srv.mailbox_keypair().public_key(), mailbox, coin).unwrap()
 }
 
@@ -24,8 +19,8 @@ pub(super) fn assert_owner_refusal(error: tonic::Status, key: PublicKey, reason:
 
 pub(super) async fn owner_rows(db: &Db, keys: &[PublicKey]) -> Vec<(String, String, String, String)> {
 	let keys = keys.iter().map(ToString::to_string).collect::<Vec<_>>();
-	db.read(async |tx| Ok(tx.query("SELECT user_pubkey,mailbox_pk,blinded_id,signature \
-		FROM expiry_owner_key WHERE user_pubkey=ANY($1) ORDER BY user_pubkey", &[&keys]).await?
+	db.read(async |tx| Ok(tx.query("SELECT user_pubkey,mailbox_pk,blinded_id,joint_proof \
+		FROM owner_key WHERE user_pubkey=ANY($1) ORDER BY user_pubkey", &[&keys]).await?
 		.into_iter().map(|row| (row.get(0), row.get(1), row.get(2), row.get(3))).collect())).await.unwrap()
 }
 

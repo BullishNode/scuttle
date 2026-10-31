@@ -192,9 +192,9 @@ impl StorageAdaptor for RoundWriteGate {
 			self.fault.hits.fetch_add(1, Ordering::SeqCst);
 			return Err(std::io::Error::other("round checkpoint write unavailable").into());
 		}
-		if record.partition == partition::FALLBACK_SNAPSHOT && self.fault.snapshot_armed.load(Ordering::SeqCst) {
+		if record.partition == partition::FALLBACK_RECEIPT && self.fault.snapshot_armed.load(Ordering::SeqCst) {
 			self.fault.snapshot_hits.fetch_add(1, Ordering::SeqCst);
-			return Err(std::io::Error::other("fallback snapshot write unavailable").into());
+			return Err(std::io::Error::other("fallback receipt write unavailable").into());
 		}
 		if record.partition == partition::VTXO && self.fault.unlock_armed.load(Ordering::SeqCst) {
 			self.fault.unlock_hits.fetch_add(1, Ordering::SeqCst);

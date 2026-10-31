@@ -250,17 +250,16 @@ async fn two_receipts() {
 	recipient.stop_daemon_wait().await.unwrap();
 	let source = donor.get_full_vtxo(ids[0]).await.unwrap();
 	assert_eq!(source.amount(), sat(100_000));
-	let binding = recipient.fallback_destination().await.unwrap();
-	let donor_binding = donor.fallback_destination().await.unwrap();
-	binding.verify(Network::Regtest, recipient.mailbox_identifier().as_pubkey()).unwrap();
-	donor_binding.verify(Network::Regtest, donor.mailbox_identifier().as_pubkey()).unwrap();
-	assert_ne!(binding.spk, donor_binding.spk);
-	assert!(sat(1_200) > sat(1_000) && sat(200) > Amount::ZERO && sat(200) < binding.spk.minimal_non_dust());
+	let binding = recipient.fallback_script();
+	let donor_binding = donor.fallback_script();
+
+	assert_ne!(binding, donor_binding);
+	assert!(sat(1_200) > sat(1_000) && sat(200) > Amount::ZERO && sat(200) < binding.minimal_non_dust());
 	let first_board = ctx.bitcoind().await_transaction(source.chain_anchor().txid).await;
 	source.validate(&first_board).unwrap();
 	for input in &first_board.input {
 		let funding = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		assert!(funding.output.iter().all(|output| output.script_pubkey != binding.spk && output.script_pubkey != donor_binding.spk),
+		assert!(funding.output.iter().all(|output| output.script_pubkey != binding && output.script_pubkey != donor_binding),
 			"ordinary funding addresses must differ from the fresh registered fallback scripts");
 	}
 	let first_ordinary = donor_cli.onchain_utxos().await.into_iter().map(|coin| (coin.outpoint, coin.amount)).collect::<BTreeMap<_, _>>();
@@ -271,9 +270,9 @@ async fn two_receipts() {
 	let leaves = transfer(&ctx, &srv, &donor, &recipient, &source, sat(1_200)).await;
 	assert_eq!(leaves.len(), 2);
 	let old = ExpectedLeaf { coin: leaves[0].clone(), mailbox: recipient.mailbox_identifier(),
-		script: binding.spk.clone(), fee: 0, payout: 0, forfeited: 1_200, group_payout: 0 };
+		script: binding.clone(), fee: 0, payout: 0, forfeited: 1_200, group_payout: 0 };
 	let change = ExpectedLeaf { coin: leaves[1].clone(), mailbox: donor.mailbox_identifier(),
-		script: donor_binding.spk.clone(), fee: 1_000, payout: 97_800, forfeited: 0, group_payout: 97_800 };
+		script: donor_binding.clone(), fee: 1_000, payout: 97_800, forfeited: 0, group_payout: 97_800 };
 	balances(&recipient, sat(1_200)).await;
 	balances(&donor, sat(98_800)).await;
 	let baseline = recipient.history().await.unwrap();
@@ -283,8 +282,7 @@ async fn two_receipts() {
 
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	for (mailbox, record) in [(old.mailbox, &binding), (change.mailbox, &donor_binding)] {
-		let actual = db.read(async |tx| tx.get_fallback(mailbox.as_pubkey()).await).await.unwrap().unwrap();
-		assert!(actual.same_binding(record));
+		assert_eq!(*record, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.as_pubkey().x_only_public_key().0, None));
 	}
 	let core = ctx.bitcoind().sync_client();
 	let mut sponsors = BTreeMap::new();
@@ -309,7 +307,7 @@ async fn two_receipts() {
 	let first = confirm_epoch(&ctx, &srv, &db, &[old.clone(), change], start, 122, 128).await;
 	let change_id = leaves[1].id();
 	let first_cut = financial_cut(&ctx, &srv, &db, scan_height, &roots, &sponsors, &[&first],
-		&[(binding.spk.clone(), None), (donor_binding.spk.clone(), Some(97_800))], &BTreeSet::from([old.coin.id(), change_id])).await;
+		&[(binding.clone(), None), (donor_binding.clone(), Some(97_800))], &BTreeSet::from([old.coin.id(), change_id])).await;
 	assert_eq!(first_cut["selected_input_sat"], 500_000);
 	let returned = recipient_cli.client().await;
 	returned.sync_fallback_payouts().await.unwrap();
@@ -342,20 +340,19 @@ async fn two_receipts() {
 	assert_eq!(later_source.amount(), sat(100_000));
 	assert_ne!(later_source.chain_anchor(), source.chain_anchor());
 	assert!(later_source.expiry_height() > source.expiry_height());
-	let later_binding = later.fallback_destination().await.unwrap();
-	later_binding.verify(Network::Regtest, later.mailbox_identifier().as_pubkey()).unwrap();
-	let actual_later = db.read(async |tx| tx.get_fallback(later.mailbox_identifier().as_pubkey()).await).await.unwrap().unwrap();
-	assert!(actual_later.same_binding(&later_binding));
-	assert_ne!(later_binding.spk, binding.spk);
-	assert_ne!(later_binding.spk, donor_binding.spk);
+	let later_binding = later.fallback_script();
+	assert_eq!(later_binding, bitcoin::ScriptBuf::new_p2tr(&ark::SECP,
+		later.mailbox_identifier().as_pubkey().x_only_public_key().0, None));
+	assert_ne!(later_binding, binding);
+	assert_ne!(later_binding, donor_binding);
 	let second_board = ctx.bitcoind().await_transaction(later_source.chain_anchor().txid).await;
 	let forbidden = first_cut["all_graph_outpoints"].as_array().unwrap().iter()
 		.map(|point| point.as_str().unwrap().parse::<OutPoint>().unwrap()).collect::<BTreeSet<_>>();
 	for input in &second_board.input {
 		assert!(!forbidden.contains(&input.previous_output));
 		let funding = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		assert!(funding.output.iter().all(|output| output.script_pubkey != binding.spk
-			&& output.script_pubkey != donor_binding.spk && output.script_pubkey != later_binding.spk),
+		assert!(funding.output.iter().all(|output| output.script_pubkey != binding
+			&& output.script_pubkey != donor_binding && output.script_pubkey != later_binding),
 			"later ordinary funding must not create an apparent fallback payment");
 		assert!(funding.input.iter().all(|input| !forbidden.contains(&input.previous_output)),
 			"later source funding must not recycle first-cut operator/customer/watch returns");
@@ -369,10 +366,10 @@ async fn two_receipts() {
 	let later_leaves = transfer(&ctx, &srv, &later, &recipient, &later_source, sat(100_000)).await;
 	assert_eq!(later_leaves.len(), 1);
 	let new = ExpectedLeaf { coin: later_leaves[0].clone(), mailbox: recipient.mailbox_identifier(),
-		script: binding.spk.clone(), fee: 1_000, payout: 99_000, forfeited: 0, group_payout: 99_000 };
+		script: binding.clone(), fee: 1_000, payout: 99_000, forfeited: 0, group_payout: 99_000 };
 	assert_ne!(new.coin.id(), old.coin.id());
 	assert_ne!(new.coin.user_pubkey(), old.coin.user_pubkey());
-	assert!(recipient.fallback_destination().await.unwrap().same_binding(&binding));
+	assert_eq!(recipient.fallback_script(), binding);
 	assert_eq!(receipt(&recipient, &old, &first).await, old_receipt);
 	assert_eq!(history(recipient.history().await.unwrap(), &baseline, &[&old]), first_history);
 	balances(&recipient, sat(100_000)).await;
@@ -384,7 +381,7 @@ async fn two_receipts() {
 	let second = confirm_epoch(&ctx, &srv, &db, std::slice::from_ref(&new), start, 122, 128).await;
 	assert_ne!(second.allocations[&new.coin.id()], first.allocations[&old.coin.id()]);
 	let expected_ids = BTreeSet::from([old.coin.id(), change_id, new.coin.id()]);
-	let payees = [(binding.spk.clone(), Some(99_000)), (donor_binding.spk.clone(), Some(97_800)), (later_binding.spk.clone(), None)];
+	let payees = [(binding.clone(), Some(99_000)), (donor_binding.clone(), Some(97_800)), (later_binding.clone(), None)];
 	let final_cut = financial_cut(&ctx, &srv, &db, scan_height, &roots, &sponsors, &[&first, &second], &payees, &expected_ids).await;
 	assert_eq!(final_cut["selected_input_sat"], 600_000);
 	let final_wallet = recipient_cli.client().await;
@@ -408,7 +405,7 @@ async fn two_receipts() {
 	assert_eq!(repeated_cut, final_cut);
 	let reopened = recipient_cli.client().await;
 	reopened.sync_fallback_payouts().await.unwrap();
-	assert!(reopened.fallback_destination().await.unwrap().same_binding(&binding));
+	assert_eq!(reopened.fallback_script(), binding);
 	assert_eq!(receipt(&reopened, &old, &first).await, old_receipt);
 	assert_eq!(receipt(&reopened, &new, &second).await, new_receipt);
 	assert_eq!(history(reopened.history().await.unwrap(), &baseline, &[&old, &new]), final_history);

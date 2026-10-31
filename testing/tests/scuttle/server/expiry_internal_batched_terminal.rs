@@ -63,7 +63,7 @@ async fn batched_terminal(reorg: bool) {
 	let invoice = recipient.bolt11_invoice(sat(280_000),None,None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
 	let receive_key = recipient.new_address().await.unwrap().policy().user_pubkey();
-	let receive_destination = recipient.fallback_destination().await.unwrap();
+	let receive_destination = recipient.fallback_script();
 	let actor = Box::pin(ctx.bark("sender",&srv).cfg(|cfg|cfg.daemon_manual_sync=true).funded(sat(600_000)).create()).await;
 	let mut ids = Vec::new();
 	for _ in 0..3 {
@@ -81,9 +81,9 @@ async fn batched_terminal(reorg: bool) {
 	}
 	assert_eq!(inputs.iter().map(Vtxo::chain_anchor).collect::<BTreeSet<_>>().len(),3);
 	assert!(inputs.iter().all(|input|input.amount()==sat(100_000)));
-	let fallback = sender.fallback_destination().await.unwrap();
-	fallback.verify(bitcoin::Network::Regtest,sender.mailbox_identifier().as_pubkey()).unwrap();
-	assert_ne!(fallback.spk,receive_destination.spk);
+	let fallback = sender.fallback_script();
+
+	assert_ne!(fallback,receive_destination);
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let deadline = tip+srv.config().htlc_send_expiry_delta+BlockDelta::new(2);
 	let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints(inputs,
@@ -101,7 +101,7 @@ async fn batched_terminal(reorg: bool) {
 		invoice:invoice.to_string(),payment_amount_sat:280_000,
 		htlc_vtxo_ids:sources.iter().map(|source|source.id().to_bytes().to_vec()).collect(),mailbox_id:None,retry_for_secs:Some(5),
 	}).await.unwrap();
-	let response = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+	let response = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash:hash.to_vec(),user_pubkey:receive_key.serialize().to_vec(),
 		htlc_recv_expiry:(tip+BlockDelta::new(36)).to_u32(),lightning_receive_anti_dos:None,
@@ -182,7 +182,7 @@ async fn batched_terminal(reorg: bool) {
 		lock_time:clauses.iter().max_by_key(|clause|clause.timelock_height).unwrap().locktime(),
 		input:sources[..2].iter().zip(&clauses).map(|(source,clause)|TxIn {previous_output:source.point(),
 			script_sig:Default::default(),sequence:clause.sequence(),witness:Witness::new()}).collect(),
-		output:vec![TxOut {value:sat(198_000),script_pubkey:fallback.spk.clone()}],
+		output:vec![TxOut {value:sat(198_000),script_pubkey:fallback.clone()}],
 	};
 	if reorg {
 		claim.lock_time = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32).to_locktime().unwrap();
@@ -260,9 +260,9 @@ async fn batched_terminal(reorg: bool) {
 	// The refund spends only the unpaid original's own backing. Separate
 	// funded operator payouts have already reclaimed the receive grants.
 	assert_eq!(parent.input.iter().map(|input|input.previous_output).collect::<BTreeSet<_>>(),BTreeSet::from([unpaid_prefix]));
-	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx,&db,&grants,&receive_destination.spk).await;
-	assert!(!parent.output.iter().any(|output|output.script_pubkey==receive_destination.spk));
-	let customer=parent.output.iter().enumerate().filter(|(_,output)|output.script_pubkey==fallback.spk).collect::<Vec<_>>();
+	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx,&db,&grants,&receive_destination).await;
+	assert!(!parent.output.iter().any(|output|output.script_pubkey==receive_destination));
+	let customer=parent.output.iter().enumerate().filter(|(_,output)|output.script_pubkey==fallback).collect::<Vec<_>>();
 	assert_eq!(customer.len(),1); assert_eq!(customer[0].1.value,sat(99_000));
 	let payout=OutPoint::new(parent.compute_txid(),u32::try_from(customer[0].0).unwrap());
 	assert_eq!(parent.output.iter().filter(|output|output.script_pubkey==operator.script_pubkey()).map(|output|output.value).sum::<bitcoin::Amount>(),sat(1_000));

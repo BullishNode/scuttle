@@ -11,7 +11,6 @@ use ark::ProtocolEncoding;
 use bitcoin_ext::{BlockDelta, TxOutExt};
 use ark_testing::{TestContext, btc, util::{FutureExt, poll_interval}};
 use ark_testing::balance::assert_balance_consistent;
-use ark_testing::onchain::AppBip84Wallet;
 
 use bark::actions::lightning::pay::LightningSendState;
 use bark::actions::lightning::receive::LightningReceiveState;
@@ -264,7 +263,7 @@ async fn pay_hold_refused() {
 			assert_eq!(ids.len(), 1, "this bounded fixture needs one real HTLC source");
 			let source = absent.get_full_vtxo(ids[0]).await.unwrap();
 			assert_eq!(source.amount(), send.total_amount());
-			let registration = absent.fallback_destination().await.unwrap();
+			let registration = absent.fallback_script();
 			let config = absent.config().clone();
 			drop(absent);
 			hold_client.cancel(hold::CancelRequest { payment_hash: hash.to_vec() }).await.unwrap();
@@ -388,7 +387,7 @@ async fn pay_hold_refused() {
 					let block = core.get_block(&core.get_block_hash(height).unwrap()).unwrap();
 					for tx in block.txdata {
 						for (index, output) in tx.output.iter().enumerate() {
-							if output.script_pubkey == registration.spk {
+							if output.script_pubkey == registration {
 								points.insert(OutPoint::new(tx.compute_txid(), index as u32), output.value);
 							}
 						}
@@ -401,13 +400,13 @@ async fn pay_hold_refused() {
 					let actual = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
 					assert!(actual.confirmations >= 6);
 					assert_eq!(actual.value, *value);
-					assert_eq!(actual.script_pub_key.hex, registration.spk.as_bytes());
+					assert_eq!(actual.script_pub_key.hex, registration.as_bytes());
 				}
 				let mut actual = bitcoin::Amount::ZERO;
 				for height in 0..=u64::from(confirmed.to_u32()) {
 					let block = core.get_block(&core.get_block_hash(height).unwrap()).unwrap();
 					actual += block.txdata.iter().flat_map(|tx| &tx.output)
-						.filter(|output| output.script_pubkey == registration.spk).map(|output| output.value).sum::<bitcoin::Amount>();
+						.filter(|output| output.script_pubkey == registration).map(|output| output.value).sum::<bitcoin::Amount>();
 				}
 				assert_eq!(actual, board - fees, "no additional payment may reuse this sender's payout script");
 			}

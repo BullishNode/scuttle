@@ -57,12 +57,12 @@ async fn upsert_vtxo() {
 	let vtxo2 = ServerVtxo::from(VTXO_VECTORS.round1_vtxo.clone());
 	let vtxo3 = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());
 
-	db.write(async |t| t.upsert_vtxos([vtxo1.clone(), vtxo2.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.expect("Query succeeded");
+	db.write(async |t| t.upsert_vtxos([vtxo1.clone(), vtxo2.clone()]).await).await.expect("Query succeeded");
 	db.read(async |t| t.get_user_vtxos_by_id(&[vtxo1.id(), vtxo2.id()]).await).await.expect("Query succeeded");
 	db.read(async |t| t.get_user_vtxos_by_id(&[vtxo3.id()]).await).await.expect_err("Query Failed because 3 isn't in the db yet");
 
 	// It shouldn't complain if vtxo2 is already present
-	db.write(async |t| t.upsert_vtxos([vtxo2.into(), vtxo3.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.expect("Query succeeded");
+	db.write(async |t| t.upsert_vtxos([vtxo2.into(), vtxo3.clone()]).await).await.expect("Query succeeded");
 }
 
 
@@ -355,7 +355,7 @@ async fn get_first_unsigned_virtual_transaction() {
 	let update = VtxoTreeUpdate::new()
 		.upsert_signed_tx([tx1.clone(), tx3.clone()])
 		.upsert_unsigned_tx([txid2]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.unwrap();
 
 	// Test case 1: [tx1, tx2, tx3] -> Some(tx2)
 	let result = db.read(async |t| t.get_first_unsigned_virtual_transaction(&[txid1, txid2, txid3]).await).await.unwrap();
@@ -392,7 +392,7 @@ async fn upsert_vtxos_with_txid() {
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
 
 	// Upsert vtxos
-	db.write(async |t| t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.expect("Failed to upsert vtxo");
+	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.expect("Failed to upsert vtxo");
 
 	// Retrieve vtxos and verify they exist
 	let vtxos = db.read(async |t| t.get_user_vtxos_by_id(&[vtxo.id()]).await).await.expect("Failed to get vtxo");
@@ -493,7 +493,7 @@ async fn ban_vtxo() {
 	// Insert a vtxo
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
 	let vtxo_id = vtxo.id();
-	db.write(async |t| t.upsert_vtxos(&[vtxo], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.expect("upsert succeeded");
+	db.write(async |t| t.upsert_vtxos(&[vtxo]).await).await.expect("upsert succeeded");
 
 	// Initially no vtxos are banned
 	let banned = db.read(async |t| t.list_banned_vtxos(BlockHeight::new(100)).await).await.expect("list succeeded");
@@ -612,11 +612,11 @@ async fn postgres_offboards() {
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	// Register the vtxo's transactions in the virtual transaction tree
 	let signed_txs: Vec<_> = vtxo.transactions().map(|item| item.tx).collect();
-	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_signed_tx(signed_txs), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_signed_tx(signed_txs)).await).await.unwrap();
 
 	// Initially no uncommitted offboards
 	let uncommitted = db.read(async |t| t.get_uncommitted_offboards().await).await.unwrap();
@@ -792,7 +792,7 @@ async fn vtxo_mailbox() {
 	db.write(async |t| t.upsert_vtxos(&[
 		ServerVtxo::from(vtxo1.clone()),
 		ServerVtxo::from(vtxo2.clone()),
-	], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	]).await).await.unwrap();
 
 	// Empty mailbox returns nothing
 	let result = db.read(async |t| t.get_mailbox_entries(mailbox_id.clone(), 0, 10).await).await.unwrap();
@@ -863,7 +863,7 @@ async fn store_vtxos_in_mailbox_duplicate() {
 	db.write(async |t| t.upsert_vtxos(&[
 		ServerVtxo::from(vtxo1.clone()),
 		ServerVtxo::from(vtxo2.clone()),
-	], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	]).await).await.unwrap();
 
 	// First post stores vtxo1 and returns a checkpoint.
 	let cp1 = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id.clone(), &[vtxo1.clone()]).await).await.unwrap()
@@ -906,7 +906,7 @@ async fn store_vtxo_ids_in_mailbox_duplicate() {
 	db.write(async |t| t.upsert_vtxos(&[
 		ServerVtxo::from(vtxo1.clone()),
 		ServerVtxo::from(vtxo2.clone()),
-	], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	]).await).await.unwrap();
 
 	// First post stores vtxo1's ID and returns a checkpoint.
 	let cp1 = db.write(async |t| t.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox_id.clone(), &[vtxo1.id()]).await).await.unwrap()
@@ -952,7 +952,7 @@ async fn mailbox_page_returns_whole_batch() {
 	db.write(async |t| t.upsert_vtxos(&[
 		ServerVtxo::from(vtxo1.clone()),
 		ServerVtxo::from(vtxo2.clone()),
-	], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	]).await).await.unwrap();
 
 	db.write(async |t| t.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox_id.clone(), &[vtxo1.id(), vtxo2.id()]).await).await.unwrap()
 		.expect("should return a checkpoint");
@@ -988,7 +988,7 @@ async fn vtxo_pool() {
 	db.write(async |t| t.upsert_vtxos(&[
 		ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone()),
 		ServerVtxo::from(VTXO_VECTORS.round1_vtxo.clone()),
-	], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	]).await).await.unwrap();
 
 	// Load from empty pool
 	let pool: Vec<_> = db.load_vtxopool().await.unwrap().try_collect().await.unwrap();
@@ -1027,11 +1027,11 @@ async fn watchman_frontier() {
 
 	// Store the vtxo row that the frontier columns hang off of
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	// Also store the funding virtual transaction that watchman queries for
 	let funding_txid = vtxo.point().txid;
-	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_unsigned_funding_tx(funding_txid), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_unsigned_funding_tx(funding_txid)).await).await.unwrap();
 
 	// Frontier starts empty
 	let frontier = db.read(async |t| t.get_frontier().await).await.unwrap();
@@ -1083,7 +1083,7 @@ async fn watchman_reorg() {
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 	db.write(async |t| t.add_vtxo_to_frontier(vtxo.id()).await).await.unwrap();
 	db.write(async |t| t.register_vtxo_confirmation(vtxo.id(), BlockHeight::new(100)).await).await.unwrap();
 
@@ -1109,7 +1109,7 @@ async fn watchman_get_vtxos_by_txid() {
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let vtxo_txid = vtxo.point().txid;
 	let vtxos = db.read(async |t| t.get_vtxos_by_txid(vtxo_txid).await).await.unwrap();
@@ -1144,9 +1144,9 @@ async fn watchman_unfrontiered_funding_txids() {
 
 	// Insert vtxo + its funding virtual_transaction (is_funding = true)
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 	let funding_txid = vtxo.point().txid;
-	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_unsigned_funding_tx(funding_txid), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_unsigned_funding_tx(funding_txid)).await).await.unwrap();
 
 	// Now funding_txid is unfrontiered
 	let unfrontiered = db.read(async |t| t.get_unfrontiered_funding_txids().await).await.unwrap();
@@ -1196,7 +1196,7 @@ async fn round_participation() {
 
 	// Insert a vtxo to use as an input
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let unlock_preimage: UnlockPreimage = [1u8; 32];
 
@@ -1268,7 +1268,7 @@ async fn round_participation_supersedes_on_same_input() {
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let output = StoredRoundOutput {
 		vtxo_request: VtxoRequest {
@@ -1314,7 +1314,7 @@ async fn round_participation_forfeited_at() {
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let unlock_preimage: UnlockPreimage = [2u8; 32];
 	let unlock_hash = UnlockHash::hash(&unlock_preimage);
@@ -1385,7 +1385,7 @@ async fn set_forfeit_transactions_is_idempotent() {
 
 	let input_vtxo_ids = input_vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
 
-	db.write(async |t| t.upsert_vtxos(input_vtxos.clone(), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(input_vtxos.clone()).await).await.unwrap();
 
 
 	// We will create a round participation that spends all three vtxos.
@@ -1518,7 +1518,7 @@ async fn set_forfeit_transactions_rejects_non_round_spent_vtxo() {
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let unlock_preimage: UnlockPreimage = [9u8; 32];
 	let unlock_hash = UnlockHash::hash(&unlock_preimage);
@@ -1581,7 +1581,7 @@ async fn round_participation_same_vtxo_multiple_pending() {
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let preimage1: UnlockPreimage = [1u8; 32];
 	let preimage2: UnlockPreimage = [2u8; 32];
@@ -1789,7 +1789,7 @@ async fn lightning_payment_attempt_stores_protocol_fee() {
 	let invoice = Invoice::Bolt11(bolt11.clone());
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.unwrap();
 
 	let expected_block_height = BlockHeight::new(850_000);
 	let expected_user_fee = sat(1_234);
@@ -2277,7 +2277,7 @@ async fn lightning_generated_invoice_and_htlc_subscription() {
 
 	// Insert a vtxo and attach it to the subscription (htlcs-ready transition)
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	db.write(async |t| t.update_lightning_htlc_subscription_with_htlcs(sub_id, [vtxo.id()]).await).await.unwrap();
 
@@ -2545,7 +2545,7 @@ async fn htlc_vtxo_chain_resolution_cleared_above_fork_height() {
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.unwrap();
 
 	let payment_hash = Preimage::random().compute_payment_hash();
 	db.write(async |t| htlc_vtxo::create_htlc_vtxos(
@@ -2582,7 +2582,7 @@ async fn htlc_vtxo_chain_resolution_kept_at_fork_height() {
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.unwrap();
 
 	let payment_hash = Preimage::random().compute_payment_hash();
 	db.write(async |t| htlc_vtxo::create_htlc_vtxos(

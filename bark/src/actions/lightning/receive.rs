@@ -347,7 +347,7 @@ pub(crate) async fn start_lightning_receive(
 	let destination = claim_destination.as_ref().map(|destination| -> anyhow::Result<_> {
 		let link = destination.owner_link(network, ark_info.mailbox_pubkey)?
 			.ok_or(FallbackRefusal::RecipientMustUpdate)?;
-		Ok(protos::VtxoRequest {
+		Ok(protos::VtxoRequest { retired_owner_proof: None,
 			amount: net_amount.to_sat(), policy: destination.policy().serialize(),
 			owner_proof: Some(link.into()),
 		})
@@ -542,7 +542,7 @@ async fn prepare_lightning_receive_htlcs(
 
 	let htlc_recv_expiry = htlc_recv_expiry(current_height, recv.htlc_recv_cltv_delta);
 	let keypair = wallet.peek_keypair(recv.key_index).await.retry()?;
-	let req = protos::PrepareLightningReceiveClaimRequest {
+	let req = protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 		owner_proof: Some(wallet.owner_link(keypair.public_key()).await.retry()?.into()),
 		payment_hash: payment_hash.to_vec(),
 		user_pubkey: keypair.public_key().serialize().to_vec(),

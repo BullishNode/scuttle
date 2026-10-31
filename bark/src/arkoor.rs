@@ -193,7 +193,7 @@ impl Wallet {
 		check_delivery(address.delivery())?;
 		address.owner_link(network, ark_info.mailbox_pubkey)
 			.map_err(|e| ArkoorAddressError::Other(e.to_string()))?
-			.filter(OwnerLink::is_joint).ok_or(ArkoorAddressError::RecipientMustUpdate)?;
+			.ok_or(ArkoorAddressError::RecipientMustUpdate)?;
 
 		Ok(())
 	}

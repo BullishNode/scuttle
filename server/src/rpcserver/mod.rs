@@ -298,7 +298,7 @@ mod fallback_tests {
 	fn ownership_refusal_metadata_names_actual_output_key() {
 		let key = VTXO_VECTORS.board_vtxo.user_pubkey();
 		for refusal in [OwnershipRefusal::Required(key), OwnershipRefusal::Invalid(key),
-			OwnershipRefusal::Conflicting(key), OwnershipRefusal::UnregisteredMailbox(key)] {
+			OwnershipRefusal::Conflicting(key)] {
 			let reason = refusal.reason();
 			let status = anyhow::Error::new(refusal).context("admission refused").to_status();
 			assert_eq!(status.code(), tonic::Code::InvalidArgument);

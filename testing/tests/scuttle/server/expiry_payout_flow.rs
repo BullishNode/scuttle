@@ -65,7 +65,7 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 		assert_eq!(funding.output[source.chain_anchor().vout as usize].value, quote.gross_amount);
 		assert_eq!(quote.gross_amount, source.amount() + quote.fee);
 	}
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	let expected = source.amount() - sat(1_000);
 	let (source_child_index, _) = client.pubkey_keypair(&source.user_pubkey()).await.unwrap()
 		.expect("original source public key must have a stored derivation index");
@@ -130,7 +130,7 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 	assert_eq!(parent.version.0, 3);
 	assert!(parent.vsize() <= 10_000);
 	let payouts = parent.output.iter().enumerate()
-		.filter(|(_, output)| output.script_pubkey == destination.spk).collect::<Vec<_>>();
+		.filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1, "one user in one backing output pays one fee");
 	assert_eq!(payouts[0].1.value, expected);
 	let payout_point = OutPoint::new(parent_txid, payouts[0].0 as u32);
@@ -147,7 +147,7 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 		assert_eq!(parent.output.len(), 3);
 		assert_eq!(payouts[0].0, 0);
 		assert_eq!(parent.output[1].value, quote.fee + sat(1_000));
-		assert_ne!(parent.output[1].script_pubkey, destination.spk);
+		assert_ne!(parent.output[1].script_pubkey, destination);
 		assert_eq!(parent.output[2], bitcoin_ext::fee::fee_anchor());
 		assert_eq!(child.input.len(), 2);
 		assert!(child.input.iter().any(|input| input.previous_output == OutPoint::new(parent_txid, 2)));
@@ -193,9 +193,9 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 			lock_manager: Some(Box::new(bark::lock_manager::memory::MemoryLockManager::new())), ..Default::default() }).await.unwrap();
 	let debug = bark_json::cli::DebugInfo::from(reader.debug_info().await.unwrap());
 	assert_eq!(serde_json::to_value(debug).unwrap(), serde_json::to_value(original_debug).unwrap());
-	let fallback = reader.fallback_destination().await.unwrap();
+	let fallback = reader.fallback_script();
 	assert_eq!(fallback, destination);
-	fallback.verify(bitcoin::Network::Regtest, reader.mailbox_keypair().public_key()).unwrap();
+
 	drop(reader);
 	let db_wallet = std::sync::Arc::new(bark::persist::sqlite::SqliteClient::open(restored.datadir().join("db.sqlite")).unwrap());
 	let onchain = bark::onchain::OnchainWallet::load_or_create(bitcoin::Network::Regtest, seed.to_seed(""), db_wallet).await.unwrap();

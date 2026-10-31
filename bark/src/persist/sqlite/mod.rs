@@ -22,7 +22,7 @@ use bitcoin::secp256k1::PublicKey;
 use chrono::DateTime;
 use lightning_invoice::Bolt11Invoice;
 use log::debug;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use ark::{Vtxo, VtxoId};
 use ark::lightning::{PaymentHash, Preimage};
@@ -296,38 +296,49 @@ impl BarkPersister for SqliteClient {
 		tx.commit().context("Failed to commit transaction")
 	}
 
-	async fn get_fallback_snapshot(&self) -> anyhow::Result<crate::FallbackSnapshot> {
-		use rusqlite::OptionalExtension;
-		let bytes: Option<Vec<u8>> = self.connect()?.query_row(
-			"SELECT snapshot FROM bark_fallback_snapshot WHERE id = 1", [], |row| row.get(0),
-		).optional()?;
-		Ok(bytes.map(|bytes| serde_json::from_slice(&bytes)).transpose()?.unwrap_or_default())
+
+
+	async fn get_fallback_receipts(&self) -> anyhow::Result<Vec<crate::FallbackReceipt>> {
+		let conn = self.connect()?;
+		let mut stmt = conn.prepare("SELECT receipt FROM bark_fallback_receipt ORDER BY vtxo_id")?;
+		let bytes = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?.collect::<Result<Vec<_>, _>>()?;
+		bytes.into_iter().map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into)).collect()
 	}
 
-	async fn store_fallback_snapshot(&self, snapshot: &crate::FallbackSnapshot) -> anyhow::Result<()> {
-		let bytes = serde_json::to_vec(snapshot)?;
-		self.connect()?.execute(
-			"INSERT INTO bark_fallback_snapshot (id, snapshot) VALUES (1, ?1)
-			ON CONFLICT (id) DO UPDATE SET snapshot = excluded.snapshot", [&bytes],
-		)?;
+	async fn store_fallback_receipt(&self, receipt: &crate::FallbackReceipt) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		let previous: Option<Vec<u8>> = tx.query_row("SELECT receipt FROM bark_fallback_receipt WHERE vtxo_id=?1",
+			[receipt.vtxo_id.to_string()], |row| row.get(0)).optional()?;
+		if let Some(previous) = previous {
+			let previous: crate::FallbackReceipt = serde_json::from_slice(&previous)?;
+			ensure!(previous.owner_mailbox == receipt.owner_mailbox && previous.gross == receipt.gross
+				&& previous.source_vtxo_ids == receipt.source_vtxo_ids, "immutable fallback receipt source differs");
+		}
+		let changed = tx.execute("INSERT INTO bark_fallback_receipt (vtxo_id,owner_mailbox,gross_sat,receipt)
+			VALUES(?1,?2,?3,?4) ON CONFLICT(vtxo_id) DO UPDATE SET receipt=excluded.receipt
+			WHERE bark_fallback_receipt.owner_mailbox=excluded.owner_mailbox AND bark_fallback_receipt.gross_sat=excluded.gross_sat",
+			rusqlite::params![receipt.vtxo_id.to_string(), receipt.owner_mailbox.to_string(),
+				i64::try_from(receipt.gross.to_sat())?, serde_json::to_vec(receipt)?])?;
+		ensure!(changed == 1, "immutable fallback receipt source differs");
+		tx.commit()?;
 		Ok(())
 	}
 
-	async fn get_fallback_record(&self) -> anyhow::Result<Option<ark::fallback::FallbackRegistration>> {
-		query::get_fallback_record(&self.connect()?)
+	async fn remove_fallback_receipt(&self, id: VtxoId) -> anyhow::Result<()> {
+		self.connect()?.execute("DELETE FROM bark_fallback_receipt WHERE vtxo_id=?1", [id.to_string()])?;
+		Ok(())
 	}
 
-	async fn store_fallback_record(&self, record: &ark::fallback::FallbackRegistration) -> anyhow::Result<()> {
-		query::store_fallback_record(&self.connect()?, record)
-	}
 
-	async fn get_pending_fallback_record(&self) -> anyhow::Result<Option<ark::fallback::FallbackRegistration>> {
-		query::get_pending_fallback_record(&self.connect()?)
-	}
 
-	async fn store_pending_fallback_record(&self, record: &ark::fallback::FallbackRegistration) -> anyhow::Result<()> {
-		query::store_pending_fallback_record(&self.connect()?, record)
-	}
+
+
+
+
+
+
+
 
 	async fn get_last_vtxo_key_index(&self) -> anyhow::Result<Option<u32>> {
 		let conn = self.connect()?;
@@ -569,31 +580,35 @@ mod test {
 	use super::*;
 
 	#[test]
-	fn fallback_tables_reopen_without_changing_wallet_records() {
+	fn fallback_receipts_reopen_without_changing_wallet_records() {
 		let (path, conn) = in_memory_db();
 		let db = SqliteClient::open(&path).unwrap();
 		let history = conn.prepare("SELECT id,value,created_at FROM migrations ORDER BY id").unwrap()
 			.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
 			.unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-		assert!(!history.is_empty());
-		// These are persistence sentinels, not authenticated financial proofs.
-		conn.execute_batch("INSERT INTO bark_fallback_record (id,record,spk) VALUES (1,X'01',X'02');
-			INSERT INTO bark_fallback_snapshot (id,snapshot) VALUES (1,X'04');
-			INSERT INTO bark_properties (id,network,fingerprint) VALUES ('control','regtest','deadbeef');").unwrap();
-		assert_eq!(conn.query_row("SELECT registered FROM bark_fallback_record", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-		conn.execute("UPDATE bark_fallback_record SET registered=0 WHERE id=1", []).unwrap();
+		// Persistence sentinels are deliberately not authenticated financial proofs.
+		conn.execute("INSERT INTO bark_fallback_receipt VALUES ('control',?1,10000,X'04')", ["02".repeat(33)]).unwrap();
 		drop(db);
 		let _reopened = SqliteClient::open(&path).unwrap();
 		let after = conn.prepare("SELECT id,value,created_at FROM migrations ORDER BY id").unwrap()
 			.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
 			.unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
 		assert_eq!(after, history);
-		assert_eq!(conn.query_row("SELECT record,spk,registered FROM bark_fallback_record", [],
-			|row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?)))
-			.unwrap(), (vec![1], vec![2], 0));
-		assert_eq!(conn.query_row("SELECT snapshot FROM bark_fallback_snapshot", [], |row| row.get::<_, Vec<u8>>(0)).unwrap(), vec![4]);
-		assert_eq!(conn.query_row("SELECT network,fingerprint FROM bark_properties WHERE id='control'", [],
-			|row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).unwrap(), ("regtest".to_owned(), "deadbeef".to_owned()));
+		assert_eq!(conn.query_row("SELECT receipt FROM bark_fallback_receipt WHERE vtxo_id='control'", [],
+			|row| row.get::<_, Vec<u8>>(0)).unwrap(), vec![4]);
+	}
+
+	#[test]
+	fn registration_shaped_wallet_is_refused_even_with_mailbox_identity() {
+		let (path,conn) = in_memory_db();
+		let db = SqliteClient::open(&path).unwrap();
+		drop(db);
+		conn.execute_batch("CREATE TABLE bark_fallback_record(id INTEGER PRIMARY KEY,record BLOB);
+			INSERT INTO bark_fallback_record VALUES(1,X'010203');").unwrap();
+		let changes: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+		assert!(SqliteClient::open(&path).is_err());
+		assert_eq!(conn.query_row("SELECT total_changes()", [], |row| row.get::<_,i64>(0)).unwrap(), changes);
+		assert_eq!(conn.query_row("SELECT record FROM bark_fallback_record", [], |row| row.get::<_,Vec<u8>>(0)).unwrap(), vec![1,2,3]);
 	}
 
 	#[tokio::test]

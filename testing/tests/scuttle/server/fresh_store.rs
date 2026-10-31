@@ -15,13 +15,14 @@ async fn fresh_scuttle_schema_reopens_without_history_changes() {
 	assert!(client.query_one("SELECT to_regclass('scuttle.refinery_schema_history') IS NULL", &[])
 		.await.unwrap().get::<_, bool>(0));
 	let missing: i64 = client.query_one(
-		"SELECT COUNT(*) FROM unnest(ARRAY['fallback_record', 'expiry_owner_key', \
+		"SELECT COUNT(*) FROM unnest(ARRAY[\
 		 'expiry_allocation', 'expiry_allocation_coin', 'expiry_lightning_receive_claim', \
 		 'owner_key', 'coin_owner', 'expiry_hold', 'htlc_settlement_source']) AS names(name) \
 		 WHERE to_regclass('scuttle.' || name) IS NULL", &[],
 	).await.unwrap().get(0);
 	assert_eq!(missing, 0);
-	assert!(client.query_one("SELECT to_regclass('public.fallback_record') IS NULL", &[])
+	assert!(client.query_one("SELECT to_regclass('public.fallback_record') IS NULL \
+		AND to_regclass('scuttle.fallback_record') IS NULL AND to_regclass('scuttle.expiry_owner_key') IS NULL", &[])
 		.await.unwrap().get::<_, bool>(0));
 	let history = "SELECT version || ':' || name || ':' || applied_on || ':' || checksum \
 		FROM public.refinery_schema_history ORDER BY version";
@@ -67,4 +68,27 @@ async fn old_fork_database_is_refused_before_initialization_writes() {
 	assert_eq!(original.get::<_, &str>(0), "original-mailbox");
 	assert_eq!(original.get::<_, &str>(1), "original-script");
 	assert_eq!(original.get::<_, &str>(2), "original-signature");
+}
+
+/// Shadow ownership rows do not authorize an in-place payout-model upgrade.
+#[tokio::test]
+async fn registration_shaped_shadow_store_is_refused_without_writes() {
+	let mut ctx = TestContext::new_minimal("postgresd/registration_shadow_store_refused").await;
+	ctx.init_central_postgres().await;
+	let cfg = ctx.new_postgres(&ctx.test_name).await;
+	let db = Db::create(&cfg, bitcoin::Network::Regtest).await.unwrap();
+	drop(db);
+	let client = ctx.postgres_manager().database_client(Some(&cfg.name)).await;
+	client.batch_execute("CREATE TABLE scuttle.fallback_record(mailbox_pk TEXT PRIMARY KEY, record BYTEA NOT NULL);
+		INSERT INTO scuttle.fallback_record VALUES ('original',decode('010203','hex'));").await.unwrap();
+	let before = client.query("SELECT version,name,checksum FROM public.refinery_schema_history ORDER BY version", &[]).await.unwrap()
+		.into_iter().map(|row| (row.get::<_,i32>(0),row.get::<_,String>(1),row.get::<_,String>(2))).collect::<Vec<_>>();
+	assert!(client.query_one("SELECT to_regclass('scuttle.owner_key') IS NOT NULL", &[]).await.unwrap().get::<_,bool>(0));
+	let error = match Db::connect(&cfg, bitcoin::Network::Regtest).await { Ok(_) => panic!("shadow store must refuse"), Err(error) => error };
+	assert!(format!("{error:#}").contains("not a fresh Scuttle store"));
+	let after = client.query("SELECT version,name,checksum FROM public.refinery_schema_history ORDER BY version", &[]).await.unwrap()
+		.into_iter().map(|row| (row.get::<_,i32>(0),row.get::<_,String>(1),row.get::<_,String>(2))).collect::<Vec<_>>();
+	assert_eq!(before,after);
+	assert_eq!(client.query_one("SELECT record FROM scuttle.fallback_record WHERE mailbox_pk='original'", &[])
+		.await.unwrap().get::<_,Vec<u8>>(0), vec![1,2,3]);
 }

@@ -16,13 +16,13 @@ use ark::{ProtocolEncoding, Vtxo};
 use ark::lightning::{PaymentHash, Preimage};
 use ark::vtxo::Full;
 
-use crate::{ExternalMailboxIdentity, VtxoId, WalletProperties};
+use crate::{MailboxIdentity, VtxoId, WalletProperties};
 use crate::actions::{WalletActionCheckpoint, WalletActionId};
 use crate::exit::{ExitState, ExitStateKind, ExitTxOrigin};
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
 use crate::persist::{RoundStateId, StoredRoundState};
 use crate::persist::models::{
-	FallbackRegistration,	PaidInvoice, SerdeRoundState, SettledLightningReceive, StoredExit, Unlocked,
+	PaidInvoice, SerdeRoundState, SettledLightningReceive, StoredExit, Unlocked,
 };
 use crate::persist::sqlite::convert::{row_to_movement, row_to_wallet_vtxo, rows_to_wallet_vtxos};
 use crate::round::RoundState;
@@ -47,8 +47,7 @@ pub (crate) fn set_properties(
 		":server_mailbox_pubkey": properties.server_mailbox_pubkey.map(|pk| pk.to_string()),
 	})?;
 	conn.execute("INSERT INTO bark_mailbox_identity (id, public_key, network) VALUES (1, ?1, ?2)",
-		params![properties.external_mailbox.as_ref().map(|id| id.public_key.to_string()),
-			properties.external_mailbox.as_ref().map(|id| id.network.to_string())])?;
+		params![properties.mailbox_identity.public_key.to_string(), properties.mailbox_identity.network.to_string()])?;
 
 	Ok(())
 }
@@ -92,7 +91,7 @@ pub (crate) fn set_server_mailbox_pubkey(
 }
 
 pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<WalletProperties>> {
-	let query = "SELECT p.*, m.public_key AS external_mailbox_pubkey, m.network AS external_mailbox_network
+	let query = "SELECT p.*, m.public_key AS mailbox_pubkey, m.network AS mailbox_network
 		FROM bark_properties p LEFT JOIN bark_mailbox_identity m ON m.id = p.id";
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query([])?;
@@ -102,15 +101,11 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 		let fingerprint: String = row.get("fingerprint")?;
 		let server_pubkey: Option<String> = row.get("server_pubkey")?;
 		let server_mailbox_pubkey: Option<String> = row.get("server_mailbox_pubkey")?;
-		let external_pubkey: Option<String> = row.get("external_mailbox_pubkey")?;
-		let external_network: Option<String> = row.get("external_mailbox_network")?;
-		let external_mailbox = match (external_pubkey, external_network) {
-			(None, None) => None,
-			(Some(public_key), Some(network)) => Some(ExternalMailboxIdentity {
-				network: Network::from_str(&network).context("invalid external mailbox network")?,
-				public_key: PublicKey::from_str(&public_key).context("invalid external mailbox public key")?,
-			}),
-			_ => bail!("incomplete external mailbox identity"),
+		let mailbox_pubkey: String = row.get("mailbox_pubkey").context("missing mailbox identity")?;
+		let mailbox_network: String = row.get("mailbox_network").context("missing mailbox network")?;
+		let mailbox_identity = MailboxIdentity {
+			network: Network::from_str(&mailbox_network).context("invalid mailbox network")?,
+			public_key: PublicKey::from_str(&mailbox_pubkey).context("invalid mailbox public key")?,
 		};
 
 		let server_pubkey = server_pubkey
@@ -129,7 +124,7 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 				fingerprint: Fingerprint::from_str(&fingerprint).context("invalid fingerprint")?,
 				server_pubkey,
 				server_mailbox_pubkey,
-				external_mailbox,
+				mailbox_identity,
 			}
 		))
 	} else {
@@ -860,50 +855,6 @@ pub fn get_last_vtxo_key_index(conn: &Connection) -> anyhow::Result<Option<u32>>
 	} else {
 		Ok(None)
 	}
-}
-
-pub fn get_fallback_record(conn: &Connection) -> anyhow::Result<Option<FallbackRegistration>> {
-	let bytes: Option<Vec<u8>> = conn.query_row(
-		"SELECT record FROM bark_fallback_record WHERE id = 1 AND registered = 1",
-		[],
-		|row| row.get(0),
-	).optional()?;
-	bytes.map(|bytes| FallbackRegistration::deserialize(&bytes).map_err(Into::into)).transpose()
-}
-
-pub fn get_pending_fallback_record(conn: &Connection) -> anyhow::Result<Option<FallbackRegistration>> {
-	let bytes: Option<Vec<u8>> = conn.query_row(
-		"SELECT record FROM bark_fallback_record WHERE id = 1 AND registered = 0",
-		[],
-		|row| row.get(0),
-	).optional()?;
-	bytes.map(|bytes| FallbackRegistration::deserialize(&bytes).map_err(Into::into)).transpose()
-}
-
-pub fn store_pending_fallback_record(conn: &Connection, record: &FallbackRegistration) -> anyhow::Result<()> {
-	store_fallback_binding(conn, record, false)
-}
-
-pub fn store_fallback_record(conn: &Connection, record: &FallbackRegistration) -> anyhow::Result<()> {
-	store_fallback_binding(conn, record, true)
-}
-
-fn store_fallback_binding(conn: &Connection, record: &FallbackRegistration, registered: bool) -> anyhow::Result<()> {
-	let changed = conn.execute(
-		"INSERT INTO bark_fallback_record (id, record, spk, registered)
-		VALUES (1, ?1, ?2, ?3)
-		ON CONFLICT (id) DO UPDATE SET
-			record = excluded.record,
-			registered = MAX(bark_fallback_record.registered, excluded.registered)
-		WHERE bark_fallback_record.spk = excluded.spk",
-		params![
-			record.serialize(),
-			record.spk.as_bytes(),
-			registered,
-		],
-	)?;
-	ensure!(changed == 1, "immutable fallback record mismatch");
-	Ok(())
 }
 
 pub fn get_mailbox_checkpoint(conn: &Connection) -> anyhow::Result<u64> {

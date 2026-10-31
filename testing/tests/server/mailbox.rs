@@ -61,7 +61,7 @@ async fn mailbox_checkpoint_visibility_gap() {
 		&vtxo_pairs.iter().map(|(key, _)| *key).collect::<Vec<_>>()).await;
 	db.write(async |t| t.upsert_vtxos(
 		vtxo_pairs.iter().map(|(_, v)| ServerVtxo::from(v.clone()))
-	, Some((bitcoin::Network::Regtest, &srv.mailbox_keypair()))).await).await.expect("upsert vtxos");
+	).await).await.expect("upsert vtxos");
 
 	let writers_done = Arc::new(AtomicBool::new(false));
 	let expiry = chrono::Local::now() + Duration::from_secs(300);
@@ -84,6 +84,7 @@ async fn mailbox_checkpoint_visibility_gap() {
 
 			loop {
 				let resp = client.read_mailbox(protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 					mailbox_id: unblinded_id.clone(),
 					authorization: Some(auth_bytes.clone()),
 					checkpoint: cursor,
@@ -171,7 +172,7 @@ async fn mailbox_post_arkoor_requires_known_vtxos() {
 		..Default::default()
 	}.build();
 	super::register_test_owners(&db, &srv.mailbox_keypair(), &mailbox_kp, &[owner_kp]).await;
-	db.write(async |t| t.upsert_vtxos([ServerVtxo::from(vtxo.clone())], Some((bitcoin::Network::Regtest, &srv.mailbox_keypair()))).await).await
+	db.write(async |t| t.upsert_vtxos([ServerVtxo::from(vtxo.clone())]).await).await
 		.expect("upsert vtxo");
 
 	// A vtxo the server never cosigned is rejected.
@@ -275,6 +276,7 @@ async fn mailbox_lightning_receive_pending() {
 			let mailbox_auth = MailboxAuthorization::new(&mailbox_kp, expiry);
 
 			let read_req = protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 				authorization: Some(mailbox_auth.serialize().to_vec()),
 				mailbox_id: mailbox_id.serialize(),
 				checkpoint: 0,
@@ -343,6 +345,7 @@ async fn mailbox_lightning_send_finished() {
 			let mailbox_auth = MailboxAuthorization::new(&mailbox_kp, expiry);
 
 			let read_req = protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 				authorization: Some(mailbox_auth.serialize().to_vec()),
 				mailbox_id: mailbox_id.serialize(),
 				checkpoint: 0,

@@ -51,8 +51,8 @@ impl From<OwnerLink> for protos::OwnerProof {
 		Self {
 			blinded_mailbox_id: link.blinded_id.as_ref().to_vec(),
 			signature: link.signature.serialize().to_vec(),
-			version: if link.is_joint() { 2 } else { 1 },
-			mailbox_signature: link.mailbox_signature.map(|sig| sig.serialize().to_vec()).unwrap_or_default(),
+			version: 2,
+			mailbox_signature: link.mailbox_signature.serialize().to_vec(),
 		}
 	}
 }
@@ -64,12 +64,9 @@ impl TryFrom<protos::OwnerProof> for OwnerLink {
 			.map_err(|_| "invalid blinded mailbox identifier")?;
 		let signature = schnorr::Signature::from_slice(&proof.signature)
 			.map_err(|_| "invalid mailbox link signature")?;
-		let mailbox_signature = match proof.version {
-			0 | 1 if proof.mailbox_signature.is_empty() => None,
-			2 => Some(schnorr::Signature::from_slice(&proof.mailbox_signature)
-				.map_err(|_| "invalid mailbox authorization signature")?),
-			_ => return Err("invalid owner proof version or signature fields".into()),
-		};
+		if proof.version != 2 { return Err("joint owner proof version required".into()); }
+		let mailbox_signature = schnorr::Signature::from_slice(&proof.mailbox_signature)
+			.map_err(|_| "invalid mailbox authorization signature")?;
 		OwnerLink::from_joint_parts(blinded_id, signature, mailbox_signature)
 			.map_err(|_| "invalid blinded mailbox identifier".into())
 	}
@@ -521,7 +518,7 @@ impl TryFrom<protos::WalletStatus> for crate::WalletStatus {
 
 impl<'a> From<&'a VtxoRequest> for protos::VtxoRequest {
 	fn from(v: &'a VtxoRequest) -> Self {
-		protos::VtxoRequest {
+		protos::VtxoRequest { retired_owner_proof: None,
 			owner_proof: None,
 			amount: v.amount.to_sat(),
 			policy: v.policy.serialize(),
@@ -532,6 +529,7 @@ impl<'a> From<&'a VtxoRequest> for protos::VtxoRequest {
 impl TryFrom<protos::VtxoRequest> for VtxoRequest {
 	type Error = ConvertError;
 	fn try_from(v: protos::VtxoRequest) -> Result<Self, Self::Error> {
+		if v.retired_owner_proof.is_some() { return Err("retired owner proof field".into()); }
 		Ok(Self {
 			amount: Amount::from_sat(v.amount),
 			policy: VtxoPolicy::deserialize(&v.policy).map_err(|_| "invalid policy")?,
@@ -542,6 +540,7 @@ impl TryFrom<protos::VtxoRequest> for VtxoRequest {
 impl TryFrom<protos::ArkoorDestination> for ArkoorDestination {
 	type Error = ConvertError;
 	fn try_from(v: protos::ArkoorDestination) -> Result<Self, Self::Error> {
+		if v.retired_owner_proof.is_some() { return Err("retired owner proof field".into()); }
 		Ok(Self {
 			total_amount: Amount::from_sat(v.total_amount),
 			policy: VtxoPolicy::deserialize(&v.policy).map_err(|_| "invalid policy")?,
@@ -552,6 +551,7 @@ impl TryFrom<protos::ArkoorDestination> for ArkoorDestination {
 impl From<ArkoorDestination> for protos::ArkoorDestination {
 	fn from(v: ArkoorDestination) -> Self {
 		Self {
+			retired_owner_proof: None,
 			owner_proof: None,
 			total_amount: v.total_amount.to_sat(),
 			policy: v.policy.serialize(),
@@ -562,7 +562,7 @@ impl From<ArkoorDestination> for protos::ArkoorDestination {
 impl From<SignedVtxoRequest> for protos::SignedVtxoRequest {
 	fn from(v: SignedVtxoRequest) -> Self {
 		protos::SignedVtxoRequest {
-			vtxo: Some(protos::VtxoRequest {
+			vtxo: Some(protos::VtxoRequest { retired_owner_proof: None,
 				owner_proof: None,
 				amount: v.vtxo.amount.to_sat(),
 				policy: v.vtxo.policy.serialize(),
@@ -578,10 +578,7 @@ impl TryFrom<protos::SignedVtxoRequest> for SignedVtxoRequest {
 	fn try_from(v: protos::SignedVtxoRequest) -> Result<Self, Self::Error> {
 		let vtxo = v.vtxo.ok_or("vtxo field missing")?;
 		Ok(SignedVtxoRequest {
-			vtxo: VtxoRequest {
-				amount: Amount::from_sat(vtxo.amount),
-				policy: VtxoPolicy::from_bytes(&vtxo.policy)?,
-			},
+			vtxo: vtxo.try_into()?,
 			cosign_pubkey: PublicKey::from_bytes(&v.cosign_pubkey)?,
 			nonces: v.public_nonces.into_iter()
 				.map(|n| musig::PublicNonce::from_bytes(n))
@@ -838,18 +835,32 @@ mod test {
 		let server = key(11); let mailbox = key(17); let coin = key(3);
 		let proof = protos::OwnerProof::from(OwnerLink::new_joint(bitcoin::Network::Regtest,
 			server.public_key(), &mailbox, &coin).unwrap());
-		let old = OldDestination { total_amount: 10_000, policy: vec![1, 2, 3], owner_proof: Some(proof.clone()) };
+		let policy = VtxoPolicy::new_pubkey(coin.public_key()).serialize();
+		let old = OldDestination { total_amount: 10_000, policy: policy.clone(), owner_proof: Some(proof.clone()) };
 		let new = protos::ArkoorDestination::decode(old.encode_to_vec().as_slice()).unwrap();
 		assert_eq!(new.total_amount, 10_000);
-		assert_eq!(new.policy, [1, 2, 3]);
+		assert_eq!(new.policy, policy);
+		assert!(new.retired_owner_proof.is_some());
+		assert!(ArkoorDestination::try_from(new.clone()).is_err());
 		assert!(new.owner_proof.is_none(), "old tag3 must not supply a new binding");
 		let new = protos::VtxoRequest::decode(old.encode_to_vec().as_slice()).unwrap();
 		assert!(new.owner_proof.is_none());
-		let current = protos::ArkoorDestination {
-			total_amount: 10_000, policy: vec![1, 2, 3], owner_proof: Some(proof),
+		assert!(VtxoRequest::try_from(new).is_err());
+		let current = protos::ArkoorDestination { retired_owner_proof: None,
+			total_amount: 10_000, policy, owner_proof: Some(proof),
 		};
 		let decoded = protos::ArkoorDestination::decode(current.encode_to_vec().as_slice()).unwrap();
 		assert_eq!(decoded, current);
+		assert!(ArkoorDestination::try_from(decoded).is_ok());
+		for retired in [vec![], old.encode_to_vec()] {
+			let mut mixed = current.clone();
+			mixed.retired_owner_proof = Some(retired);
+			let decoded = protos::ArkoorDestination::decode(mixed.encode_to_vec().as_slice()).unwrap();
+			assert!(decoded.retired_owner_proof.is_some(), "empty retired fields retain presence");
+			assert!(ArkoorDestination::try_from(decoded).is_err());
+			let decoded = protos::VtxoRequest::decode(mixed.encode_to_vec().as_slice()).unwrap();
+			assert!(VtxoRequest::try_from(decoded).is_err());
+		}
 	}
 
 	#[test]
@@ -877,10 +888,8 @@ mod test {
 
 	#[test]
 	fn owner_link_proto_roundtrip_rejects_malformed_evidence() {
-		let blinded_id = BlindedMailboxIdentifier::from_pubkey(PublicKey::from_str(
-			"0229757774cc6f3be1d5f1774aefa8f02e50bc64404230e7a67e8fde79bd559a9a").unwrap());
-		let link = OwnerLink::from_parts(blinded_id, schnorr::Signature::from_str(
-			"20a352f4f1e0868fa74f8ff5752927ec0b05b2b554daeccdabe8fe02e3d14e7eb42941fc34d91d18ab45b8a44223377a891f39948a59a5e510b1bf4bb0160e5c").unwrap()).unwrap();
+		let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!("../../lib/testdata/owner-joint-v2.json")).unwrap();
+		let link = OwnerLink::deserialize_hex(vectors[0]["proof"].as_str().unwrap()).unwrap();
 		let proto = protos::OwnerProof::from(link);
 		assert_eq!(OwnerLink::try_from(proto.clone()).unwrap(), link);
 		for length in [0, 32, 34] {
@@ -912,9 +921,8 @@ mod test {
 			let mut changed = proto.clone(); changed.version = version;
 			assert!(OwnerLink::try_from(changed).is_err());
 		}
-		let legacy = OwnerLink::new(server.public_key(), ark::mailbox::MailboxIdentifier::from_pubkey(mailbox.public_key()), &coin).unwrap();
-		let mut legacy_proto = protos::OwnerProof::from(legacy); legacy_proto.version = 0;
-		assert_eq!(OwnerLink::try_from(legacy_proto).unwrap(), legacy);
+		let mut legacy_proto = proto; legacy_proto.version = 0; legacy_proto.mailbox_signature.clear();
+		assert!(OwnerLink::try_from(legacy_proto).is_err());
 	}
 
 	#[test]

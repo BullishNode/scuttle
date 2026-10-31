@@ -176,21 +176,19 @@ async fn three_owners() {
 	assert!(ordinary.keys().all(|point| point.txid == root.txid && *point != root));
 	let board_fee = actual_fee(&ctx, &board).await;
 	assert_eq!(sat(100_000) + ordinary.values().copied().sum::<Amount>() + board_fee, sat(200_000));
-	let a_binding = a.fallback_destination().await.unwrap();
-	let b_binding = b.fallback_destination().await.unwrap();
-	let c_binding = c.fallback_destination().await.unwrap();
+	let a_binding = a.fallback_script();
+	let b_binding = b.fallback_script();
+	let c_binding = c.fallback_script();
 	let mailboxes = [a.mailbox_identifier(), b.mailbox_identifier(), c.mailbox_identifier()];
 	let bindings = [&a_binding, &b_binding, &c_binding];
 	assert_eq!(mailboxes.iter().map(|mailbox| mailbox.as_pubkey().to_string()).collect::<BTreeSet<_>>().len(), 3);
-	assert_eq!(bindings.iter().map(|record| record.spk.clone()).collect::<BTreeSet<_>>().len(), 3);
+	assert_eq!(bindings.iter().map(|script| (*script).clone()).collect::<BTreeSet<_>>().len(), 3);
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	for (mailbox, binding) in mailboxes.iter().zip(&bindings) {
-		binding.verify(Network::Regtest, mailbox.as_pubkey()).unwrap();
-		let stored = db.read(async |tx| tx.get_fallback(mailbox.as_pubkey()).await).await.unwrap().unwrap();
-		assert!(stored.same_binding(binding));
+		assert_eq!(**binding, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.as_pubkey().x_only_public_key().0, None));
 		for input in &board.input {
 			let funding = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-			assert!(funding.output.iter().all(|output| output.script_pubkey != binding.spk),
+			assert!(funding.output.iter().all(|output| output.script_pubkey != **binding),
 				"ordinary funding must not be mistaken for fallback payment");
 		}
 	}
@@ -202,7 +200,7 @@ async fn three_owners() {
 	let ancestors = last.ancestor_ids().into_iter().collect::<BTreeSet<_>>();
 	assert!(ancestors.contains(&source.id()) && ancestors.contains(&middle.id()));
 	assert!(last.transactions().len() <= 10);
-	let expected = ExpectedLeaf { coin: last.clone(), mailbox: mailboxes[2], script: c_binding.spk.clone(),
+	let expected = ExpectedLeaf { coin: last.clone(), mailbox: mailboxes[2], script: c_binding.clone(),
 		fee: 1_000, payout: 99_000, forfeited: 0, group_payout: 99_000 };
 	balances(&a, Amount::ZERO).await;
 	balances(&b, Amount::ZERO).await;
@@ -249,11 +247,11 @@ async fn three_owners() {
 	};
 	let parent = epoch.parents.values().next().unwrap();
 	assert_eq!(parent.output.iter().map(|output| output.value).sum::<Amount>(), sat(100_000));
-	let retained = parent.output.iter().filter(|output| output.script_pubkey != c_binding.spk).collect::<Vec<_>>();
+	let retained = parent.output.iter().filter(|output| output.script_pubkey != c_binding).collect::<Vec<_>>();
 	assert_eq!(retained.iter().map(|output| output.value).sum::<Amount>(), sat(1_000));
 	assert!(retained.iter().all(|output| output.script_pubkey == operator || output.is_p2a_fee_anchor()));
 	let roots = BTreeMap::from([(root, board.output[root.vout as usize].clone())]);
-	let payees = [(a_binding.spk.clone(), None), (b_binding.spk.clone(), None), (c_binding.spk.clone(), Some(99_000))];
+	let payees = [(a_binding.clone(), None), (b_binding.clone(), None), (c_binding.clone(), Some(99_000))];
 	let ids = BTreeSet::from([last.id()]);
 	let cut = Box::pin(financial_cut(&ctx, &srv, &db, scan_height, &roots, &sponsors, &[&epoch], &payees, &ids)).await;
 	assert_eq!(cut["selected_input_sat"], 300_000);
@@ -268,7 +266,7 @@ async fn three_owners() {
 	let returned_c = Box::pin(c_cli.client()).await;
 	for (wallet, binding, mailbox) in [(&returned_a, &a_binding, mailboxes[0]), (&returned_b, &b_binding, mailboxes[1]), (&returned_c, &c_binding, mailboxes[2])] {
 		assert_eq!(wallet.mailbox_identifier(), mailbox);
-		assert!(wallet.fallback_destination().await.unwrap().same_binding(binding));
+		assert!(wallet.fallback_script() == *binding);
 	}
 	predecessor(&returned_a, &source, &baselines[0], &a_send).await;
 	predecessor(&returned_b, &middle, &baselines[1], &b_send).await;
@@ -301,7 +299,7 @@ async fn three_owners() {
 	predecessor(&reopened_a, &source, &baselines[0], &a_send).await;
 	predecessor(&reopened_b, &middle, &baselines[1], &b_send).await;
 	reopened_c.sync_fallback_payouts().await.unwrap();
-	assert!(reopened_c.fallback_destination().await.unwrap().same_binding(&c_binding));
+	assert!(reopened_c.fallback_script() == c_binding);
 	assert_eq!(receipt(&reopened_c, &expected, &epoch).await, final_receipt);
 	assert_eq!(history(reopened_c.history().await.unwrap(), &baselines[2], &[&expected]), final_history);
 	balances(&reopened_c, Amount::ZERO).await;

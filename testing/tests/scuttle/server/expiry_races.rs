@@ -22,7 +22,7 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 	let db = Db::connect(&cfg, bitcoin::Network::Regtest).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([&coin], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos([&coin]).await).await.unwrap();
 	let txid = Txid::from_byte_array([42; 32]);
 	let writes = [
 		("Lightning grant", VtxoTreeUpdate::new().mark_vtxos_oor_spent([(coin.id(), txid)])),
@@ -45,7 +45,7 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 						SELECT pg_backend_pid()
 					", &[]).await?.get::<_, i32>(0);
 					pid_send.send(pid).expect("race observer alive");
-					tx.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await
+					tx.execute_vtxo_tree_update(update).await
 				}).await
 			});
 			let pid = pid_recv.await.unwrap();
@@ -114,7 +114,7 @@ async fn expiry_cancels_unfinished_exchange_without_freezing_other_tree_inputs()
 	let hash = ark::tree::signed::UnlockHash::hash(&[7; 32]);
 	let accepted_hash = ark::tree::signed::UnlockHash::hash(&[8; 32]);
 	let (pending, binding) = db.write(async |t| {
-		t.upsert_vtxos([&old, &other, &accepted], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await?;
+		t.upsert_vtxos([&old, &other, &accepted]).await?;
 		let pending = t.query_one("
 			INSERT INTO round_participation(unlock_hash, created_at)
 			VALUES($1, NOW())
@@ -145,7 +145,7 @@ async fn expiry_cancels_unfinished_exchange_without_freezing_other_tree_inputs()
 	assert!(format!("{error:#}").contains("cancelled for expiry recovery"), "{error:#}");
 	// This input remains a normal spendable source for a different operation.
 	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new()
-		.mark_vtxos_oor_spent([(other.id(), Txid::from_byte_array([3; 32]))]), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+		.mark_vtxos_oor_spent([(other.id(), Txid::from_byte_array([3; 32]))])).await).await.unwrap();
 	assert!(!db.write(async |t| t.cancel_expiry_participations(&[binding]).await).await.unwrap());
 	let cancelled = db.read(async |t| Ok(t.query_one("
 		SELECT COUNT(*)

@@ -2,8 +2,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use anyhow::{Context, bail};
 
-use bitcoin::{Network, Transaction, Txid};
-use bitcoin::secp256k1::Keypair;
+use bitcoin::{Transaction, Txid};
 use tracing::debug;
 
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId};
@@ -467,7 +466,6 @@ impl VtxoTreeUpdate {
 pub async fn execute_vtxo_tree_update(
 	tx: &Tx<'_>,
 	update: VtxoTreeUpdate,
-	owners: Option<(Network, &Keypair)>,
 ) -> anyhow::Result<u64> {
 	debug_assert!(validate(&update).is_ok(), "{}", validate(&update).unwrap_err());
 	let mut customer_keys = BTreeSet::new();
@@ -490,8 +488,7 @@ pub async fn execute_vtxo_tree_update(
 		}
 	}
 	for key in customer_keys {
-		let (network, server_mailbox_key) = owners.ok_or(OwnershipRefusal::Required(key))?;
-		if !matches!(tx.expiry_owner(key, network, server_mailbox_key).await?, Attribution::Owned { .. }) {
+		if !matches!(tx.expiry_owner(key).await?, Attribution::Owned { .. }) {
 			return Err(OwnershipRefusal::Required(key).into());
 		}
 	}
@@ -511,10 +508,8 @@ pub async fn execute_vtxo_tree_update(
 
 	upsert_virtual_transactions(tx, &update.tx_inserts).await?;
 	let inserted = insert_vtxos(tx, &update.vtxo_inserts).await?;
-	// Only actual births get shadow metadata. An old accepted replay or a
+	// Only actual births get ownership metadata. A replay or a
 	// recovery upload cannot backfill consent or rewrite an existing owner.
-	// Legacy-only accepted records remain on the authoritative old path until
-	// the fresh-store ownership switch makes complete joint metadata mandatory.
 	tx.execute("INSERT INTO coin_owner (vtxo_id, mailbox_pk)
 		SELECT birth.vtxo_id, owner_key.mailbox_pk
 		FROM UNNEST($1::text[], $2::text[]) AS birth(vtxo_id, user_pubkey)

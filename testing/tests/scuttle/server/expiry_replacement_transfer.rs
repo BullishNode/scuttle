@@ -30,9 +30,9 @@ async fn expiry_transferred_refresh_replacement_survives_old_backing_settlement(
 	let recipient = ctx.bark_sdk("recipient", &srv)
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let old = former.spendable_vtxos().await.unwrap().remove(0);
-	let former_destination = former.fallback_destination().await.unwrap();
-	let recipient_destination = recipient.fallback_destination().await.unwrap();
-	assert_ne!(former_destination.spk, recipient_destination.spk);
+	let former_destination = former.fallback_script();
+	let recipient_destination = recipient.fallback_script();
+	assert_ne!(former_destination, recipient_destination);
 	let receive_address = recipient.new_address().await.unwrap();
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	// The old operator-only sweep and the later customer sweep each have
@@ -99,8 +99,8 @@ async fn expiry_transferred_refresh_replacement_survives_old_backing_settlement(
 		}
 	}).await.expect("accepted refresh's original backing must actually return to the operator");
 	assert_eq!(ctx.bitcoind().await_transaction(old_parent.compute_txid()).await, old_parent);
-	assert!(old_parent.output.iter().all(|output| output.script_pubkey != former_destination.spk
-		&& output.script_pubkey != recipient_destination.spk));
+	assert!(old_parent.output.iter().all(|output| output.script_pubkey != former_destination
+		&& output.script_pubkey != recipient_destination));
 	ctx.generate_blocks(1).await;
 	let old_drain = old_parent.output.iter().position(|output| output.value == old.amount())
 		.expect("the old backing must return its whole principal to the operator");
@@ -155,10 +155,10 @@ async fn expiry_transferred_refresh_replacement_survives_old_backing_settlement(
 	assert_ne!(old_parent.compute_txid(), customer_parent.compute_txid());
 	assert_eq!(ctx.bitcoind().await_transaction(customer_parent.compute_txid()).await, customer_parent);
 	let payouts = customer_parent.output.iter().enumerate()
-		.filter(|(_, output)| output.script_pubkey == recipient_destination.spk).collect::<Vec<_>>();
+		.filter(|(_, output)| output.script_pubkey == recipient_destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
 	assert_eq!(payouts[0].1.value + sat(1_000), old.amount());
-	assert!(customer_parent.output.iter().all(|output| output.script_pubkey != former_destination.spk));
+	assert!(customer_parent.output.iter().all(|output| output.script_pubkey != former_destination));
 	ctx.generate_blocks(6).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&customer_parent.compute_txid(), payouts[0].0 as u32,
 		Some(true)).unwrap().unwrap().confirmations >= 6);

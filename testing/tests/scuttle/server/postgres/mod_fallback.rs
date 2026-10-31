@@ -135,7 +135,7 @@ async fn successful_attempt_consumes_its_linked_htlc_send() {
 	let htlc = VTXO_VECTORS.arkoor_htlc_out_vtxo.policy().as_server_htlc_send().unwrap();
 	let hash = htlc.payment_hash;
 	db.write(async |t| {
-		t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await?;
+		t.upsert_vtxos([vtxo.clone()]).await?;
 		htlc_vtxo::create_htlc_vtxos(t, &[(vtxo.id(), hash, htlc.htlc_expiry)], HtlcDirection::Incoming).await
 	}).await.unwrap();
 	let secp = Secp256k1::new();
@@ -216,7 +216,7 @@ async fn watchman_receive_claim_uses_upstream_facts_for_both_encodings() {
 			.min_final_cltv_expiry_delta(18).amount_milli_satoshis(source.amount().to_sat() * 1_000)
 			.build_signed(|message| secp.sign_ecdsa_recoverable(message, &invoice_key)).unwrap();
 		db.write(async |t| {
-			t.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_bare_vtxos([source.clone()]), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await?;
+			t.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_bare_vtxos([source.clone()])).await?;
 			htlc_vtxo::create_htlc_vtxos(t, &[(source.id(), hash, expiry)], HtlcDirection::Outgoing).await?;
 			t.register_vtxo_confirmation(source.id(), BlockHeight::new(100)).await?;
 			t.store_generated_lightning_receive(node, &invoice, source.amount().to_sat() * 1_000, None, None).await
@@ -264,113 +264,38 @@ async fn watchman_receive_claim_uses_upstream_facts_for_both_encodings() {
 }
 
 #[tokio::test]
-async fn mailbox_registration_guards_every_writer_reader_and_empty_batch() {
-	let mut ctx = TestContext::new_minimal("postgresd/mailbox_registration_guards").await;
+async fn mailbox_writers_need_no_registration_and_delivery_matches_the_birth_owner() {
+	let mut ctx = TestContext::new_minimal("postgresd/mailbox_without_registration").await;
 	ctx.init_central_postgres().await;
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg, bitcoin::Network::Regtest).await.unwrap();
-	let db = Db::connect(&cfg, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::create(&cfg, bitcoin::Network::Regtest).await.unwrap();
 	super::register_vector_owners(&db).await;
-	let network = bitcoin::Network::Regtest;
-	let mailbox_key = Keypair::from_seckey_slice(&ark::SECP, &[249; 32]).unwrap();
-	let mailbox = MailboxIdentifier::from_pubkey(mailbox_key.public_key());
+	let foreign = Keypair::from_seckey_slice(&ark::SECP, &[249; 32]).unwrap();
+	let mailbox = MailboxIdentifier::from_pubkey(foreign.public_key());
 	let coin = VTXO_VECTORS.board_vtxo.clone();
-	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(coin.clone())],
-		Some((network, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(coin.clone())]).await).await.unwrap();
+	let before = db.read(async |tx| Ok(tx.query_one("SELECT to_jsonb(s)::TEXT FROM checkpoint_state s WHERE type_id=1", &[])
+		.await?.get::<_, String>(0))).await.unwrap();
+	assert!(db.write(async |tx| tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[coin.clone()]).await)
+		.await.is_err());
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT to_jsonb(s)::TEXT FROM checkpoint_state s WHERE type_id=1", &[])
+		.await?.get::<_, String>(0))).await.unwrap(), before);
 	let hash = Preimage::random().compute_payment_hash();
-	let unlock = UnlockHash::hash(b"guarded mailbox round");
-	let checkpoint_before = db.read(async |tx| {
-		let row = tx.query_one("SELECT last_time, last_counter, max_time FROM checkpoint_state WHERE type_id=1", &[]).await?;
-		Ok((row.get::<_, i64>(0), row.get::<_, i32>(1), row.get::<_, i64>(2)))
-	}).await.unwrap();
-	for kind in 0..7 {
-		let error = db.write(async |tx| match kind {
-			0 => tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[coin.clone()]).await,
-			1 => tx.store_round_participation_in_mailbox(mailbox, unlock).await,
-			2 => tx.store_lightning_receive_notification(mailbox, &hash.to_string(), coin.amount()).await,
-			3 => tx.store_lightning_send_finished(mailbox, hash, None, Some(LightningFailureKind::FeeTooLow)).await,
-			4 => tx.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox, &[coin.id()]).await,
-			5 => tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[]).await,
-			6 => tx.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox, &[]).await,
+	let unlock = UnlockHash::hash(b"unregistered notification mailbox");
+	for kind in 0..4 {
+		assert!(db.write(async |tx| match kind {
+			0 => tx.store_round_participation_in_mailbox(mailbox, unlock).await,
+			1 => tx.store_lightning_receive_notification(mailbox, &hash.to_string(), coin.amount()).await,
+			2 => tx.store_lightning_send_finished(mailbox, hash, None, Some(LightningFailureKind::FeeTooLow)).await,
+			3 => tx.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox, &[coin.id()]).await,
 			_ => unreachable!(),
-		}).await.unwrap_err();
-		assert!(error.is::<OwnershipRefusal>(), "writer {kind}: {error:#}");
+		}).await.unwrap().is_some());
 	}
-	assert!(db.read(async |tx| tx.get_mailbox_entries(mailbox, 0, 0).await)
-		.await.unwrap_err().is::<OwnershipRefusal>());
-	assert!(db.read(async |tx| tx.get_mailbox_messages(mailbox, 0, 0).await)
-		.await.unwrap_err().is::<OwnershipRefusal>());
-	let checkpoint_after = db.read(async |tx| {
-		let row = tx.query_one("SELECT last_time, last_counter, max_time FROM checkpoint_state WHERE type_id=1", &[]).await?;
-		Ok((row.get::<_, i64>(0), row.get::<_, i32>(1), row.get::<_, i64>(2)))
-	}).await.unwrap();
-	assert_eq!(checkpoint_after, checkpoint_before, "refusals cannot consume checkpoints");
-	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM mailbox", &[]).await?.get::<_, i64>(0))).await.unwrap(), 0);
-
-	super::register_test_owners(&db, super::test_server_mailbox_key(), &mailbox_key, &[]).await;
-	for kind in 0..5 {
-		let checkpoint = db.write(async |tx| match kind {
-			0 => tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[coin.clone()]).await,
-			1 => tx.store_round_participation_in_mailbox(mailbox, unlock).await,
-			2 => tx.store_lightning_receive_notification(mailbox, &hash.to_string(), coin.amount()).await,
-			3 => tx.store_lightning_send_finished(mailbox, hash, None, Some(LightningFailureKind::FeeTooLow)).await,
-			4 => tx.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox, &[coin.id()]).await,
-			_ => unreachable!(),
-		}).await.unwrap();
-		assert!(checkpoint.is_some(), "registered writer {kind} must work");
-	}
-	let entries = db.read(async |tx| tx.get_mailbox_messages(mailbox, 0, 100).await).await.unwrap();
-	assert_eq!(entries.len(), 5);
-	assert_eq!(db.read(async |tx| tx.get_mailbox_entries(mailbox, 0, 100).await).await.unwrap().len(), 1);
+	assert_eq!(db.read(async |tx| tx.get_mailbox_messages(mailbox, 0, 100).await).await.unwrap().len(), 4);
 	assert!(db.write(async |tx| tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[]).await).await.unwrap().is_none());
 	assert!(db.write(async |tx| tx.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox, &[]).await).await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn malformed_notification_registration_remains_a_typed_round_refusal() {
-	let mut ctx = TestContext::new_minimal("postgresd/malformed_notification_registration").await;
-	ctx.init_central_postgres().await;
-	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg, bitcoin::Network::Regtest).await.unwrap();
-	let db = Db::connect(&cfg, bitcoin::Network::Regtest).await.unwrap();
-	let key = Keypair::from_seckey_slice(&ark::SECP, &[247; 32]).unwrap();
-	let mailbox = MailboxIdentifier::from_pubkey(key.public_key());
-	super::register_test_owners(&db, super::test_server_mailbox_key(), &key, &[]).await;
-	let canonical = db.read(async |tx| {
-		let row = tx.query_one("SELECT spk, mailbox_sig FROM fallback_record WHERE mailbox_pk=$1",
-			&[&key.public_key().to_string()]).await?;
-		Ok((row.get::<_, String>(0), row.get::<_, String>(1)))
-	}).await.unwrap();
-	for (spk, signature) in [
-		("not-hex".to_owned(), canonical.1.clone()),
-		(canonical.0.clone(), "not-a-signature".to_owned()),
-	] {
-		db.write(async |tx| {
-			tx.execute("UPDATE fallback_record SET spk=$2, mailbox_sig=$3 WHERE mailbox_pk=$1",
-				&[&key.public_key().to_string(), &spk, &signature]).await?;
-			Ok(())
-		}).await.unwrap();
-		let decoded = db.read(async |tx| tx.get_fallback(key.public_key()).await).await.unwrap_err();
-		assert!(matches!(decoded.downcast_ref::<OwnershipRefusal>(),
-			Some(OwnershipRefusal::UnregisteredMailbox(actual)) if *actual == key.public_key()));
-		let predicate = db.read(async |tx| tx.require_registered_mailbox(mailbox).await).await.unwrap_err();
-		assert!(predicate.is::<OwnershipRefusal>());
-		let round_write = db.write(async |tx| tx.store_round_participation_in_mailbox(
-			mailbox, UnlockHash::hash(b"malformed notification registration"),
-		).await).await.unwrap_err().context("round persistence");
-		// persist_round uses this typed predicate for both propagation from
-		// best-effort delivery and Recoverable classification, through context.
-		assert!(round_write.is::<OwnershipRefusal>(), "{round_write:#}");
-		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM mailbox", &[]).await?.get::<_, i64>(0))).await.unwrap(), 0);
-	}
-	// A query failure stays a database failure; it is not relabelled as a
-	// bad registration by the two decoding maps.
-	let sql_error = db.write(async |tx| {
-		tx.batch_execute("ALTER TABLE fallback_record RENAME TO unavailable_fallback_record").await?;
-		tx.get_fallback(key.public_key()).await
-	}).await.unwrap_err();
-	assert!(!sql_error.is::<OwnershipRefusal>(), "{sql_error:#}");
-	assert!(sql_error.is::<tokio_postgres::Error>(), "{sql_error:#}");
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM owner_key WHERE mailbox_pk=$1", &[&foreign.public_key().to_string()])
+		.await?.get::<_, i64>(0))).await.unwrap(), 0, "notifications and hints never authorize a mailbox or coin");
 }
 
 async fn legacy_payment_attempt(db: &Db, node_id: i64, invoice: &Invoice, sources: &[VtxoId]) {

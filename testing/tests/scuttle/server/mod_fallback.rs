@@ -4,10 +4,7 @@ async fn register_test_owners(
 	mailbox_key: &bitcoin::secp256k1::Keypair, coin_keys: &[bitcoin::secp256k1::Keypair],
 ) {
 	let network = bitcoin::Network::Regtest;
-	let spk = bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox_key.x_only_public_key().0, None);
-	let record = FallbackRegistration::new(network, spk, mailbox_key).unwrap();
 	db.write(async |tx| {
-		tx.set_fallback(mailbox_key.public_key(), &record, network).await?;
 		for key in coin_keys {
 			let link = OwnerLink::new_joint(network, server_key.public_key(), mailbox_key, key).unwrap();
 			tx.verify_owner_link(server_key, key.public_key(), &link, network).await?;
@@ -63,12 +60,10 @@ async fn signed_package(
 			}
 		}
 		if link.is_none() {
-			link = db.read(async |tx| Ok(tx.query_opt("SELECT joint_proof FROM expiry_owner_key WHERE user_pubkey=$1",
-				&[&key.to_string()]).await?.and_then(|row| row.get::<_, Option<&str>>("joint_proof")
-					.map(|proof| OwnerLink::deserialize_hex(proof).unwrap())))).await.unwrap();
+			link = db.read(async |tx| Ok(tx.query_opt("SELECT joint_proof FROM owner_key WHERE user_pubkey=$1",
+				&[&key.to_string()]).await?.map(|row| OwnerLink::deserialize_hex(row.get("joint_proof")).unwrap()))).await.unwrap();
 		}
 		let link = link.unwrap_or_else(|| panic!("hand-built output {key} needs its real signing key"));
-		assert!(link.is_joint());
 		link.verify_joint(bitcoin::Network::Regtest, &srv.mailbox_keypair(), key).unwrap();
 		links.insert(key, link);
 	}

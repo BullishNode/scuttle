@@ -15,7 +15,6 @@ pub enum OwnershipRefusal {
 	Required(PublicKey),
 	Invalid(PublicKey),
 	Conflicting(PublicKey),
-	UnregisteredMailbox(PublicKey),
 }
 
 impl OwnershipRefusal {
@@ -24,14 +23,12 @@ impl OwnershipRefusal {
 			Self::Required(_) => "owner_proof_required",
 			Self::Invalid(_) => "invalid_owner_proof",
 			Self::Conflicting(_) => "conflicting_owner_binding",
-			Self::UnregisteredMailbox(_) => "unregistered_mailbox",
 		}
 	}
 
 	pub fn public_key(&self) -> PublicKey {
 		match self {
-			Self::Required(key) | Self::Invalid(key) | Self::Conflicting(key)
-				| Self::UnregisteredMailbox(key) => *key,
+			Self::Required(key) | Self::Invalid(key) | Self::Conflicting(key) => *key,
 		}
 	}
 }

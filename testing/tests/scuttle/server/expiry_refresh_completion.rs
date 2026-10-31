@@ -88,7 +88,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 			cfg.daemon_sync_interval_secs = 60;
 		}).boarded(sat(100_000)).create().await);
 	let original = wallet.spendable_vtxos().await.unwrap().remove(0);
-	let destination = wallet.fallback_destination().await.unwrap();
+	let destination = wallet.fallback_script();
 	let funding_address = srv.watchmand().wait_wallet_address().await;
 	ctx.bitcoind().fund_addr(funding_address, sat(100_000)).await;
 	ctx.generate_blocks(2).await;
@@ -189,7 +189,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 			}
 		}).await.expect("the competing payout worker must finish the accepted old source as operator-owned");
 		assert!(parent.input.iter().any(|input| input.previous_output == original.chain_anchor()));
-		assert!(parent.output.iter().all(|output| output.script_pubkey != destination.spk));
+		assert!(parent.output.iter().all(|output| output.script_pubkey != destination));
 		assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 		ctx.generate_blocks(6).await;
 		// Core 31 reports the P2A output as `anchor`, which the older
@@ -264,7 +264,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 		assert_eq!(cancelled, (true, false, false));
 		assert_eq!(rpc.round_participation_status(status_request).await.unwrap_err().code(), tonic::Code::NotFound);
 		assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-		let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination.spk).unwrap();
+		let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination).unwrap();
 		assert_eq!(output.value, original.amount() - sat(1_000));
 		ctx.generate_blocks(6).await;
 		assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);

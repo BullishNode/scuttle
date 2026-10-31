@@ -244,7 +244,7 @@ async fn exited_unattempted_send_does_not_block_unrelated_expiry_payout() {
 		let customer_wallet = customer.client().await;
 		let input = wallet.get_full_vtxo(send_board.vtxos[0]).await.unwrap();
 		let customer_source = customer_wallet.get_full_vtxo(customer_board.vtxos[0]).await.unwrap();
-		let destination = customer_wallet.fallback_destination().await.unwrap();
+		let destination = customer_wallet.fallback_script();
 		assert_ne!(wallet.mailbox_identifier(), customer_wallet.mailbox_identifier());
 		assert_ne!(input.chain_anchor(), customer_source.chain_anchor());
 		assert_eq!(input.expiry_height(), customer_source.expiry_height());
@@ -294,7 +294,7 @@ async fn exited_unattempted_send_does_not_block_unrelated_expiry_payout() {
 		customer_source.validate(&funding).unwrap();
 		assert_eq!(funding.output[customer_source.chain_anchor().vout as usize].value,
 			parent.output.iter().map(|output| output.value).sum::<Amount>());
-		let payouts = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination.spk)
+		let payouts = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination)
 			.collect::<Vec<_>>();
 		assert_eq!(payouts.len(), 1);
 		assert_eq!(payouts[0].1.value, sat(99_000));
@@ -322,12 +322,12 @@ async fn exited_unattempted_send_does_not_block_unrelated_expiry_payout() {
 		let received = chain.get_tx_out(&payout.txid, payout.vout, Some(true)).unwrap().unwrap();
 		assert!(received.confirmations >= 6);
 		assert_eq!(received.value, sat(99_000));
-		assert_eq!(received.script_pub_key.script().unwrap(), destination.spk);
+		assert_eq!(received.script_pub_key.script().unwrap(), destination);
 		let mut canonical_payouts = Vec::new();
 		for height in start_height + 1..=chain.get_block_count().unwrap() {
 			for transaction in chain.get_block(&chain.get_block_hash(height).unwrap()).unwrap().txdata {
 				for (vout, output) in transaction.output.iter().enumerate() {
-					if output.script_pubkey == destination.spk {
+					if output.script_pubkey == destination {
 						canonical_payouts.push((OutPoint::new(transaction.compute_txid(), vout as u32), output.value));
 					}
 				}

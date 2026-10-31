@@ -159,7 +159,6 @@ impl rpc::server::MailboxService for crate::Server {
 		// route it into a mailbox its owner doesn't watch.
 		let vtxo_ids = vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
 		let stored = self.db.read(async |t| {
-			t.require_registered_mailbox(mailbox_id).await?;
 			t.get_user_vtxos_by_id(&vtxo_ids).await
 		}).await.to_status()?;
 		for stored in &stored {
@@ -208,11 +207,17 @@ impl rpc::server::MailboxService for crate::Server {
 			self::badarg!("invalid mailbox authorization signature");
 		}
 		let limit = self.config.max_read_mailbox_items;
-		let entries_by_checkpoint = self.db.read(async |t| {
-			t.get_mailbox_messages(mailbox_id, req.checkpoint, limit).await
+		let cursor = req.fallback_cursor.as_deref().map(VtxoId::from_slice).transpose()
+			.badarg("invalid fallback receipt cursor")?;
+		let (entries_by_checkpoint, claims) = self.db.read(async |t| {
+			Ok((t.get_mailbox_messages(mailbox_id, req.checkpoint, limit).await?,
+				t.mailbox_fallback_claims(mailbox_id.as_pubkey(), cursor, limit).await?))
 		}).await.to_status()?;
 
 		let response = protos::mailbox_server::MailboxMessages {
+			have_more_fallback_claims: claims.len() >= limit,
+			fallback_cursor: claims.last().map(|claim| claim.vtxo_id.to_bytes().to_vec()),
+			fallback_claims: claims.iter().map(Into::into).collect(),
 			have_more: entries_by_checkpoint.len() >= limit,
 			messages: entries_by_checkpoint.into_iter().map(new_mailbox_msg).collect(),
 		};
@@ -257,8 +262,6 @@ impl rpc::server::MailboxService for crate::Server {
 		// Start listening for updates on the tip of the mailbox.
 		// Marking the first value as changed makes `changed()` return
 		// immediately so the loop starts with a catch-up fetch.
-		self.db.read(async |tx| tx.require_registered_mailbox(mailbox_id).await)
-			.await.to_status()?;
 		let mut mailbox_tip_rx = self.mailbox_manager.subscribe(mailbox_id, 0);
 		mailbox_tip_rx.mark_changed();
 

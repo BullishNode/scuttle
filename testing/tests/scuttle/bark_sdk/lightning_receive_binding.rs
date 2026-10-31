@@ -1,7 +1,7 @@
 //! Successful receives deliver the actual recipient's signed value once.
 
 use std::time::Duration;
-use ark::fallback::{FallbackRegistration, OwnerLink};
+use ark::fallback::OwnerLink;
 use ark::lightning::{PaymentHash, Preimage};
 use ark::{ProtocolEncoding, VtxoPolicy, SECP};
 use ark_testing::{btc, sat, TestContext};
@@ -30,7 +30,7 @@ async fn assert_receive_start_refused(
 			(SELECT COUNT(*) FROM htlc_settlement WHERE payment_hash=$1), \
 			(SELECT COUNT(*) FROM htlc_vtxo WHERE payment_hash=$1), \
 			(SELECT COUNT(*) FROM expiry_lightning_receive_claim WHERE payment_hash=$1)", &[&hash.to_string()]).await?;
-		let owner = tx.query_opt("SELECT mailbox_pk, blinded_id, signature FROM expiry_owner_key WHERE user_pubkey=$1",
+		let owner = tx.query_opt("SELECT mailbox_pk, blinded_id, joint_proof FROM owner_key WHERE user_pubkey=$1",
 			&[&key.to_string()]).await?.map(|r| (r.get::<_, String>(0), r.get::<_, String>(1), r.get::<_, String>(2)));
 		Ok((subscription, counts.get::<_, i64>(0), counts.get::<_, i64>(1), counts.get::<_, i64>(2), owner))
 	}).await.unwrap();
@@ -77,14 +77,14 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 		expiry_secs: None,
 		payment_hash: hash.to_vec(), amount_sat: amount.to_sat(), min_cltv_delta: 18,
 		mailbox_id: Some(provider.mailbox_identifier().serialize()), description: None,
-		claim_destination: Some(protos::VtxoRequest {
+		claim_destination: Some(protos::VtxoRequest { retired_owner_proof: None,
 			amount: net.to_sat(), policy: address.policy().serialize(), owner_proof: Some(link.into()),
 		}),
 	};
 	let postgres = srv.config().postgres.clone();
 	let db = Db::connect(&postgres, bitcoin::Network::Regtest).await.unwrap();
 	let mut rpc = srv.get_public_rpc().await;
-	assert!(db.read(async |tx| Ok(tx.query_opt("SELECT user_pubkey FROM expiry_owner_key WHERE user_pubkey=$1",
+	assert!(db.read(async |tx| Ok(tx.query_opt("SELECT user_pubkey FROM owner_key WHERE user_pubkey=$1",
 		&[&recipient_key.to_string()]).await?)).await.unwrap().is_none());
 	let mut invalid = valid_link;
 	invalid.signature = schnorr::Signature::from_slice(&[0; 64]).unwrap();
@@ -95,8 +95,6 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 	assert_receive_start_refused(&mut rpc, &db, &lightning.internal, wrong_amount, None).await;
 	let other = Keypair::from_seckey_slice(&SECP, &[73; 32]).unwrap();
 	let other_link = OwnerLink::new_joint(Network::Regtest, server.public_key(), &other, &recipient_pair).unwrap();
-	assert_receive_start_refused(&mut rpc, &db, &lightning.internal,
-		request(Preimage::random().compute_payment_hash(), other_link), Some(FallbackRefusal::UnregisteredMailbox)).await;
 
 	let invoice = provider.bolt11_invoice_for_address(amount, address.clone(), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
@@ -104,11 +102,6 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 	assert_receive_start_refused(&mut rpc, &db, &lightning.internal,
 		request(hash, invalid), Some(FallbackRefusal::InvalidOwnerProof)).await;
 	assert_eq!(rpc.start_lightning_receive(request(hash, valid_link)).await.unwrap().into_inner().bolt11, invoice.to_string());
-	let other_record = FallbackRegistration::new(Network::Regtest,
-		recipient.fallback_destination().await.unwrap().spk, &other).unwrap();
-	rpc.set_fallback(protos::SetFallbackRequest {
-		mailbox_pk: other.public_key().serialize().to_vec(), record: other_record.serialize(),
-	}).await.unwrap();
 	assert_receive_start_refused(&mut rpc, &db, &lightning.internal,
 		request(Preimage::random().compute_payment_hash(), other_link), Some(FallbackRefusal::ConflictingOwnerBinding)).await;
 	lightning.sync().await;

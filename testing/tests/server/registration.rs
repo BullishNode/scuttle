@@ -282,7 +282,7 @@ async fn board_output_is_bound_to_one_exit_tx() {
 		let builder = BoardBuilder::new(
 			user.public_key(), expiry, info.server_pubkey, info.vtxo_exit_delta,
 		).set_funding_details(amount, fee, utxo).unwrap().generate_user_nonces();
-		let resp = srv.get_public_rpc().await.request_board_cosign(protos::BoardCosignRequest {
+		let resp = srv.get_public_rpc().await.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
 			owner_proof: Some(owner_proof.into()),
 			amount: amount.to_sat(),
 			utxo: utxo.serialize(),

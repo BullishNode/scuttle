@@ -56,7 +56,7 @@ mod watchman_wallet;
 use std::str::FromStr;
 use bitcoin::secp256k1::Keypair;
 use ark::{ProtocolEncoding, VtxoPolicy};
-use ark::fallback::{FallbackRegistration, OwnerLink};
+use ark::fallback::OwnerLink;
 use bark::Wallet;
 use server_rpc::protos;
 use ark_testing::Captaind;

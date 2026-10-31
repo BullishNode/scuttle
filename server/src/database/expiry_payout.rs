@@ -7,7 +7,7 @@ use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin_ext::TxOutExt;
+use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 
 use super::expiry_chain::ExpiryViewToken;
@@ -19,6 +19,20 @@ use super::Tx;
 use crate::expiry_readiness::INVENTORY_LIMITS;
 
 pub(crate) const MAX_PAYOUT_VSIZE: usize = 10_000;
+
+pub struct FallbackClaim {
+	pub vtxo_id: VtxoId,
+	pub source_vtxo_ids: BTreeSet<VtxoId>,
+	pub allocation_id: u64,
+	pub owner_mailbox: PublicKey,
+	pub gross: Amount,
+	pub fee: Amount,
+	pub payout: Amount,
+	pub forfeited: Amount,
+	pub transaction_id: Option<Txid>,
+	pub output_index: Option<u32>,
+	pub confirmed_block: Option<BlockRef>,
+}
 
 fn receive_timeout_allowed(
 	status: LightningHtlcSubscriptionStatus,
@@ -113,6 +127,129 @@ pub struct PendingExpiryPayout {
 }
 
 impl Tx<'_> {
+	/// Select the winning economic decision before filtering for customer claims.
+	/// The receipt describes that decision; it does not promote a pending parent
+	/// or replace the wallet's independent canonical-chain confirmation check.
+	pub async fn fallback_claims(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
+		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+		let rows = self.query("SELECT c.vtxo_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
+			c.payout_sat,c.forfeited_sat,a.sweep_txid,
+			CASE WHEN a.status='confirmed' AND NOT cv.invalid
+				AND cv.rebuilt_watchmand_height >= a.confirmed_height+5
+				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
+				THEN a.confirmed_height END AS confirmed_height,
+			CASE WHEN a.status='confirmed' AND NOT cv.invalid
+				AND cv.rebuilt_watchmand_height >= a.confirmed_height+5
+				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
+				THEN a.confirmed_hash END AS confirmed_hash,p.output_index
+			FROM (SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
+				c.payout_sat,c.forfeited_sat,c.spk,c.disposition FROM expiry_entitlement e
+				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
+				JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1)
+				ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.active DESC,c.allocation_id DESC) c
+			JOIN expiry_allocation a ON a.id=c.allocation_id
+			CROSS JOIN expiry_chain_view cv
+			LEFT JOIN expiry_allocation_payout p ON p.allocation_id=c.allocation_id AND p.spk=c.spk
+			WHERE c.disposition='customer'", &[&ids]).await?;
+		let mut claims: BTreeMap<VtxoId, FallbackClaim> = rows.into_iter().map(|row| {
+			let height: Option<i64> = row.get("confirmed_height");
+			let hash: Option<&str> = row.get("confirmed_hash");
+			let confirmed_block = match (height, hash) {
+				(Some(height), Some(hash)) => Some(BlockRef { height: BlockHeight::new(u32::try_from(height)?), hash: hash.parse()? }),
+				(None, None) => None,
+				_ => bail!("incomplete fallback confirmation receipt"),
+			};
+			let claim = FallbackClaim {
+				vtxo_id: row.get::<_, &str>("vtxo_id").parse()?,
+				source_vtxo_ids: BTreeSet::new(),
+				allocation_id: u64::try_from(row.get::<_, i64>("allocation_id"))?,
+				owner_mailbox: row.get::<_, &str>("owner_mailbox").parse()?,
+				gross: Amount::from_sat(u64::try_from(row.get::<_, i64>("gross_sat"))?),
+				fee: Amount::from_sat(u64::try_from(row.get::<_, i64>("fee_sat"))?),
+				payout: Amount::from_sat(u64::try_from(row.get::<_, i64>("payout_sat"))?),
+				forfeited: Amount::from_sat(u64::try_from(row.get::<_, i64>("forfeited_sat"))?),
+				transaction_id: row.get::<_, Option<&str>>("sweep_txid").map(str::parse).transpose()?,
+				output_index: row.get::<_, Option<i32>>("output_index").map(u32::try_from).transpose()?,
+				confirmed_block,
+			};
+			ensure!(claim.fee.checked_add(claim.payout).and_then(|sum| sum.checked_add(claim.forfeited)) == Some(claim.gross),
+				"fallback receipt does not conserve its source");
+			ensure!(claim.payout == Amount::ZERO || claim.output_index.is_some(), "fallback payout has no allocated output");
+			Ok((row.get::<_, &str>("vtxo_id").parse()?, claim))
+		}).collect::<anyhow::Result<_>>()?;
+		for claim in claims.values_mut() {
+			claim.source_vtxo_ids = self.fallback_claim_sources(claim).await?;
+		}
+		Ok(claims)
+	}
+
+	/// A receipt belongs to the stage-selected mailbox. Birth ownership is
+	/// only one possible source alias: a provisional recipient must not gain
+	/// its input owner's refund, and a collected receive grant belongs to its
+	/// admitted claimant even if the final output was never inserted.
+	async fn fallback_claim_sources(&self, claim: &FallbackClaim) -> anyhow::Result<BTreeSet<VtxoId>> {
+		let mut sources = BTreeSet::new();
+		if self.coin_owner_mailboxes(&[claim.vtxo_id]).await?.get(&claim.vtxo_id) == Some(&claim.owner_mailbox) {
+			sources.insert(claim.vtxo_id);
+		}
+		let row = self.query_one("SELECT irreversible_facts::TEXT FROM expiry_entitlement WHERE vtxo_id=$1",
+			&[&claim.vtxo_id.to_string()]).await?;
+		let facts: serde_json::Value = serde_json::from_str(row.get(0))?;
+		match facts.get("kind").and_then(serde_json::Value::as_str) {
+			Some("lightning_receive_claim") => {
+				let (output, key) = self.receive_claim_recipient(claim.vtxo_id).await?
+					.context("committed receive receipt has no collected claim")?;
+				ensure!(matches!(self.expiry_owner(key).await?, super::expiry_attribution::Attribution::Owned { mailbox_pk, .. }
+					if mailbox_pk == claim.owner_mailbox), "receive receipt differs from its admitted claimant");
+				sources.insert(output);
+			},
+			Some("input_owner") => {
+				let mut current = self.get_server_vtxo_by_id(claim.vtxo_id).await?.vtxo;
+				let mut seen = BTreeSet::from([current.id()]);
+				loop {
+					let last = current.transactions().last().context("input-owner receipt has no source transaction")?;
+					let [input] = last.tx.input.as_slice() else { bail!("input-owner receipt is not a single-input transition"); };
+					let parent = VtxoId::from(input.previous_output);
+					ensure!(seen.insert(parent), "input-owner receipt source cycle");
+					ensure!(self.query_opt("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 AND oor_spent_txid=$2",
+						&[&parent.to_string(), &current.point().txid.to_string()]).await?.is_some(),
+						"input-owner receipt lacks its immutable source spend");
+					current = self.get_server_vtxo_by_id(parent).await?.vtxo;
+					match current.policy() {
+						ServerVtxoPolicy::Checkpoint(_) => continue,
+						ServerVtxoPolicy::User(_) => {
+							if self.coin_owner_mailboxes(&[parent]).await?.get(&parent) == Some(&claim.owner_mailbox) {
+								sources.insert(parent);
+							}
+							break;
+						},
+						_ => bail!("input-owner receipt has an unsupported source policy"),
+					}
+				}
+			},
+			_ => {},
+		}
+		Ok(sources)
+	}
+
+	/// Independent receipt pagination cannot be hidden behind a mailbox
+	/// message checkpoint, including for an empty-store seed restore.
+	pub async fn mailbox_fallback_claims(&self, mailbox: PublicKey, cursor: Option<VtxoId>, limit: usize)
+		-> anyhow::Result<Vec<FallbackClaim>>
+	{
+		let cursor = cursor.map(|id| id.to_string());
+		let rows = self.query("SELECT w.vtxo_id FROM
+			(SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,c.owner_mailbox,c.disposition
+			FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
+			JOIN expiry_allocation a ON a.id=c.allocation_id
+			ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.active DESC,c.allocation_id DESC) w
+			WHERE w.disposition='customer' AND w.owner_mailbox=$1 AND ($2::TEXT IS NULL OR w.vtxo_id>$2)
+			ORDER BY w.vtxo_id LIMIT $3", &[&mailbox.to_string(), &cursor, &i64::try_from(limit)?]).await?;
+		let ids = rows.iter().map(|row| row.get::<_, &str>(0).parse()).collect::<Result<Vec<VtxoId>, _>>()?;
+		let mut claims = self.fallback_claims(&ids).await?;
+		ids.into_iter().map(|id| claims.remove(&id).context("mailbox receipt winner changed")).collect()
+	}
+
 	/// Select the winning allocation before matching its actual customer. An
 	/// unregistered change output can use a fresh key in the same immutable
 	/// mailbox as its input owner; a recipient in another mailbox cannot.
@@ -127,7 +264,7 @@ impl Tx<'_> {
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 				JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
 				ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.active DESC,c.allocation_id DESC \
-			) c ON c.vtxo_id=q.vtxo_id LEFT JOIN expiry_owner_key k ON k.user_pubkey=q.user_pubkey \
+			) c ON c.vtxo_id=q.vtxo_id LEFT JOIN owner_key k ON k.user_pubkey=q.user_pubkey \
 			WHERE c.disposition='customer' AND (c.user_pubkey=q.user_pubkey OR c.owner_mailbox=k.mailbox_pk)",
 			&[&ids,&keys]).await?.into_iter().map(|row| Ok(row.get::<_, &str>("vtxo_id").parse()?)).collect()
 	}

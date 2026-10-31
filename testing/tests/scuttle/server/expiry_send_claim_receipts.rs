@@ -489,7 +489,7 @@ async fn send_claim_follows_internal_attempt_settlement() {
 			invoice, payment_amount_sat: 90_000, htlc_vtxo_ids: vec![source.id().to_bytes().to_vec()],
 			mailbox_id: None, retry_for_secs: Some(1),
 		}).await.unwrap();
-		let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+		let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 			owner_proof: Some(super::test_owner_link(&server, &receiver).await.into()),
 			payment_hash: hash.to_vec(), user_pubkey: receiver.public_key().serialize().to_vec(),
 			htlc_recv_expiry: (tip + BlockDelta::new(220)).to_u32(), lightning_receive_anti_dos: None,
@@ -626,7 +626,7 @@ async fn internal_send_records_fee_without_native_payment() {
 			invoice, payment_amount_sat: 90_000, htlc_vtxo_ids: vec![source.id().to_bytes().to_vec()],
 			mailbox_id: None, retry_for_secs: Some(1),
 		}).await.unwrap();
-		let mut grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+		let mut grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 			owner_proof: Some(super::test_owner_link(&server, &receiver).await.into()),
 			payment_hash: hash.to_vec(), user_pubkey: receiver.public_key().serialize().to_vec(),
 			htlc_recv_expiry: (tip + BlockDelta::new(220)).to_u32(), lightning_receive_anti_dos: None,

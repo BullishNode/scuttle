@@ -41,25 +41,6 @@ impl ReceiveClaimBinding {
 
 
 impl Tx<'_> {
-	/// Read-only authentication of a previously accepted complete receive claim.
-	/// A subscription or existing output key alone is not this receipt.
-	pub(crate) async fn receive_claims_match(&self, bindings: &[ReceiveClaimBinding]) -> anyhow::Result<bool> {
-		if bindings.is_empty() { return Ok(false); }
-		for binding in bindings {
-			let Some(row) = self.query_opt("SELECT c.output_vtxo FROM expiry_lightning_receive_claim c
-				JOIN vtxo v ON v.vtxo_id=c.source_vtxo_id AND v.lightning_htlc_subscription_id=c.subscription_id
-				JOIN htlc_vtxo h ON h.id=v.id AND h.direction='outgoing' AND h.payment_hash=c.payment_hash
-				JOIN lightning_htlc_subscription s ON s.id=c.subscription_id AND s.payment_hash=c.payment_hash
-				WHERE c.source_vtxo_id=$1 AND c.payment_hash=$2 AND c.output_vtxo_id=$3
-				AND s.status IN ('htlcs-ready','settled')", &[&binding.source.to_string(),
-					&binding.payment_hash.to_string(), &binding.output.id().to_string()]).await?
-				else { return Ok(false); };
-			let output = Vtxo::<Full>::deserialize(row.get("output_vtxo"))?;
-			if output.to_bare().serialize() != binding.output.to_bare().serialize() { return Ok(false); }
-		}
-		Ok(true)
-	}
-
 	pub(crate) async fn prepare_receive_claims(&self, bindings: &[ReceiveClaimBinding]) -> anyhow::Result<()> {
 		let mut ids = bindings.iter().map(|binding| binding.source).collect::<Vec<_>>();
 		ids.sort_unstable();

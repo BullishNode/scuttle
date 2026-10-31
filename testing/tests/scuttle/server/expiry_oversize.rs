@@ -4,14 +4,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use ark::arkoor::{ArkoorDestination, package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse}};
-use ark::fallback::{FallbackRegistration, OwnerLink};
+use ark::fallback::OwnerLink;
 use ark::mailbox::MailboxIdentifier;
 use ark::vtxo::Full;
 use ark::{ProtocolEncoding, ServerVtxoPolicy, Vtxo, VtxoRequest, SECP};
 use ark_testing::{sat, Captaind, TestContext};
 use ark_testing::constants::ROUND_CONFIRMATIONS;
 use ark_testing::daemon::captaind::{ArkClient, WalletAdminClient};
-use bitcoin::{Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash};
+use bitcoin::{Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hashes::Hash;
@@ -31,7 +31,7 @@ struct Owner {
 	key: Keypair,
 	mailbox_key: Keypair,
 	mailbox: MailboxIdentifier,
-	record: FallbackRegistration,
+	script: ScriptBuf,
 }
 
 struct Node {
@@ -53,11 +53,8 @@ fn owner() -> Owner {
 	let account = Xpriv::new_master(Network::Regtest, &seed).unwrap();
 	let key = account.derive_priv(&SECP, &[ChildNumber::from_normal_idx(1).unwrap()]).unwrap().to_keypair(&SECP);
 	let mailbox = account.derive_priv(&SECP, &[ChildNumber::from_hardened_idx(1).unwrap()]).unwrap().to_keypair(&SECP);
-	thread_rng().fill_bytes(&mut seed);
-	let payout = Xpriv::new_master(Network::Regtest, &seed).unwrap().to_keypair(&SECP);
-	let script = ScriptBuf::new_p2wpkh(&WPubkeyHash::hash(&payout.public_key().serialize()));
-	let record = FallbackRegistration::new(Network::Regtest, script, &mailbox).unwrap();
-	Owner { key, mailbox_key: mailbox, mailbox: MailboxIdentifier::from_pubkey(mailbox.public_key()), record }
+	let script = ScriptBuf::new_p2tr(&SECP, mailbox.x_only_public_key().0, None);
+	Owner { key, mailbox_key: mailbox, mailbox: MailboxIdentifier::from_pubkey(mailbox.public_key()), script }
 }
 
 async fn native_node(
@@ -260,17 +257,12 @@ async fn bounded_round_inventory() {
 	assert!(forfeit.get::<_, bool>("signed") && forfeit.get::<_, bool>("accepted"));
 	assert_eq!(forfeit.get::<_, String>("funding_txid"), anchor.txid.to_string());
 	let owners = (0..COUNT).map(|_| owner()).collect::<Vec<_>>();
-	assert_eq!(owners.iter().map(|owner| owner.record.spk.clone()).collect::<BTreeSet<_>>().len(), COUNT);
+	assert_eq!(owners.iter().map(|owner| owner.script.clone()).collect::<BTreeSet<_>>().len(), COUNT);
 	let mut rpc = srv.get_public_rpc().await;
 	let proof_db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let mailbox_key = srv.mailbox_keypair();
 	let mut first_link_elapsed = Duration::ZERO;
 	for owner in &owners {
-		let record = owner.record.serialize();
-		let response = rpc.set_fallback(protos::SetFallbackRequest {
-			mailbox_pk: owner.mailbox.as_pubkey().serialize().to_vec(), record: record.clone(),
-		}).await.unwrap().into_inner();
-		assert_eq!(response.record, record);
 		let proof = OwnerLink::new_joint(Network::Regtest, mailbox_key.public_key(), &owner.mailbox_key, &owner.key).unwrap();
 		let started = Instant::now();
 		proof_db.write(async |tx| tx.verify_owner_link(&mailbox_key, owner.key.public_key(), &proof, Network::Regtest).await)
@@ -299,7 +291,7 @@ async fn bounded_round_inventory() {
 		proof_db.write(async |tx| distinct.verify(tx, keys.iter().copied(), &mailbox_key, Network::Regtest).await).await.unwrap();
 		distinct_elapsed += started.elapsed();
 		let one = &group[0];
-		let before = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id,signature FROM expiry_owner_key WHERE user_pubkey=$1",
+		let before = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id,joint_proof FROM owner_key WHERE user_pubkey=$1",
 			&[&one.key.public_key().to_string()]).await?)).await.unwrap();
 		let canonical = (before.get::<_, String>(0), before.get::<_, String>(1));
 		let mut repeated = OwnerLinks::default();
@@ -318,23 +310,23 @@ async fn bounded_round_inventory() {
 		let error = proof_db.write(async |tx| invalid.verify(tx, [one.key.public_key()], &mailbox_key, Network::Regtest).await).await.unwrap_err();
 		invalid_elapsed += started.elapsed();
 		assert!(error.is::<server::OwnershipRefusal>(), "{error:#}");
-		let after = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id,signature FROM expiry_owner_key WHERE user_pubkey=$1",
+		let after = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id,joint_proof FROM owner_key WHERE user_pubkey=$1",
 			&[&one.key.public_key().to_string()]).await?)).await.unwrap();
 		assert_eq!((after.get::<_, String>(0), after.get::<_, String>(1)), canonical);
 	}
 	let started = Instant::now();
 	proof_db.read(async |tx| {
 		for owner in &owners {
-			assert_eq!(tx.expiry_owner(owner.key.public_key(), Network::Regtest, &mailbox_key).await?,
-				server::database::expiry_attribution::Attribution::Owned { mailbox_pk: owner.mailbox.as_pubkey(), spk: owner.record.spk.clone() });
+			assert_eq!(tx.expiry_owner(owner.key.public_key()).await?,
+				server::database::expiry_attribution::Attribution::Owned { mailbox_pk: owner.mailbox.as_pubkey(), spk: owner.script.clone() });
 		}
 		Ok(())
 	}).await.unwrap();
-	let payout_reverify_elapsed = started.elapsed();
-	assert_eq!(max_evidence_bytes, batch_limit * 97);
-	eprintln!("signed-link cost: owners={} configured_batch={} max_encoded_evidence_bytes={} first_link_us={} distinct_replay_us={} repeated_us={} invalid_last_us={} payout_reverify_us={}",
+	let payout_lookup_elapsed = started.elapsed();
+	assert_eq!(max_evidence_bytes, batch_limit * 163);
+	eprintln!("signed-link cost: owners={} configured_batch={} max_encoded_evidence_bytes={} first_link_us={} distinct_replay_us={} repeated_us={} invalid_last_us={} payout_lookup_us={}",
 		owners.len(), batch_limit, max_evidence_bytes, first_link_elapsed.as_micros(), distinct_elapsed.as_micros(),
-		repeated_elapsed.as_micros(), invalid_elapsed.as_micros(), payout_reverify_elapsed.as_micros());
+		repeated_elapsed.as_micros(), invalid_elapsed.as_micros(), payout_lookup_elapsed.as_micros());
 	let mut sponsor_funding = BTreeSet::new();
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	for _ in 0..96 {
@@ -472,23 +464,18 @@ async fn automatic_multilevel_split() {
 	assert_eq!(srv.watchmand().config().watchman.progress_grace_period, BlockDelta::new(2));
 	// Give every owner a separate random account and payout destination.
 	let owners = (0..PAYEES).map(|_| owner()).collect::<Vec<_>>();
-	assert_eq!(owners.iter().map(|o| o.record.spk.clone()).collect::<BTreeSet<_>>().len(), PAYEES);
+	assert_eq!(owners.iter().map(|o| o.script.clone()).collect::<BTreeSet<_>>().len(), PAYEES);
 	// This lower bound uses real consensus serialization, without any input,
 	// witness, drain, anchor or transaction-header overhead.
 	let minimum_outputs = owners[..324].iter().map(|o|
-		serialize(&TxOut { value: sat(LEAF_SAT - 1_000), script_pubkey: o.record.spk.clone() }).len()
+		serialize(&TxOut { value: sat(LEAF_SAT - 1_000), script_pubkey: o.script.clone() }).len()
 	).sum::<usize>();
-	assert_eq!(minimum_outputs, 10_044);
+	assert_eq!(minimum_outputs, 324 * 43);
 	assert!(minimum_outputs > 10_000);
 	let mut rpc = srv.get_public_rpc().await;
 	let proof_db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let mailbox_key = srv.mailbox_keypair();
 	for owner in &owners {
-		let bytes = owner.record.serialize();
-		let reply = rpc.set_fallback(protos::SetFallbackRequest {
-			mailbox_pk: owner.mailbox.as_pubkey().serialize().to_vec(), record: bytes.clone(),
-		}).await.unwrap().into_inner();
-		assert_eq!(reply.record, bytes);
 		let proof = OwnerLink::new_joint(Network::Regtest, mailbox_key.public_key(), &owner.mailbox_key, &owner.key).unwrap();
 		proof_db.write(async |tx| tx.verify_owner_link(&mailbox_key, owner.key.public_key(), &proof, Network::Regtest).await)
 			.await.unwrap();
@@ -499,10 +486,9 @@ async fn automatic_multilevel_split() {
 	assert_eq!(ids.len(), 1);
 	let client = wallet.client().await;
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
-	let registry_count = db.read(async |tx| Ok(tx.query_one(
-		"SELECT COUNT(*) FROM fallback_record", &[],
-	).await?.get::<_, i64>(0))).await.unwrap();
-	assert_eq!(registry_count, PAYEES as i64 + 2, "the source wallet registers its normal and recovery mailbox identities");
+	let keys = owners.iter().map(|owner| owner.key.public_key().to_string()).collect::<Vec<_>>();
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM owner_key WHERE user_pubkey=ANY($1)", &[&keys.as_slice()])
+		.await?.get::<_, i64>(0))).await.unwrap(), PAYEES as i64);
 	let source = client.get_full_vtxo(ids[0]).await.unwrap();
 	let source_key = client.get_vtxo_key(&source).await.unwrap();
 	let board_exit = source.transactions().find(|step| step.tx.input[0].previous_output == source.chain_anchor())
@@ -698,7 +684,7 @@ async fn finish_payouts(
 	for (index, leaf) in terminals {
 		let owner = &owners[*index];
 		let matches = graph.values().flat_map(|tx| tx.output.iter().enumerate().filter_map(move |(vout, out)|
-			(out.script_pubkey == owner.record.spk).then_some((tx.compute_txid(), vout, out))
+			(out.script_pubkey == owner.script).then_some((tx.compute_txid(), vout, out))
 		)).collect::<Vec<_>>();
 		assert_eq!(matches.len(), 1, "each actual owner must have exactly one economic payout output");
 		let (txid, vout, expected) = matches[0];
@@ -706,9 +692,9 @@ async fn finish_payouts(
 		let actual = core.get_tx_out(&txid, vout as u32, Some(true)).unwrap().unwrap();
 		assert!(actual.confirmations >= 6);
 		assert_eq!(actual.value, expected.value);
-		assert_eq!(actual.script_pub_key.script().unwrap(), owner.record.spk);
+		assert_eq!(actual.script_pub_key.script().unwrap(), owner.script);
 		let row = payout_rows.iter().find(|r| r.get::<_, String>("vtxo_id") == leaf.id().to_string()).unwrap();
-		assert_eq!(row.get::<_, String>("spk"), owner.record.spk.as_bytes().to_lower_hex_string());
+		assert_eq!(row.get::<_, String>("spk"), owner.script.as_bytes().to_lower_hex_string());
 		assert_eq!(row.get::<_, String>("owner_mailbox"), owner.mailbox.as_pubkey().to_string());
 		assert_eq!(row.get::<_, String>("user_pubkey"), owner.key.public_key().to_string());
 		let associated_parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
@@ -747,7 +733,7 @@ async fn finish_payouts(
 			core.get_block_header_info(&info.blockhash.unwrap()).unwrap().height
 		}).min().unwrap();
 		let mut reached = backing.union(sponsor_funding).copied().collect::<BTreeSet<_>>();
-		let customer_scripts = owners.iter().map(|owner| owner.record.spk.clone()).collect::<BTreeSet<_>>();
+		let customer_scripts = owners.iter().map(|owner| owner.script.clone()).collect::<BTreeSet<_>>();
 		let mut customer_counts = BTreeMap::new();
 		for height in first..=core.get_block_count().unwrap() as usize {
 			let block = core.get_block(&core.get_block_hash(height as u64).unwrap()).unwrap();
@@ -801,7 +787,7 @@ async fn finish_payouts(
 			let actual = core.get_tx_out(txid, vout as u32, Some(true)).unwrap().unwrap();
 			assert_eq!(actual.value, expected.value);
 			assert_eq!(actual.script_pub_key.script().unwrap(), expected.script_pubkey);
-			if mine_pending && actual.value > sat(0) && !owners.iter().any(|owner| owner.record.spk == expected.script_pubkey) {
+			if mine_pending && actual.value > sat(0) && !owners.iter().any(|owner| owner.script == expected.script_pubkey) {
 				assert!(operator_owned.contains(&OutPoint::new(*txid, vout as u32)),
 					"all remaining operator capital must belong to the configured wallets");
 			}

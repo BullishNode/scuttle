@@ -22,7 +22,7 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 		.boarded(sat(100_000)).create().await;
 	let coin = wallet.spendable_vtxos().await.unwrap().remove(0);
 	let original = wallet.get_full_vtxo(coin.id()).await.unwrap();
-	let registration = wallet.fallback_destination().await.unwrap();
+	let registration = wallet.fallback_script();
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	let expired = ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - height).await;
@@ -43,15 +43,17 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 	}).await.expect("actual background allocation never decided the native coin");
 	wallet.sync().await;
 	let client_db = SqliteClient::open(ctx.datadir.join("owner/db.sqlite")).unwrap();
-	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spendable,
-		"the server's spent admission fence must not stop the client's exit protection");
+	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None },
+		"a committed decision fences the retained exit material until its canonical outcome");
 	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), original.serialize());
 	assert!(wallet.spendable_vtxos().await.unwrap().is_empty(), "protected is not available for new payments");
 	assert!(wallet.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
+	assert!(wallet.exit_mgr().start_exit_for_vtxos(&[coin.vtxo.clone()]).await.is_err());
+	assert!(wallet.lock_vtxos([coin.id()], None).await.is_err());
 	let pending = wallet.history().await.unwrap();
-	assert!(pending.iter().filter(|movement| movement.subsystem.name == "abandon.fallback_payout")
+	assert!(pending.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
 		.all(|movement| movement.status != bark::movement::MovementStatus::Successful));
-	assert!(client_db.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.is_empty());
+	assert!(super::fallback_receipt_ids(client_db.get_fallback_receipts().await.unwrap(), true).is_empty());
 	let owed = wallet.balance().await.unwrap();
 	assert_eq!(owed.spendable, Amount::ZERO);
 	assert_eq!(owed.awaiting_settlement, coin.amount());
@@ -65,7 +67,7 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 		loop {
 			for txid in ctx.bitcoind().sync_client().get_raw_mempool().unwrap() {
 				let tx = ctx.bitcoind().await_transaction(txid).await;
-				if tx.output.iter().any(|output| output.script_pubkey == registration.spk
+				if tx.output.iter().any(|output| output.script_pubkey == registration
 					&& output.value == coin.amount() - sat(1_000)) { return txid; }
 			}
 			tokio::time::sleep(Duration::from_millis(50)).await;
@@ -77,8 +79,8 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 	wallet.chain().invalidate_caches().await;
 	wallet.sync_fallback_payouts().await.unwrap();
 	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	let snapshot = client_db.get_fallback_snapshot().await.unwrap();
-	assert!(snapshot.adopted_payout_vtxos.contains(&coin.id()));
+	let receipts = client_db.get_fallback_receipts().await.unwrap();
+	assert!(receipts.iter().any(|r| r.affects(coin.id()) && r.retired_block.is_some()));
 	assert!(!wallet.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
 	let paid_balance = wallet.balance().await.unwrap();
 	assert_eq!(paid_balance.spendable, Amount::ZERO);
@@ -90,8 +92,8 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 	ctx.bitcoind().sync_client().invalidate_block(&confirmation_hash).unwrap();
 	wallet.chain().invalidate_caches().await;
 	wallet.sync_fallback_payouts().await.unwrap();
-	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
-	assert!(client_db.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.is_empty());
+	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
+	assert!(super::fallback_receipt_ids(client_db.get_fallback_receipts().await.unwrap(), true).is_empty());
 	assert!(wallet.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
 	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), original.serialize());
 }
@@ -116,8 +118,8 @@ async fn fallback_dust_forfeiture_is_confirmed_and_reorgs_without_server() {
 	let signed = wallet.get_full_vtxo(coin.id()).await.unwrap();
 	let original = signed.serialize();
 	let native_history = wallet.history().await.unwrap();
-	let registration = wallet.fallback_destination().await.unwrap();
-	assert!(sat(200) < registration.spk.minimal_non_dust());
+	let registration = wallet.fallback_script();
+	assert!(sat(200) < registration.minimal_non_dust());
 	let client_db = SqliteClient::open(ctx.datadir.join("owner/db.sqlite")).unwrap();
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	let expired = ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - height).await;
@@ -133,8 +135,8 @@ async fn fallback_dust_forfeiture_is_confirmed_and_reorgs_without_server() {
 	}).await.expect("native dust allocation was not decided");
 	wallet.sync_fallback_payouts().await.unwrap();
 	assert!(wallet.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
-	assert!(client_db.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.is_empty());
-	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
+	assert!(super::fallback_receipt_ids(client_db.get_fallback_receipts().await.unwrap(), true).is_empty());
+	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
 	let owed = wallet.balance().await.unwrap();
 	assert_eq!(owed.spendable, Amount::ZERO);
 	assert_eq!(owed.awaiting_settlement, sat(1_200));
@@ -154,7 +156,7 @@ async fn fallback_dust_forfeiture_is_confirmed_and_reorgs_without_server() {
 		}
 	}).await.expect("actual dust sweep never broadcast");
 	assert!(parent.input.iter().any(|input| input.previous_output == signed.chain_anchor()));
-	assert!(!parent.output.iter().any(|output| output.script_pubkey == registration.spk));
+	assert!(!parent.output.iter().any(|output| output.script_pubkey == registration));
 	let allocations = db.read(async |tx| Ok(tx.query(
 		"SELECT a.sweep_txid,c.disposition,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
@@ -176,11 +178,11 @@ async fn fallback_dust_forfeiture_is_confirmed_and_reorgs_without_server() {
 	let confirmed_hash: bitcoin::BlockHash = parent_info["blockhash"].as_str().unwrap().parse().unwrap();
 	wallet.chain().invalidate_caches().await;
 	wallet.sync_fallback_payouts().await.unwrap();
-	let snapshot = client_db.get_fallback_snapshot().await.unwrap();
-	assert!(snapshot.adopted_payout_vtxos.contains(&coin.id()));
+	let receipts = client_db.get_fallback_receipts().await.unwrap();
+	assert!(receipts.iter().any(|r| r.affects(coin.id()) && r.retired_block.is_some()));
 	assert!(!wallet.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
 	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(!parent.output.iter().any(|output| output.script_pubkey == registration.spk));
+	assert!(!parent.output.iter().any(|output| output.script_pubkey == registration));
 
 	assert_eq!(wallet.balance().await.unwrap().total(), Amount::ZERO,
 		"confirmed forfeiture cannot remain counted as another owned Ark claim");
@@ -188,12 +190,17 @@ async fn fallback_dust_forfeiture_is_confirmed_and_reorgs_without_server() {
 	ctx.bitcoind().sync_client().invalidate_block(&confirmed_hash).unwrap();
 	wallet.chain().invalidate_caches().await;
 	wallet.sync_fallback_payouts().await.unwrap();
-	assert!(client_db.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.is_empty());
-	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
+	assert!(super::fallback_receipt_ids(client_db.get_fallback_receipts().await.unwrap(), true).is_empty());
+	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
 	assert!(wallet.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
 	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), original);
-	// Chain reconciliation does not invent another native payment or debit.
-	assert_eq!(wallet.history().await.unwrap(), native_history);
+	// The same explicit receipt is reversed, without changing native history.
+	let reversed = wallet.history().await.unwrap();
+	assert_eq!(reversed.iter().filter(|movement| movement.subsystem.name != "scuttle.fallback").cloned().collect::<Vec<_>>(), native_history);
+	let receipt_movement = reversed.iter().find(|movement| movement.subsystem.name == "scuttle.fallback").unwrap();
+	assert_eq!(receipt_movement.status, bark::movement::MovementStatus::Pending);
+	assert_eq!(receipt_movement.effective_balance, bitcoin::SignedAmount::ZERO);
+	let receipt_movement_id = receipt_movement.id;
 	let owed_again = wallet.balance().await.unwrap();
 	assert_eq!(owed_again.spendable, Amount::ZERO);
 	assert_eq!(owed_again.awaiting_settlement, sat(1_200));
@@ -206,9 +213,14 @@ async fn fallback_dust_forfeiture_is_confirmed_and_reorgs_without_server() {
 	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spent);
 	assert!(!wallet.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
 	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), original);
-	assert!(client_db.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.contains(&coin.id()));
+	assert!(super::fallback_receipt_ids(client_db.get_fallback_receipts().await.unwrap(), true).contains(&coin.id()));
 	assert_eq!(wallet.balance().await.unwrap().total(), Amount::ZERO);
-	assert_eq!(wallet.history().await.unwrap(), native_history);
+	let repeated = wallet.history().await.unwrap();
+	assert_eq!(repeated.iter().filter(|movement| movement.subsystem.name != "scuttle.fallback").cloned().collect::<Vec<_>>(), native_history);
+	let receipt_movement = repeated.iter().find(|movement| movement.subsystem.name == "scuttle.fallback").unwrap();
+	assert_eq!(receipt_movement.id, receipt_movement_id);
+	assert_eq!(receipt_movement.status, bark::movement::MovementStatus::Successful);
+	assert_eq!(receipt_movement.effective_balance.to_sat(), -1_200);
 	let reconfirmed: serde_json::Value = ctx.bitcoind().sync_client().call("getrawtransaction",
 		&[serde_json::json!(parent.compute_txid()), serde_json::json!(true)]).unwrap();
 	assert!(reconfirmed["confirmations"].as_u64().unwrap() >= 6);

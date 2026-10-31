@@ -181,9 +181,8 @@ impl OnchainWallet {
 		ret.reserve_fallback_address().await?;
 		Ok(ret)
 	}
-	/// A stable destination the native app can explicitly register with Ark.
-	/// External onchain wallets choose their own destination through the same
-	/// OpenWalletArgs field; the core wallet never derives it from the Ark seed.
+	/// The default mailbox's BIP86 external index-zero destination. External
+	/// mailbox applications must use the corresponding Bitcoin account themselves.
 	pub fn fallback_script(&self) -> ScriptBuf {
 		self.inner.peek_address(KeychainKind::External, 0).address.script_pubkey()
 	}
@@ -656,6 +655,8 @@ mod fallback_tests {
 				bip32::ChildNumber::from_hardened_idx(u32::from(network != Network::Bitcoin)).unwrap(),
 				bip32::ChildNumber::from_hardened_idx(0).unwrap(), 0.into(), 0.into()];
 			let mailbox = master.derive_priv(&secp, &path).unwrap().to_keypair(&secp);
+			let sdk_seed = crate::WalletSeed::new_from_mnemonic(network, &mnemonic);
+			assert_eq!(sdk_seed.to_mailbox_keypair().public_key(), mailbox.public_key());
 			let script = ScriptBuf::new_p2tr(&secp, mailbox.x_only_public_key().0, None);
 			let native = BdkWallet::create_single(bdk_wallet::template::Bip86(master, KeychainKind::External))
 				.network(network).create_wallet_no_persist().unwrap();

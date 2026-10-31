@@ -43,7 +43,7 @@ async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
 	let ids = wallet.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	let client = wallet.client().await;
 	let input = client.get_full_vtxo(ids[0]).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	let key = client.get_vtxo_key(&input).await.unwrap();
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let deadline = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
@@ -103,7 +103,7 @@ async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
 	let refusal = format!("{reserved:#}");
 	assert!(backing.iter().any(|id| refusal.contains(&format!("vtxo {id} is reserved for expiry recovery"))),
 		"{refusal}");
-	assert_eq!(first.output.iter().find(|o| o.script_pubkey == destination.spk).unwrap().value, sat(49_000));
+	assert_eq!(first.output.iter().find(|o| o.script_pubkey == destination).unwrap().value, sat(49_000));
 	let waiting = db.read(async |t| Ok(t.query_one("
 		SELECT COUNT(*)
 		FROM expiry_entitlement
@@ -112,7 +112,7 @@ async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
 	assert_eq!(waiting, 0, "ordinary payout must not invent a terminal HTLC resolution");
 	assert!((ctx.bitcoind().get_block_count().await as u32) < deadline.to_u32());
 	ctx.generate_blocks(6).await;
-	let output_index = first.output.iter().position(|o| o.script_pubkey == destination.spk).unwrap() as u32;
+	let output_index = first.output.iter().position(|o| o.script_pubkey == destination).unwrap() as u32;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&first.compute_txid(), output_index, Some(true)).unwrap().unwrap().confirmations >= 6);
 
 	// This registered send was never initiated. Once its refund deadline
@@ -125,15 +125,15 @@ async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
 	let second = payout(&db, htlc).await;
 	assert_ne!(first.compute_txid(), second.compute_txid());
 	assert_eq!(ctx.bitcoind().await_transaction(second.compute_txid()).await, second);
-	assert_eq!(second.output.iter().find(|o| o.script_pubkey == destination.spk).unwrap().value, sat(50_000));
-	assert_eq!(first.output.iter().filter(|o| o.script_pubkey == destination.spk).map(|o| o.value).sum::<bitcoin::Amount>()
-		+ second.output.iter().filter(|o| o.script_pubkey == destination.spk).map(|o| o.value).sum::<bitcoin::Amount>(), sat(99_000),
+	assert_eq!(second.output.iter().find(|o| o.script_pubkey == destination).unwrap().value, sat(50_000));
+	assert_eq!(first.output.iter().filter(|o| o.script_pubkey == destination).map(|o| o.value).sum::<bitcoin::Amount>()
+		+ second.output.iter().filter(|o| o.script_pubkey == destination).map(|o| o.value).sum::<bitcoin::Amount>(), sat(99_000),
 		"both 50,000 sat siblings pay the 1,000 sat floor once at their original expiry height");
 	let upstream = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, htlc).await).await.unwrap().unwrap();
 	assert_eq!(upstream.htlc.resolution(), None);
 	assert!(first.input.iter().all(|a| second.input.iter().all(|b| a.previous_output != b.previous_output)));
 	ctx.generate_blocks(6).await;
-	let output_index = second.output.iter().position(|o| o.script_pubkey == destination.spk).unwrap() as u32;
+	let output_index = second.output.iter().position(|o| o.script_pubkey == destination).unwrap() as u32;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&second.compute_txid(), output_index, Some(true)).unwrap().unwrap().confirmations >= 6);
 }
 
@@ -150,7 +150,7 @@ async fn expiry_unregistered_owner_does_not_block_registered_sibling() {
 	let client = wallet.client().await;
 	client.stop_daemon_wait().await.unwrap();
 	let source = client.get_full_vtxo(ids[0]).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	let key = client.get_vtxo_key(&source).await.unwrap();
 	let unknown_pair = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[91; 32]).unwrap();
 	let unknown = unknown_pair.public_key();
@@ -188,11 +188,9 @@ async fn expiry_unregistered_owner_does_not_block_registered_sibling() {
 	ctx.generate_blocks(2).await;
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	// Deliberately corrupt attribution evidence after genuine signed admission.
-	assert!(matches!(db.read(async |tx| tx.expiry_owner(unknown, bitcoin::Network::Regtest,
-		&srv.mailbox_keypair()).await).await.unwrap(), server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. } if mailbox_pk == unknown));
+	assert!(matches!(db.read(async |tx| tx.expiry_owner(unknown).await).await.unwrap(), server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. } if mailbox_pk == unknown));
 	db.write(async |tx| {
-		tx.execute("DELETE FROM expiry_owner_key WHERE user_pubkey=$1", &[&unknown.to_string()]).await?;
-		tx.execute("DELETE FROM fallback_record WHERE mailbox_pk=$1", &[&unknown.to_string()]).await?;
+		tx.execute("DELETE FROM owner_key WHERE user_pubkey=$1", &[&unknown.to_string()]).await?;
 		Ok(())
 	}).await.unwrap();
 	let height = ctx.bitcoind().get_block_count().await as u32;
@@ -221,7 +219,7 @@ async fn expiry_unregistered_owner_does_not_block_registered_sibling() {
 	}).await.expect("registered sibling payout must not wait for an unregistered key");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	let outputs = parent.output.iter().enumerate()
-		.filter(|(_, output)| output.script_pubkey == destination.spk).collect::<Vec<_>>();
+		.filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(outputs.len(), 1);
 	assert_eq!(outputs[0].1.value, sat(89_000));
 	let tip = ctx.generate_blocks(6).await;
@@ -230,10 +228,10 @@ async fn expiry_unregistered_owner_does_not_block_registered_sibling() {
 	let paid = core.get_tx_out(&parent.compute_txid(), outputs[0].0 as u32, Some(true)).unwrap().unwrap();
 	assert!(paid.confirmations >= 6);
 	assert_eq!(paid.value, sat(89_000));
-	let state = db.read(async |tx| tx.expiry_owner(unknown, bitcoin::Network::Regtest, &srv.mailbox_keypair()).await).await.unwrap();
+	let state = db.read(async |tx| tx.expiry_owner(unknown).await).await.unwrap();
 	assert_eq!(state, server::database::expiry_attribution::Attribution::Unresolved);
 	assert!(db.read(async |tx| Ok(tx.query_one("SELECT \
-		NOT EXISTS(SELECT 1 FROM expiry_owner_key WHERE user_pubkey=$1) \
+		NOT EXISTS(SELECT 1 FROM owner_key WHERE user_pubkey=$1) \
 		AND NOT EXISTS(SELECT 1 FROM expiry_entitlement WHERE vtxo_id=$2)",
 		&[&unknown.to_string(), &held.id().to_string()],
 	).await?.get::<_, bool>(0))).await.unwrap());
@@ -261,7 +259,7 @@ async fn expiry_unregistered_owner_does_not_block_registered_sibling() {
 		let block = core.get_block(&core.get_block_hash(height).unwrap()).unwrap();
 		for transaction in block.txdata {
 			for (index, output) in transaction.output.iter().enumerate() {
-				if output.script_pubkey == destination.spk {
+				if output.script_pubkey == destination {
 					assert_eq!(output.value, sat(89_000));
 					payments.push(bitcoin::OutPoint::new(transaction.compute_txid(), index as u32));
 				}

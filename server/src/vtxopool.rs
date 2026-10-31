@@ -389,7 +389,7 @@ impl VtxoPool {
 
 		srv.db.write(async |t| {
 			crate::database::expiry_guard::guard_new_lightning_inputs(t, &input_ids).await?;
-			t.execute_vtxo_tree_update(update, Some((srv.config.network, srv.mailbox_key.leak_ref()))).await?;
+			t.execute_vtxo_tree_update(update).await?;
 			htlc_vtxo::create_htlc_vtxos(&t, &htlc_recvs, HtlcDirection::Outgoing).await?;
 			t.mark_vtxopool_vtxos_spent(inputs.iter().map(|v| v.0)).await
 				.context("failed to mark vtxopool vtxos as spent")?;
@@ -661,7 +661,7 @@ impl Process {
 				database::SpendState::Pool,
 			);
 		self.srv.db.write(async |t| {
-			t.execute_vtxo_tree_update(update, None).await?;
+			t.execute_vtxo_tree_update(update).await?;
 			t.upsert_nursery_tx(&tx, NurseryTxKind::VtxoPool, confirm_target).await
 		}).await?;
 

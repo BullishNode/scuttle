@@ -11,8 +11,6 @@ import "core.proto";
 service ArkService {
 	rpc Handshake(HandshakeRequest) returns (HandshakeResponse) {}
 	rpc GetArkInfo(core.Empty) returns (ArkInfo) {}
-	// Register an authenticated immutable mailbox/payout binding.
-	rpc SetFallback(SetFallbackRequest) returns (SetFallbackResponse) {}
 	rpc GetOffboardFeeRate(core.Empty) returns (OffboardFeeRateResponse) {}
 
 	rpc GetVtxo(GetVtxoRequest) returns (GetVtxoResponse) {}
@@ -226,6 +224,9 @@ enum VtxoSpendState {
 	// canonical payment before it retires this claim.
 	reserved 6;
 	VTXO_SPEND_STATE_FALLBACK_PENDING = 1000;
+	// Terminal no-output policy result. The attached receipt carries the
+	// actual fee and forfeited amount; this is not a Bitcoin payment.
+	VTXO_SPEND_STATE_FALLBACK_FORFEITED = 1001;
 }
 
 message GetVtxoStatusRequest {
@@ -237,6 +238,7 @@ message GetVtxoStatusRequest {
 message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
 	bytes owner_mailbox = 1000;
+	optional core.FallbackClaim fallback_claim = 1001;
 }
 
 message VtxoStatusQuery {
@@ -254,6 +256,7 @@ message VtxoStatus {
 	bytes vtxo_id = 1;
 	VtxoSpendState spend_state = 2;
 	bytes owner_mailbox = 1000;
+	optional core.FallbackClaim fallback_claim = 1001;
 }
 
 message GetVtxosStatusByIdsResponse {
@@ -288,6 +291,7 @@ message RecoveredVtxo {
 	uint32 derivation_index = 2;
 	VtxoSpendState spend_state = 3;
 	bytes owner_mailbox = 1000;
+	optional core.FallbackClaim fallback_claim = 1001;
 }
 
 message RecoverVtxosByXpubResponse {
@@ -323,7 +327,8 @@ message BoardCosignRequest {
 	bytes user_pubkey = 4;
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
-	reserved 7;
+	// Decode-only tombstone: presence is refused, including an empty payload.
+	optional bytes retired_owner_proof = 7;
 	OwnerProof owner_proof = 1000;
 }
 
@@ -347,14 +352,16 @@ message RegisterVtxoTransactionsRequest {
 message VtxoRequest {
 	uint64 amount = 1;
 	bytes policy = 2;
-	reserved 3;
+	// Decode-only tombstone: presence is refused, including an empty payload.
+	optional bytes retired_owner_proof = 3;
 	OwnerProof owner_proof = 1000;
 }
 
 message ArkoorDestination {
 	uint64 total_amount = 1;
 	bytes policy = 2;
-	reserved 3;
+	// Decode-only tombstone: presence is refused, including an empty payload.
+	optional bytes retired_owner_proof = 3;
 	OwnerProof owner_proof = 1000;
 }
 
@@ -465,7 +472,8 @@ message PrepareLightningReceiveClaimRequest {
 		InputVtxo input_vtxo = 4;
 		string token = 5;
 	};
-	reserved 6;
+	// Decode-only tombstone: presence is refused, including an empty payload.
+	optional bytes retired_owner_proof = 6;
 	OwnerProof owner_proof = 1000;
 }
 
@@ -824,13 +832,4 @@ message WalletStatusResponse {
 
 message LightningNodeUri {
 	string uri = 1;
-}
-
-// The record uses ark-lib's bounded mailbox-only v4 FallbackRegistration encoding.
-message SetFallbackRequest {
-	bytes mailbox_pk = 1;
-	bytes record = 2;
-}
-message SetFallbackResponse {
-	bytes record = 1;
 }

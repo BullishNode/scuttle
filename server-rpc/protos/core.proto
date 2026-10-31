@@ -12,6 +12,25 @@ message VtxoOwner {
 	bytes owner_mailbox = 1001;
 }
 
+// An immutable source's winning fallback allocation. The wallet independently
+// checks the transaction, BIP86 destination and canonical confirmations.
+message FallbackClaim {
+	// The allocated entitlement, which may differ from a wallet's original input.
+	bytes vtxo_id = 1010;
+	// Explicit stage-selected wallet sources/claim outputs, not inferred ancestry.
+	repeated bytes source_vtxo_ids = 1011;
+	uint64 allocation_id = 1000;
+	bytes owner_mailbox = 1001;
+	uint64 gross_sat = 1002;
+	uint64 fee_sat = 1003;
+	uint64 payout_sat = 1004;
+	uint64 forfeited_sat = 1005;
+	optional bytes transaction_id = 1006;
+	optional uint32 output_index = 1007;
+	optional uint32 confirmed_height = 1008;
+	optional bytes confirmed_block_hash = 1009;
+}
+
 // Why a lightning send failed.
 //
 // Only FEE_TOO_LOW is worth retrying with a larger routing reserve: no route

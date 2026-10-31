@@ -62,10 +62,9 @@ async fn forwarded_receive_to_signed_address_survives_barkd_restart() {
 	assert!(!coins.is_empty());
 	assert_eq!(coins.iter().map(|coin| coin.vtxo.amount).sum::<Amount>(), amount);
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
-	let record = db.read(async |tx| tx.get_fallback(recipient_mailbox.as_pubkey()).await).await.unwrap().unwrap();
-	record.verify(Network::Regtest, recipient_mailbox.as_pubkey()).unwrap();
-	assert_eq!(db.read(async |tx| tx.expiry_owner(recipient_key, Network::Regtest, &server_key).await).await.unwrap(),
-		Attribution::Owned { mailbox_pk: recipient_mailbox.as_pubkey(), spk: record.spk });
+	assert_eq!(db.read(async |tx| tx.expiry_owner(recipient_key).await).await.unwrap(),
+		Attribution::Owned { mailbox_pk: recipient_mailbox.as_pubkey(),
+			spk: bitcoin::ScriptBuf::new_p2tr(&ark::SECP, recipient_mailbox.as_pubkey().x_only_public_key().0, None) });
 	for coin in coins {
 		assert_eq!(coin.vtxo.user_pubkey, recipient_key);
 		let encoded = recipient.get_vtxo_encoded(&coin.vtxo.id.to_string()).await;

@@ -53,7 +53,7 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 	let invoice=recipient.bolt11_invoice(sat(180_000),None,None).await.unwrap();
 	let hash=PaymentHash::from(&invoice);
 	let receive_key=recipient.new_address().await.unwrap().policy().user_pubkey();
-	let receive_spk=recipient.fallback_destination().await.unwrap().spk;
+	let receive_spk=recipient.fallback_script();
 	let actor=Box::pin(ctx.bark("sender",&srv).cfg(|cfg|cfg.daemon_manual_sync=true).funded(sat(400_000)).create()).await;
 	let a=actor.board_and_confirm_and_register(&ctx,sat(100_000)).await;
 	let b=actor.board_and_confirm_and_register(&ctx,sat(100_000)).await;
@@ -66,7 +66,7 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 	let expected_payout=sat(inputs.iter().map(|input|input.amount().to_sat()).sum::<u64>()
 		-gross_by_expiry.values().map(|gross|1_000_u64.max(gross.div_ceil(100))).sum::<u64>());
 	let keys=vec![sender.get_vtxo_key(&inputs[0]).await.unwrap(),sender.get_vtxo_key(&inputs[1]).await.unwrap()];
-	let fallback=sender.fallback_destination().await.unwrap();
+	let fallback=sender.fallback_script();
 	let tip=BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let deadline=tip+srv.config().htlc_send_expiry_delta+BlockDelta::new(2);
 	let builder=ArkoorPackageBuilder::new_claim_all_with_checkpoints(inputs,
@@ -82,7 +82,7 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 	lightning.sync().await;
 	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {invoice:invoice.to_string(),payment_amount_sat:180_000,
 		htlc_vtxo_ids:sources.iter().map(|source|source.id().to_bytes().to_vec()).collect(),mailbox_id:None,retry_for_secs:Some(5)}).await.unwrap();
-	let reply=rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+	let reply=rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash:hash.to_vec(),user_pubkey:receive_key.serialize().to_vec(),htlc_recv_expiry:(tip+BlockDelta::new(36)).to_u32(),
 		lightning_receive_anti_dos:None,
@@ -158,7 +158,7 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 				let parents=by_source.values().map(|(id,p)|(*id,p.clone())).collect::<BTreeMap<_,_>>();
 				let inputs=parents.values().flat_map(|p|p.input.iter().map(|i|i.previous_output.to_string())).collect::<BTreeSet<_>>();
 				assert_eq!(inputs,prefixes.iter().map(ToString::to_string).collect(),"each refund spends only its sources' backing");
-				let outputs=parents.values().flat_map(|p|&p.output).filter(|o|o.script_pubkey==fallback.spk).map(|o|o.value).collect::<Vec<_>>();
+				let outputs=parents.values().flat_map(|p|&p.output).filter(|o|o.script_pubkey==fallback).map(|o|o.value).collect::<Vec<_>>();
 				assert_eq!(outputs.iter().copied().sum::<bitcoin::Amount>(),expected_payout,"charge each original expiry height once");
 				super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx,&db,&grants,&receive_spk).await;
 				return OriginalReservation {by_source,entitlements};
@@ -230,7 +230,7 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 		}
 	}).await.expect("every actual user claim must retain its canonical raw authorization");
 	if partial {
-		confirm_reserved_partial(&ctx,&srv,&db,&sources,&claims[0],&fallback.spk,&operator,&reserved).await;
+		confirm_reserved_partial(&ctx,&srv,&db,&sources,&claims[0],&fallback,&operator,&reserved).await;
 		return;
 	}
 	confirm_operator_returns(&ctx,&srv,&db,&sources,&claims,&reserved).await;

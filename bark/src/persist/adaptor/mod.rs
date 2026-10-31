@@ -72,7 +72,7 @@ use crate::movement::{
 use crate::movement::update::MovementUpdate;
 use crate::persist::BarkPersister;
 use crate::persist::models::{
-	FallbackRegistration,	PaidInvoice, RoundStateId, SerdeExitChildTx, SerdeRoundState, SerdeVtxo, SerdeVtxoKey,
+	PaidInvoice, RoundStateId, SerdeExitChildTx, SerdeRoundState, SerdeVtxo, SerdeVtxoKey,
 	SettledLightningReceive, StoredExit, StoredRoundState, Unlocked, wallet_vtxo_from_full,
 };
 use crate::round::RoundState;
@@ -118,9 +118,8 @@ pub mod partition {
 	/// re-driven action step reuses its movement instead of duplicating it.
 	pub const MOVEMENT_ACTION: u8 = 17;
 
-	pub const FALLBACK_RECORD: u8 = 18;
-	pub const FALLBACK_SNAPSHOT: u8 = 19;
-	pub const PENDING_FALLBACK_RECORD: u8 = 20;
+	// 18..=20 belonged to refused registration-era stores.
+	pub const FALLBACK_RECEIPT: u8 = 21;
 
 	pub const LAST_IDS: u8 = u8::MAX;
 }
@@ -1012,48 +1011,38 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		}
 	}
 
-	async fn get_fallback_snapshot(&self) -> anyhow::Result<crate::FallbackSnapshot> {
-		Ok(self.inner.read().await.get(partition::FALLBACK_SNAPSHOT, &[]).await?
-			.map(|record| record.to_data()).transpose()?.unwrap_or_default())
+
+
+	async fn get_fallback_receipts(&self) -> anyhow::Result<Vec<crate::FallbackReceipt>> {
+		self.inner.read().await.get_all(partition::FALLBACK_RECEIPT).await?
+			.into_iter().map(|record| record.to_data()).collect()
 	}
 
-	async fn store_fallback_snapshot(&self, snapshot: &crate::FallbackSnapshot) -> anyhow::Result<()> {
-		self.inner.write().await.put(Record::from_data(partition::FALLBACK_SNAPSHOT, &[], None, snapshot)?).await
-	}
-
-	async fn get_fallback_record(&self) -> anyhow::Result<Option<FallbackRegistration>> {
-		self.inner.read().await.get(partition::FALLBACK_RECORD, &[]).await?
-			.map(|r| r.to_data()).transpose()
-	}
-
-	async fn store_fallback_record(&self, record: &FallbackRegistration) -> anyhow::Result<()> {
+	async fn store_fallback_receipt(&self, receipt: &crate::FallbackReceipt) -> anyhow::Result<()> {
 		let mut guard = self.inner.write().await;
-		for partition in [partition::FALLBACK_RECORD, partition::PENDING_FALLBACK_RECORD] {
-			if let Some(stored) = guard.get(partition, &[]).await? {
-				ensure!(stored.to_data::<FallbackRegistration>()?.same_binding(record), "immutable fallback record mismatch");
-			}
+		let id = receipt.vtxo_id.to_bytes();
+		if let Some(previous) = guard.get(partition::FALLBACK_RECEIPT, &id).await? {
+			let previous: crate::FallbackReceipt = previous.to_data()?;
+			ensure!(previous.owner_mailbox == receipt.owner_mailbox && previous.gross == receipt.gross
+				&& previous.source_vtxo_ids == receipt.source_vtxo_ids,
+				"immutable fallback receipt source differs");
 		}
-		guard.put(Record::from_data(partition::FALLBACK_RECORD, &[], None, record)?).await?;
-		guard.delete(partition::PENDING_FALLBACK_RECORD, &[]).await?;
-		Ok(())
+		guard.put(Record::from_data(partition::FALLBACK_RECEIPT, &id, None, receipt)?).await
 	}
 
-	async fn get_pending_fallback_record(&self) -> anyhow::Result<Option<FallbackRegistration>> {
-		let guard = self.inner.read().await;
-		if guard.get(partition::FALLBACK_RECORD, &[]).await?.is_some() { return Ok(None); }
-		guard.get(partition::PENDING_FALLBACK_RECORD, &[]).await?.map(|r| r.to_data()).transpose()
+	async fn remove_fallback_receipt(&self, id: VtxoId) -> anyhow::Result<()> {
+		self.inner.write().await.delete(partition::FALLBACK_RECEIPT, &id.to_bytes()).await
 	}
 
-	async fn store_pending_fallback_record(&self, record: &FallbackRegistration) -> anyhow::Result<()> {
-		let mut guard = self.inner.write().await;
-		for partition in [partition::FALLBACK_RECORD, partition::PENDING_FALLBACK_RECORD] {
-			if let Some(stored) = guard.get(partition, &[]).await? {
-				ensure!(stored.to_data::<FallbackRegistration>()?.same_binding(record), "immutable fallback record mismatch");
-			}
-		}
-		if guard.get(partition::FALLBACK_RECORD, &[]).await?.is_some() { return Ok(()); }
-		guard.put(Record::from_data(partition::PENDING_FALLBACK_RECORD, &[], None, record)?).await
-	}
+
+
+
+
+
+
+
+
+
 
 
 	async fn get_public_key_idx(&self, public_key: &PublicKey) -> anyhow::Result<Option<u32>> {

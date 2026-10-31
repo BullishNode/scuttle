@@ -8,7 +8,6 @@
 //! - Provide stable, serde-friendly representations for database backends.
 //! - Enable forward/backward compatibility when schema migrations occur.
 
-pub use ark::fallback::FallbackRegistration;
 use ark::fallback::OwnerLink;
 
 use std::borrow::Cow;

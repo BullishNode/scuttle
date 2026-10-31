@@ -1,4 +1,4 @@
-//! An application-owned BIP84 wallet attached through the public SDK interface.
+//! An application-owned BIP86 wallet attached through the public SDK interface.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -24,18 +24,26 @@ fn timestamp() -> u64 {
 }
 
 /// Keeps its own descriptor, keys and persistence; the SDK sees a trait object.
-pub struct AppBip84Wallet {
+pub struct AppBip86Wallet {
 	inner: bdk_wallet::Wallet,
 	db: Arc<dyn BarkPersister>,
 	rpc: BitcoinRpcClient,
 }
 
-impl AppBip84Wallet {
+impl AppBip86Wallet {
+	/// The app supplies its first external BIP86 key independently of Ark keys.
+	pub fn mailbox_keypair(network: Network, seed: &[u8; 64]) -> anyhow::Result<bitcoin::secp256k1::Keypair> {
+		let coin = if network == Network::Bitcoin { 0 } else { 1 };
+		let path = format!("m/86'/{coin}'/0'/0/0").parse::<bitcoin::bip32::DerivationPath>()?;
+		let key = bitcoin::bip32::Xpriv::new_master(network, seed)?.derive_priv(&ark::SECP, &path)?;
+		Ok(bitcoin::secp256k1::Keypair::from_secret_key(&ark::SECP, &key.private_key))
+	}
+
 	pub async fn load_or_create(
 		network: Network, seed: [u8; 64], db: Arc<dyn BarkPersister>, rpc: BitcoinRpcClient,
 	) -> anyhow::Result<Self> {
 		let xpriv = bitcoin::bip32::Xpriv::new_master(network, &seed)?;
-		let descriptor = bdk_wallet::template::Bip84(xpriv, KeychainKind::External);
+		let descriptor = bdk_wallet::template::Bip86(xpriv, KeychainKind::External);
 		let changeset = db.initialize_bdk_wallet().await?;
 		let inner = bdk_wallet::Wallet::load()
 			.descriptor(KeychainKind::External, Some(descriptor.clone()))
@@ -79,7 +87,7 @@ impl AppBip84Wallet {
 }
 
 #[async_trait]
-impl OnchainWalletTrait for AppBip84Wallet {
+impl OnchainWalletTrait for AppBip86Wallet {
 	async fn balance(&self) -> Amount {
 		self.inner.balance().total()
 	}

@@ -62,7 +62,7 @@ impl BarkPersister for Dummy {
 			fingerprint: Fingerprint::default(),
 			server_pubkey: None,
 			server_mailbox_pubkey: None,
-			external_mailbox: None,
+			mailbox_identity: bark::MailboxIdentity { network: Network::Bitcoin, public_key: "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9".parse().unwrap() },
 		}))
 	}
 
@@ -127,22 +127,6 @@ impl BarkPersister for Dummy {
 	}
 
 	async fn store_vtxo_key(&self, _index: u32, _public_key: PublicKey) -> anyhow::Result<()> {
-		Ok(())
-	}
-
-	async fn get_fallback_snapshot(&self) -> anyhow::Result<bark::FallbackSnapshot> {
-		Ok(bark::FallbackSnapshot::default())
-	}
-
-	async fn store_fallback_snapshot(&self, _snapshot: &bark::FallbackSnapshot) -> anyhow::Result<()> {
-		Ok(())
-	}
-
-	async fn get_fallback_record(&self) -> anyhow::Result<Option<ark::fallback::FallbackRegistration>> {
-		Ok(None)
-	}
-
-	async fn store_fallback_record(&self, _record: &ark::fallback::FallbackRegistration) -> anyhow::Result<()> {
 		Ok(())
 	}
 

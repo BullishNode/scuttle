@@ -12,6 +12,9 @@ use ark::lightning::PaymentHash;
 use ark::vtxo::{Full, VtxoClause};
 use ark_testing::{sat, Captaind, TestContext};
 use ark_testing::daemon::captaind::{self, ArkClient, MailboxClient, WalletAdminClient};
+use bark::{OpenWalletArgs, Wallet, WalletSeed};
+use bark::onchain::OnchainWallet;
+use bark::persist::{BarkPersister, sqlite::SqliteClient};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut};
 use bitcoin::consensus::deserialize;
 use bitcoin::hex::DisplayHex;
@@ -374,16 +377,16 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let proxy = srv.start_proxy_with_mailbox(gate.clone(), gate.clone()).await;
 	let provider = ctx.bark_sdk("provider", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	provider.stop_daemon_wait().await.unwrap();
-	let provider_destination = provider.fallback_destination().await.unwrap();
+	let provider_destination = provider.fallback_script();
 	assert_eq!(provider.balance().await.unwrap().spendable, sat(0));
 	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	recipient.stop_daemon_wait().await.unwrap();
 	let address = recipient.new_address().await.unwrap();
 	let recipient_key = address.policy().user_pubkey();
-	let destination = recipient.fallback_destination().await.unwrap();
+	let destination = recipient.fallback_script();
 	let recipient_mailbox = recipient.mailbox_keypair().public_key().to_string();
 	assert_ne!(recipient.mailbox_identifier(), provider.mailbox_identifier());
-	assert_ne!(destination.spk, provider_destination.spk);
+	assert_ne!(destination, provider_destination);
 	assert_eq!(recipient.balance().await.unwrap().spendable, sat(0));
 	drop(recipient);
 	let gross = sat(100_000);
@@ -391,10 +394,8 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let invoice = provider.bolt11_invoice_for_address(gross, address.clone(), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
-	let registered = db.read(async |tx| tx.get_fallback(recipient_mailbox.parse().unwrap()).await).await.unwrap().unwrap();
-	registered.verify(bitcoin::Network::Regtest, recipient_mailbox.parse().unwrap()).unwrap();
-	assert_eq!(registered.spk, destination.spk);
-	assert!(registered.same_binding(&destination));
+	assert_eq!(destination, bitcoin::ScriptBuf::new_p2tr(&ark::SECP,
+		recipient_mailbox.parse::<bitcoin::secp256k1::PublicKey>().unwrap().x_only_public_key().0, None));
 	let operation_provider = provider.clone();
 	let claim = tokio::spawn(async move { operation_provider.try_claim_lightning_receive(hash, true).await });
 	let payment = lightning.external.try_pay_bolt11(invoice.to_string());
@@ -562,9 +563,9 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 			if let Some(row) = rows.first() {
 				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
 				let input_value = payout_input_value(&parent);
-				assert_eq!(parent.output.iter().filter(|out| out.script_pubkey == destination.spk).count(), 1);
+				assert_eq!(parent.output.iter().filter(|out| out.script_pubkey == destination).count(), 1);
 				for output in &parent.output {
-					if output.script_pubkey == destination.spk { assert_eq!(output.value, sat(99_000)); }
+					if output.script_pubkey == destination { assert_eq!(output.value, sat(99_000)); }
 					else { assert!(output.script_pubkey == operator_script || output.is_p2a_fee_anchor()); }
 				}
 				assert_eq!(input_value, parent.output.iter().map(|out| out.value).sum::<Amount>());
@@ -619,7 +620,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 			} else { tokio::time::sleep(Duration::from_millis(50)).await; }
 		}
 	}).await.expect("expiry path must publish the actual funded payout through its bounded signed prefix");
-	let outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination.spk).collect::<Vec<_>>();
+	let outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(outputs.len(), 1);
 	assert_eq!(outputs[0].1.value, sat(99_000));
 	let payout = OutPoint::new(parent.compute_txid(), outputs[0].0 as u32);
@@ -653,7 +654,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		assert_eq!(row.get::<_, &str>("vtxo_id"), original.source.id().to_string());
 		assert_eq!(row.get::<_, &str>("owner_mailbox"), recipient_mailbox);
 		assert_eq!(row.get::<_, &str>("user_pubkey"), recipient_key.to_string());
-		assert_eq!(row.get::<_, &str>("spk"), destination.spk.as_bytes().to_lower_hex_string());
+		assert_eq!(row.get::<_, &str>("spk"), destination.as_bytes().to_lower_hex_string());
 		assert_eq!(row.get::<_, i64>("gross_sat"), 100_000);
 		assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
 		assert_eq!(row.get::<_, i64>("payout_sat"), 99_000);
@@ -661,9 +662,44 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		assert!(row.get::<_, bool>("active"));
 		assert_eq!(row.get::<_, String>("status"), "confirmed");
 		assert_eq!(row.get::<_, Option<String>>("sweep_txid"), Some(payout.txid.to_string()));
-		canonical_cut(&ctx, &srv, &db, &boundary, &destination.spk, &provider_destination.spk, payout, &original.source, &operator_pool).await;
+		canonical_cut(&ctx, &srv, &db, &boundary, &destination, &provider_destination, payout, &original.source, &operator_pool).await;
 	}
 	assert_eq!(gate.claims.load(Ordering::SeqCst), 1);
 	assert_eq!(gate.registrations.load(Ordering::SeqCst), 0);
+	assert_eq!(gate.posts.load(Ordering::SeqCst), 0);
+
+	// The rightful recipient discovers the explicit grant/claim mapping from
+	// its authenticated mailbox, without the provider key or a fabricated
+	// final VTXO. Neither the original payment nor claim is submitted again.
+	let seed = bip39::Mnemonic::from_str(tokio::fs::read_to_string(ctx.datadir.join("recipient/mnemonic")).await.unwrap().trim()).unwrap();
+	let local = Arc::new(SqliteClient::open(ctx.datadir.join("recipient/db.sqlite")).unwrap());
+	let onchain = OnchainWallet::load_or_create(bitcoin::Network::Regtest, seed.to_seed(""), local.clone()).await.unwrap();
+	let mut cfg = ctx.bark_default_cfg(&srv, Some(ctx.bitcoind()));
+	cfg.daemon_manual_sync = true;
+	let returned = Wallet::open(bitcoin::Network::Regtest,
+		WalletSeed::new_from_mnemonic(bitcoin::Network::Regtest, &seed), cfg, OpenWalletArgs {
+			persister: Some(local.clone()), onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
+			run_daemon: false, skip_recovery: true, ..Default::default()
+		}).await.unwrap();
+	returned.sync_fallback_payouts().await.unwrap();
+	let receipts = returned.fallback_receipts().await.unwrap();
+	assert_eq!(receipts.len(), 1);
+	let receipt = &receipts[0];
+	assert_eq!(receipt.vtxo_id, original.source.id());
+	assert_eq!(receipt.owner_mailbox.to_string(), recipient_mailbox);
+	assert_eq!(receipt.source_vtxo_ids, BTreeSet::from([original.promised.id()]));
+	assert_eq!((receipt.gross, receipt.fee, receipt.payout, receipt.forfeited),
+		(sat(100_000), sat(1_000), sat(99_000), sat(0)));
+	assert!(receipt.retired_block.is_some());
+	assert!(local.get_wallet_vtxo(original.promised.id()).await.unwrap().is_none());
+	assert!(local.get_wallet_vtxo(original.source.id()).await.unwrap().is_none());
+	assert_eq!(returned.balance().await.unwrap().total(), sat(0));
+	let history = returned.history().await.unwrap();
+	for _ in 0..2 {
+		returned.sync_fallback_payouts().await.unwrap();
+		assert_eq!(returned.fallback_receipts().await.unwrap(), receipts);
+		assert_eq!(returned.history().await.unwrap(), history);
+	}
+	assert_eq!(gate.claims.load(Ordering::SeqCst), 1);
 	assert_eq!(gate.posts.load(Ordering::SeqCst), 0);
 }

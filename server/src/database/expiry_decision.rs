@@ -3,10 +3,10 @@
 use std::collections::BTreeMap;
 
 use anyhow::Context;
-use bitcoin::{Amount, Network, ScriptBuf, Transaction, TxIn, TxOut, Sequence, Witness};
+use bitcoin::{Amount, ScriptBuf, Transaction, TxIn, TxOut, Sequence, Witness};
 use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
-use bitcoin::secp256k1::{Keypair, PublicKey};
+use bitcoin::secp256k1::PublicKey;
 use chrono::{DateTime, Local};
 
 use ark::ServerVtxo;
@@ -152,8 +152,6 @@ impl Tx<'_> {
 		&self,
 		view: ExpiryViewToken,
 		outputs: Vec<ReadyOutput>,
-		network: Network,
-		server_mailbox_key: &Keypair,
 	) -> anyhow::Result<Option<CommittedExpiryGroup>> {
 		if outputs.is_empty() { return Ok(None); }
 		ensure!(ReadyOutput::group_fits(&outputs.iter().collect::<Vec<_>>())?, "expiry group exceeds version-3 sweep size");
@@ -221,7 +219,7 @@ impl Tx<'_> {
 				valid &= current.disposition == coin.ownership.disposition && current.evidence == coin.ownership.evidence
 					&& current.has_stored_preimage == coin.ownership.has_stored_preimage
 					&& current.cancellations == coin.ownership.cancellations;
-				valid &= self.revalidate_expiry_payee(coin, network, server_mailbox_key).await?;
+				valid &= self.revalidate_expiry_payee(coin).await?;
 
 				if let Some(row) = self.query_opt("
 					SELECT e.id,e.gross_sat,
@@ -386,9 +384,9 @@ impl Tx<'_> {
 		Ok(Some(CommittedExpiryGroup { id, inputs, dropped }))
 	}
 
-	async fn revalidate_expiry_payee(&self, coin: &ReadyCoin, network: Network, server_mailbox_key: &Keypair) -> anyhow::Result<bool> {
-		let OwnershipDisposition::Customer { user_pubkey, .. } = &coin.ownership.disposition else { return Ok(coin.payee.is_none()); };
-		let current = self.expiry_owner(*user_pubkey, network, server_mailbox_key).await?;
+	async fn revalidate_expiry_payee(&self, coin: &ReadyCoin) -> anyhow::Result<bool> {
+		let OwnershipDisposition::Customer { .. } = &coin.ownership.disposition else { return Ok(coin.payee.is_none()); };
+		let current = self.derived_expiry_owner(&coin.ownership).await?;
 		Ok(match (&coin.payee,current) {
 			(Some(payee),super::expiry_attribution::Attribution::Owned { mailbox_pk,spk }) =>
 				mailbox_pk == payee.mailbox && spk == payee.script,

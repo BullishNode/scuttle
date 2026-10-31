@@ -66,18 +66,15 @@ async fn tiny_group() {
 	assert!(ordinary.keys().all(|point| point.txid == root.txid && *point != root));
 	let board_fee = actual_fee(&ctx, &board).await;
 	assert_eq!(sat(100_000) + ordinary.values().copied().sum::<Amount>() + board_fee, sat(200_000));
-	let sender_binding = sender.fallback_destination().await.unwrap();
-	let recipient_binding = recipient.fallback_destination().await.unwrap();
+	let sender_binding = sender.fallback_script();
+	let recipient_binding = recipient.fallback_script();
 	let sender_mailbox = sender.mailbox_identifier();
 	let recipient_mailbox = recipient.mailbox_identifier();
-	sender_binding.verify(Network::Regtest, sender_mailbox.as_pubkey()).unwrap();
-	recipient_binding.verify(Network::Regtest, recipient_mailbox.as_pubkey()).unwrap();
-	assert_ne!(sender_binding.spk, recipient_binding.spk);
-	assert!(recipient_binding.spk.minimal_non_dust() <= sat(500));
+	assert_ne!(sender_binding, recipient_binding);
+	assert!(recipient_binding.minimal_non_dust() <= sat(500));
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	for (mailbox, binding) in [(sender_mailbox, &sender_binding), (recipient_mailbox, &recipient_binding)] {
-		let registered = db.read(async |tx| tx.get_fallback(mailbox.as_pubkey()).await).await.unwrap().unwrap();
-		assert!(registered.same_binding(binding));
+		assert_eq!(*binding, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.as_pubkey().x_only_public_key().0, None));
 	}
 
 	let mut keys = Vec::new();
@@ -208,7 +205,7 @@ async fn tiny_group() {
 		assert_eq!(row.get::<_, i64>("fee_sat"), fee);
 		assert_eq!(row.get::<_, i64>("payout_sat"), payout);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
-		assert_eq!(row.get::<_, String>("spk"), binding.spk.as_bytes().to_lower_hex_string());
+		assert_eq!(row.get::<_, String>("spk"), binding.as_bytes().to_lower_hex_string());
 		assert_eq!(row.get::<_, String>("owner_mailbox"), owner.as_pubkey().to_string());
 		assert_eq!(row.get::<_, String>("user_pubkey"), keys[index].public_key().to_string());
 		let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
@@ -231,7 +228,7 @@ async fn tiny_group() {
 		let output_amount = if index < 3 { 500 } else { 97_500 };
 		assert_eq!(ledger.get::<_, i64>("amount_sat"), output_amount);
 		assert_eq!(parent.output[output_index as usize].value, sat(output_amount as u64));
-		assert_eq!(parent.output[output_index as usize].script_pubkey, binding.spk);
+		assert_eq!(parent.output[output_index as usize].script_pubkey, binding);
 		if index < 3 {
 			let group = (row.get::<_, i64>("id"), OutPoint::new(txid, output_index));
 			if let Some(previous) = tiny_group { assert_eq!(previous, group); }
@@ -291,7 +288,7 @@ async fn tiny_group() {
 	}
 	assert!(spent.contains(&root));
 	for (txid, parent) in &parents { assert_eq!(graph.get(txid), Some(parent)); }
-	for (script, amount) in [(&recipient_binding.spk, 500), (&sender_binding.spk, 97_500)] {
+	for (script, amount) in [(&recipient_binding, 500), (&sender_binding, 97_500)] {
 		let matches = graph.values().flat_map(|transaction| transaction.output.iter().enumerate().filter_map(move |(vout, output)|
 			(&output.script_pubkey == script).then_some((OutPoint::new(transaction.compute_txid(), vout as u32), output))
 		)).collect::<Vec<_>>();
@@ -311,8 +308,8 @@ async fn tiny_group() {
 	assert_eq!(remaining + fees, sat(300_000));
 	for point in core.get_raw_mempool().unwrap() {
 		let pending = core.get_raw_transaction(&point, None).unwrap();
-		assert!(pending.output.iter().all(|output| output.script_pubkey != recipient_binding.spk
-			&& output.script_pubkey != sender_binding.spk), "no second economic payout may wait in the mempool");
+		assert!(pending.output.iter().all(|output| output.script_pubkey != recipient_binding
+			&& output.script_pubkey != sender_binding), "no second economic payout may wait in the mempool");
 	}
 	let all_customer_rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.sweep_txid \
 		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \

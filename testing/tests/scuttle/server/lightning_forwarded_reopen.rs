@@ -70,7 +70,7 @@ async fn interrupted_forwarding() {
 	let mailboxes = address.delivery().iter().filter_map(|delivery| delivery.mailbox_id().map(|id| id.as_ref().to_vec())).collect::<Vec<_>>();
 	assert_eq!(mailboxes.len(), 1, "this native fixture must name one exact recipient server mailbox");
 	let mailbox = mailboxes[0].clone();
-	recipient.fallback_destination().await.unwrap();
+	recipient.fallback_script();
 	assert_ne!(provider.mailbox_identifier(), recipient.mailbox_identifier());
 	recipient.stop_daemon_wait().await.unwrap();
 	drop(recipient);
