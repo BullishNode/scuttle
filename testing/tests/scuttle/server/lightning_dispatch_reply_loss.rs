@@ -77,7 +77,7 @@ async fn recovery_records_its_native_routing_fee() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn coded_xpay_error_retains_its_own_pending_payment() {
-	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, true, false, false)).await
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, true, false, RestartCut::None)).await
 		.expect("the native plugin fault and original settlement tail must finish");
 }
 
@@ -86,23 +86,36 @@ async fn coded_xpay_error_retains_its_own_pending_payment() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn timed_out_rpc_that_later_completes_settles() {
-	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, false, true, false)).await
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, false, true, RestartCut::None)).await
 		.expect("the genuine deadline, Pending custody and late completion must finish");
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn zero_part_native_call_survives_bark_crash_and_redrive() {
-	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(true, false, false, true)).await
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(true, false, false, RestartCut::QueuedNative)).await
 		.expect("the genuine queued native commands, task loss and original settlement tail must finish");
 }
 
-async fn external_success_during_restart(routed: bool) {
-	external_success_with_fault(routed, false, false, false).await;
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recorded_request_survives_crash_before_first_native_rpc() {
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(true, false, false, RestartCut::BeforeFirstRpc)).await
+		.expect("the genuine count-zero cut, automatic first send and original settlement tail must finish");
 }
 
-async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadline: bool, zero_part_restart: bool) {
-	let ctx = TestContext::new(if zero_part_restart { "scuttle/zero_part_native_bark_crash_redrive" }
+#[derive(Clone, Copy)]
+enum RestartCut { None, QueuedNative, BeforeFirstRpc }
+
+async fn external_success_during_restart(routed: bool) {
+	external_success_with_fault(routed, false, false, RestartCut::None).await;
+}
+
+async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadline: bool, restart: RestartCut) {
+	let zero_part_restart = matches!(restart, RestartCut::QueuedNative);
+	let count_zero_restart = matches!(restart, RestartCut::BeforeFirstRpc);
+	let ctx = TestContext::new(if count_zero_restart { "scuttle/count_zero_native_bark_crash_recovery" }
+		else if zero_part_restart { "scuttle/zero_part_native_bark_crash_redrive" }
 		else if rpc_deadline { "scuttle/timed_out_rpc_that_later_completes_settles" }
 		else if plugin_fault { "scuttle/coded_xpay_error_own_pending" }
 		else if routed { "server/recovery_records_its_native_routing_fee" }
@@ -232,10 +245,28 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 		}
 	} else { None };
 	let mut xpay_returned = (plugin_fault || rpc_deadline).then(|| srv.subscribe_log::<XpayRpcReturned>());
-	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	let request = protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 100_000, htlc_vtxo_ids: vec![sources[0].to_bytes().to_vec()],
 		mailbox_id: (routed || plugin_fault || rpc_deadline || zero_part_restart).then(|| mailbox.mailbox().serialize()), retry_for_secs: Some(5),
-	}).await.unwrap();
+	};
+	#[cfg(target_os = "linux")]
+	if count_zero_restart {
+		let result = crash_before_first_native_rpc(&ctx, &srv, &lightning.internal, receiving_node, hash, &sources, request).await;
+		let record = match &result {
+			Ok(record) => record.clone(),
+			Err(error) => {
+				let error = format!("{error:#}");
+				serde_json::json!({"disposition": if error.contains("MISSED_TARGET") { "MISSED_TARGET" } else { "FAILED" }, "error":error})
+			},
+		};
+		tokio::fs::write(ctx.datadir.join("count-zero-native-recovery.json"), serde_json::to_vec_pretty(&record).unwrap()).await.unwrap();
+		result.unwrap();
+		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 0).await;
+	} else {
+		rpc.initiate_lightning_payment(request).await.unwrap();
+	}
+	#[cfg(not(target_os = "linux"))]
+	rpc.initiate_lightning_payment(request).await.unwrap();
 	#[cfg(target_os = "linux")]
 	if let Some(queue) = queued {
 		let result = observe_queued_redrive(&srv, &lightning.internal, hash, &sources, &queue).await;
@@ -887,6 +918,187 @@ async fn observe_queued_redrive(
 		"native_observations":queue.logs.lock().unwrap().clone(),
 		"scope":"zero-part cut and live original A callback; final money assertions follow in the original fixture",
 		"not_proved":"a genuine B205 while A remains zero-part" }))
+}
+
+/// Hold the real public request's deferred commit, not a fabricated attempt.
+/// PostgreSQL can finish that commit while the acknowledged owned app STOP
+/// prevents consuming it, spawning Xpay or admitting any native dispatch.
+#[cfg(target_os = "linux")]
+async fn crash_before_first_native_rpc(
+	ctx: &TestContext, srv: &Captaind, node: &Lightningd, recipient: &Lightningd,
+	hash: PaymentHash, sources: &[VtxoId], request: protos::InitiateLightningPaymentRequest,
+) -> anyhow::Result<serde_json::Value> {
+	const LATCH_CLASS: i32 = 0x5343544c;
+	const LATCH_OBJECT: i32 = 1;
+	let db = Db::connect(&srv.config().postgres, Network::Regtest).await?;
+	let source_rows = super::owner_helpers::source_rows(&db, sources).await;
+	let native = node.native_child().await?;
+	let channels = normal_channels(node).await?;
+	let endpoints = format!("{} to {}", node.id().await.to_lower_hex_string(), recipient.id().await.to_lower_hex_string());
+	let logs = Arc::new(Mutex::new(QueuedNativeLogs::default()));
+	let observed = logs.clone();
+	node.add_stdout_handler(move |line: &str| {
+		observed.lock().unwrap().observe(line, &endpoints);
+		false
+	});
+	let invoice = request.invoice.clone();
+	db.write(async |tx| {
+		tx.batch_execute(&format!("CREATE FUNCTION public.hold_count_zero_dispatch_commit() RETURNS trigger AS $$
+			BEGIN
+				IF NEW.payment_hash = '{hash}' THEN
+					PERFORM pg_advisory_xact_lock({LATCH_CLASS}, {LATCH_OBJECT});
+				END IF;
+				RETURN NEW;
+			END;
+			$$ LANGUAGE plpgsql;
+			CREATE CONSTRAINT TRIGGER hold_count_zero_dispatch_commit AFTER INSERT ON public.cln_xpay
+			DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.hold_count_zero_dispatch_commit();")).await?;
+		Ok(())
+	}).await?;
+	let result = async {
+		let (paused, initiation, writer, blocker) = db.write(async |tx| {
+			tx.query_one("SELECT pg_advisory_xact_lock($1,$2)", &[&LATCH_CLASS, &LATCH_OBJECT]).await?;
+			let blocker = tx.query_one("SELECT pg_backend_pid(),backend_start FROM pg_stat_activity WHERE pid=pg_backend_pid()", &[]).await?;
+			let blocker = (blocker.get::<_, i32>(0), blocker.get::<_, chrono::DateTime<chrono::Utc>>(1));
+			let mut rpc = srv.get_public_rpc().await;
+			// This is the one public initiation. Losing its reply never causes
+			// another public request or any manually inserted payment record.
+			let initiation = tokio::spawn(async move { rpc.initiate_lightning_payment(request).await });
+			let writer = tokio::time::timeout(Duration::from_secs(15), async {
+				loop {
+					tx.query_one("SELECT pg_stat_clear_snapshot()", &[]).await?;
+					let rows = tx.query("SELECT DISTINCT a.pid,a.backend_start FROM pg_stat_activity a \
+						JOIN pg_locks l ON l.pid=a.pid WHERE a.datname=current_database() \
+						AND a.wait_event_type='Lock' AND a.query IN ('COMMIT','COMMIT;') \
+						AND l.locktype='advisory' AND l.mode='ExclusiveLock' AND NOT l.granted \
+						AND l.classid::BIGINT=$1 AND l.objid::BIGINT=$2 AND l.objsubid=2 \
+						AND $3=ANY(pg_blocking_pids(a.pid))",
+						&[&i64::from(LATCH_CLASS), &i64::from(LATCH_OBJECT), &blocker.0]).await?;
+					ensure!(rows.len() <= 1, "more than one commit reached the original request latch");
+					if let Some(row) = rows.first() {
+						break Ok::<_, anyhow::Error>((row.get::<_, i32>(0), row.get::<_, chrono::DateTime<chrono::Utc>>(1)));
+					}
+					tokio::time::sleep(Duration::from_millis(20)).await;
+				}
+			}).await.context("MISSED_TARGET: the real request did not reach its deferred commit latch")??;
+			let paused = srv.pause_native().await?;
+			ensure!(tx.query_one("SELECT COUNT(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid \
+				WHERE a.pid=$1 AND a.backend_start=$2 AND NOT l.granted AND l.locktype='advisory' \
+				AND l.classid::BIGINT=$3 AND l.objid::BIGINT=$4 AND l.objsubid=2 \
+				AND $5=ANY(pg_blocking_pids(a.pid))",
+				&[&writer.0, &writer.1, &i64::from(LATCH_CLASS), &i64::from(LATCH_OBJECT), &blocker.0]).await?.get::<_, i64>(0) == 1,
+				"MISSED_TARGET: commit latch changed before owned STOP acknowledgement");
+			// Returning commits ONLY this controller transaction and releases
+			// its latch. Keep the STOP guard across the real request commit.
+			Ok((paused, initiation, writer, blocker))
+		}).await?;
+		let cap_before = paused.identity().clone();
+		let cut = async {
+			let record = tokio::time::timeout(Duration::from_secs(15), async {
+				loop {
+					let mut rows = db.read(async |tx| server::database::xpay::get_xpays_by_payment_hash(&**tx, hash).await).await?;
+					ensure!(rows.len() <= 1, "public intent created multiple request rows");
+					if let Some(record) = rows.pop() { break Ok::<_, anyhow::Error>(record); }
+					tokio::time::sleep(Duration::from_millis(20)).await;
+				}
+			}).await.context("MISSED_TARGET: request did not durably commit while captaind was stopped")??;
+			let original = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await?
+				.context("committed public attempt missing")?;
+			let label = original.id.to_string();
+			ensure!(record.dispatch_count == Some(0) && record.label.as_deref() == Some(label.as_str())
+				&& record.lightning_node_id == original.lightning_node_id && record.signed_invoice.as_deref() == Some(invoice.as_str())
+				&& record.status == server::database::xpay::ClnXpayStatus::Pending
+				&& record.error_code.is_none() && record.routing_fee_msat.is_none()
+				&& original.status == server::database::ln::LightningPaymentStatus::Requested
+				&& original.error.is_none() && original.final_amount_msat.is_none(),
+				"MISSED_TARGET: stopped request is not the genuine original count-zero admission");
+			ensure!(node.native_child().await? == native && srv.native_child().await? == cap_before,
+				"native or stopped app identity changed at the count-zero cut");
+			ensure!(logs.lock().unwrap().payments.is_empty(), "MISSED_TARGET: Xpay was called before the crash cut");
+			let pays = remote_pays(node, hash).await;
+			ensure!(pays.is_empty(), "count zero gained a native pay record");
+			let parts = node.grpc_client().await.list_send_pays(cln_rpc::ListsendpaysRequest {
+				payment_hash: Some(hash.to_vec()), ..Default::default()
+			}).await?.into_inner().payments;
+			ensure!(parts.is_empty(), "count zero gained a native part");
+			ensure!(super::owner_helpers::source_rows(&db, sources).await == source_rows,
+				"count-zero public initiation changed its retained source bodies/state");
+			ensure!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await?.is_none(),
+				"count-zero request gained a settlement preimage");
+			let ids = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
+			let counts = db.read(async |tx| Ok(tx.query_one("SELECT \
+				(SELECT COUNT(*) FROM mailbox WHERE payment_hash=$1), \
+				(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($2))",
+				&[&hash.to_string(), &ids]).await?)).await?;
+			ensure!(counts.get::<_, i64>(0) == 0 && counts.get::<_, i64>(1) == 0,
+				"count-zero request emitted terminal mail or allocated a refund");
+			let linked = db.read(async |tx| Ok(tx.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo \
+				WHERE lightning_payment_attempt_id=$1 ORDER BY vtxo_id", &[&original.id]).await?
+				.into_iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>())).await?;
+			ensure!(linked == vec![sources[0].to_string()] && original.amount_msat == 100_000_000
+				&& original.user_fee == Some(sat(1_000)), "count-zero funding scope or invoice/fee changed");
+			let stopped = serde_json::json!({
+				"payment_hash":hash.to_string(), "sources":ids, "attempt":original.id, "label":label,
+				"dispatch_count":record.dispatch_count, "signed_invoice_sha256":sha256::Hash::hash(invoice.as_bytes()).to_string(),
+				"deferred_commit_backend":writer, "controller_backend":blocker, "advisory_latch":[LATCH_CLASS,LATCH_OBJECT],
+				"stopped_captaind":cap_before, "native_process":native, "native_observations":logs.lock().unwrap().clone(),
+				"native_pay_rows":pays.len(), "native_part_rows":parts.len(),
+				"terminal_mail_rows":counts.get::<_, i64>(0), "source_allocation_rows":counts.get::<_, i64>(1),
+			});
+			tokio::fs::write(ctx.datadir.join("count-zero-stopped-cut.json"), serde_json::to_vec_pretty(&stopped)?).await?;
+			Ok::<_, anyhow::Error>((original, record))
+		}.await;
+		// Even a failed cut observation must not resume this app into the
+		// now-committed request. Reap while the original STOP guard is alive.
+		let reaped = srv.crash_stop().await;
+		drop(paused);
+		reaped?;
+		let (original, record) = cut?;
+		let reply = tokio::time::timeout(Duration::from_secs(10), initiation).await
+			.context("original public request did not finish after its owned app was reaped")??;
+		let reply = match reply { Ok(_) => "ok".to_owned(), Err(error) => format!("{:?}", error.code()) };
+		ensure!(node.native_child().await? == native, "crash cut restarted the native node");
+		srv.start().await?;
+		let cap_after = srv.native_child().await?;
+		ensure!(cap_after != cap_before, "same-store start did not create a new owned app child");
+		let label = original.id.to_string();
+		let after = tokio::time::timeout(Duration::from_secs(40), async {
+			loop {
+				let mut rows = db.read(async |tx| server::database::xpay::get_xpays_by_payment_hash(&**tx, hash).await).await?;
+				ensure!(rows.len() == 1, "automatic first send created another request");
+				let row = rows.pop().unwrap();
+				ensure!(row.dispatch_count.is_some_and(|count| count <= 1), "MISSED_TARGET: original first dispatch was not observed before another admission");
+				let pays = remote_pays(node, hash).await;
+				if row.dispatch_count == Some(1) && pays.len() == 1
+					&& pays[0].status() == ListpaysPaysStatus::Pending && pays[0].label.as_deref() == Some(label.as_str())
+					&& pays[0].preimage.is_none() && logs.lock().unwrap().payments.len() == 1 {
+					break Ok::<_, anyhow::Error>(row);
+				}
+				tokio::time::sleep(Duration::from_millis(20)).await;
+			}
+		}).await.context("MISSED_TARGET: monitor did not issue the original automatic first native send")??;
+		let mut unchanged = after.clone();
+		unchanged.dispatch_count = record.dispatch_count;
+		unchanged.updated_at = record.updated_at;
+		ensure!(unchanged == record, "automatic first dispatch changed original invoice, caps, node, label or deadline");
+		let parts = pending_parts(node, hash, &label).await?;
+		ensure!(node.native_child().await? == native && normal_channels(node).await? == channels,
+			"native node/store/channel continuity changed across the count-zero crash");
+		ensure!(super::owner_helpers::source_rows(&db, sources).await == source_rows, "automatic first send changed source custody");
+		assert_one_source_dispatch(&db, hash, sources, original.id, &label, false, sat(1_000)).await;
+		Ok(serde_json::json!({ "disposition":"COUNT_ZERO_CRASH_THEN_AUTOMATIC_FIRST_SEND",
+			"payment_hash":hash.to_string(), "attempt":original.id, "label":label,
+			"dispatch_count_before":record.dispatch_count, "dispatch_count_after":after.dispatch_count,
+			"original_public_reply":reply, "crashed_captaind":cap_before, "restarted_captaind":cap_after,
+			"native_process":native, "native_observations":logs.lock().unwrap().clone(), "pending_parts":parts,
+			"scope":"real public count-zero request and automatic first dispatch; original money assertions follow" }))
+	}.await;
+	let removed = db.write(async |tx| {
+		tx.batch_execute("DROP TRIGGER hold_count_zero_dispatch_commit ON public.cln_xpay; DROP FUNCTION public.hold_count_zero_dispatch_commit();").await?;
+		Ok(())
+	}).await;
+	removed?;
+	result
 }
 
 #[cfg(target_os = "linux")]
