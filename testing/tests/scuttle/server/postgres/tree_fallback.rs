@@ -220,3 +220,185 @@ async fn supplied_duplicate_links_are_all_verified_and_batches_roll_back() {
 	left.unwrap();
 	right.unwrap();
 }
+
+// These are PostgreSQL decision/cancellation contracts. Test-key signatures and
+// complete paths are genuine; their funding/view fixtures are not a native
+// chain, a physical payout, or a full financial-qualification result.
+struct DustDecisionBoard {
+	root: ServerVtxo,
+	leaf: ServerVtxo<Full>,
+	funding: Transaction,
+	key: Keypair,
+	mailbox: Keypair,
+}
+
+const DUST_TEST_LIMITS: BackingSnapshotLimits = BackingSnapshotLimits { max_rows: 100, max_serialized_bytes: 1_000_000 };
+
+async fn dust_decision_board(db: &Db, tag: u8, amount: u64, foreign: bool) -> DustDecisionBoard {
+	let server = super::super::test_server_mailbox_key();
+	let key = Keypair::from_seckey_slice(&ark::SECP, &[tag; 32]).unwrap();
+	let mailbox = if foreign { Keypair::from_seckey_slice(&ark::SECP, &[121; 32]).unwrap() } else { *server };
+	super::super::register_test_owners(db, server, &mailbox, &[key]).await;
+	let expiry = BlockHeight::new(100);
+	let delta = BlockDelta::new(6);
+	let builder = BoardBuilder::new(key.public_key(), expiry, server.public_key(), delta);
+	let funding = Transaction {
+		version: bitcoin::transaction::Version::TWO, lock_time: bitcoin::absolute::LockTime::ZERO,
+		input: vec![TxIn { previous_output: OutPoint::new(dummy_txid(tag), 0), script_sig: Default::default(),
+			sequence: Sequence::MAX, witness: Witness::new() }],
+		output: vec![TxOut { value: Amount::from_sat(amount), script_pubkey: builder.funding_script_pubkey() }],
+	};
+	let point = OutPoint::new(funding.compute_txid(), 0);
+	let builder = builder.set_funding_details(Amount::from_sat(amount), Amount::ZERO, point).unwrap().generate_user_nonces();
+	let response = BoardBuilder::new_for_cosign(key.public_key(), expiry, server.public_key(), delta,
+		Amount::from_sat(amount), Amount::ZERO, point, *builder.user_pub_nonce()).server_cosign(server);
+	let leaf = builder.build_vtxo(&response, &key).unwrap();
+	leaf.validate(&funding).unwrap();
+	let board = BoardBuilder::new_from_vtxo(&leaf, &funding, server.public_key()).unwrap();
+	let mut rows = board.build_server_vtxos();
+	let root = rows.remove(0);
+	let leaf = rows.remove(0);
+	db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+		.insert_oor_spent_vtxos([(root.clone(), board.exit_txid())])
+		.insert_spendable_vtxos([leaf.clone()])).await).await.unwrap();
+	// Separate transactions retain the upstream cumulative timestamp trigger.
+	db.write(async |tx| Ok(tx.execute("UPDATE vtxo SET frontier_at=NOW(),confirmed_height=1,updated_at=NOW() WHERE vtxo_id=$1",
+		&[&root.id().to_string()]).await?)).await.unwrap();
+	DustDecisionBoard { root: root.to_bare(), leaf, funding, key, mailbox }
+}
+
+async fn dust_decision_view(db: &Db, cap: u32, watch: u32) -> ExpiryViewToken {
+	db.write(async |tx| {
+		let generation: i64 = tx.query_one("SELECT generation FROM expiry_chain_view WHERE id=1", &[]).await?.get(0);
+		for (table, process, height) in [(BlockTable::Captaind, "captaind", cap), (BlockTable::Watchmand, "watchmand", watch)] {
+			let point = BlockRef { height: BlockHeight::new(height), hash: bitcoin::BlockHash::from_byte_array([height as u8; 32]) };
+			if tx.get_highest_block(table).await? != Some(point) { tx.store_block(table, &point).await?; }
+			tx.execute("INSERT INTO expiry_sync_ack(process,generation,height,hash) VALUES($1,$2,$3,$4) \
+				ON CONFLICT(process) DO UPDATE SET generation=EXCLUDED.generation,height=EXCLUDED.height,hash=EXCLUDED.hash",
+				&[&process, &generation, &i64::from(height), &point.hash.to_string()]).await?;
+		}
+		let view = tx.expiry_rebuild_token().await?.unwrap();
+		assert!(tx.finish_expiry_rebuild(view).await?);
+		Ok(view)
+	}).await.unwrap()
+}
+
+async fn dust_decision_ready(db: &Db, board: &DustDecisionBoard, view: ExpiryViewToken) -> ReadyOutput {
+	db.read(async |tx| {
+		let snapshot = tx.backing_snapshot(std::slice::from_ref(&board.root), DUST_TEST_LIMITS).await?;
+		let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == board.leaf.id()).unwrap();
+		let ownership = tx.propose_expiry_ownership(fact, &board.funding, view.captaind.height, Some(view.watchmand.height)).await?;
+		assert!(matches!(ownership.disposition, OwnershipDisposition::Customer { .. }));
+		let payee = match tx.derived_expiry_owner(&ownership).await? {
+			Attribution::Owned { mailbox_pk, spk } => VerifiedPayee { mailbox: mailbox_pk, script: spk },
+			Attribution::Unresolved => panic!("actual joint/birth binding must resolve"),
+		};
+		let leaf_tx = board.leaf.transactions().last().unwrap().tx;
+		let residuals = leaf_tx.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor())
+			.map(|(index, output)| BackingPartitionResidual { outpoint: OutPoint::new(leaf_tx.compute_txid(), index as u32), txout: output.clone() }).collect::<Vec<_>>();
+		ReadyOutput::prove(snapshot, vec![ReadyCoin { ownership, payee: Some(payee) }],
+			std::slice::from_ref(&board.funding), &residuals, DUST_TEST_LIMITS)
+	}).await.unwrap()
+}
+
+#[tokio::test]
+async fn dust_hold_across_two_groups_resolves() {
+	let (_ctx, db) = test_db("dust_hold_across_two_groups_resolves").await;
+	let small = dust_decision_board(&db, 81, 500, false).await;
+	let large = dust_decision_board(&db, 82, 2_000, false).await;
+	let view = dust_decision_view(&db, 104, 104).await;
+	let first = dust_decision_ready(&db, &small, view).await;
+	let second = dust_decision_ready(&db, &large, view).await;
+	let frontier = first.dust_candidates().into_iter().chain(second.dust_candidates()).collect::<Vec<_>>();
+	let mut included = BTreeSet::new();
+	assert!(db.write(async |tx| tx.commit_expiry_group(view, vec![first], &frontier, &included).await).await.unwrap().is_none());
+	assert!(included.is_empty(), "an uncommitted/held group is not included");
+	let group = db.write(async |tx| tx.commit_expiry_group(view, vec![second], &frontier, &included).await).await.unwrap().unwrap();
+	assert_eq!(group.included, vec![large.leaf.id()]);
+	included.extend(group.included);
+	let first = dust_decision_ready(&db, &small, view).await;
+	let group = db.write(async |tx| tx.commit_expiry_group(view, vec![first], &frontier, &included).await).await.unwrap().unwrap();
+	assert_eq!(group.included, vec![small.leaf.id()]);
+	included.extend(group.included);
+	assert_eq!(included, BTreeSet::from([small.leaf.id(), large.leaf.id()]));
+	let sum = db.read(async |tx| Ok(tx.query_one("SELECT SUM(gross_sat)::BIGINT,SUM(fee_sat)::BIGINT, \
+		SUM(payout_sat)::BIGINT,SUM(forfeited_sat)::BIGINT FROM expiry_allocation_coin WHERE active", &[]).await?)).await.unwrap();
+	assert_eq!((sum.get::<_, i64>(0), sum.get::<_, i64>(1), sum.get::<_, i64>(2), sum.get::<_, i64>(3)), (2_500, 1_000, 1_500, 0));
+	assert_eq!(db.read(async |tx| tx.expiry_hold_count().await).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn abandoned_exited_leaf_does_not_hold_siblings() {
+	let (_ctx, db) = test_db("exited_or_other_script_does_not_hold_dust").await;
+	let small = dust_decision_board(&db, 83, 500, false).await;
+	let exited = dust_decision_board(&db, 84, 2_000, false).await;
+	let foreign = dust_decision_board(&db, 85, 2_000, true).await;
+	assert_ne!(small.mailbox.public_key(), foreign.mailbox.public_key());
+	let view = dust_decision_view(&db, 104, 104).await;
+	let first = dust_decision_ready(&db, &small, view).await;
+	let other = dust_decision_ready(&db, &exited, view).await;
+	let foreign = dust_decision_ready(&db, &foreign, view).await;
+	let frontier = first.dust_candidates().into_iter().chain(other.dust_candidates()).chain(foreign.dust_candidates()).collect::<Vec<_>>();
+	// A previously prepared output was exposed before decision. It is not
+	// currently decidable backing, even though its ready hint is retained.
+	db.write(async |tx| Ok(tx.execute("UPDATE vtxo SET onchain_spent_height=103,onchain_spent_txid=$2,updated_at=NOW() WHERE vtxo_id=$1",
+		&[&exited.root.id().to_string(), &dummy_txid(200).to_string()]).await?)).await.unwrap();
+	assert!(db.write(async |tx| tx.commit_expiry_group(view, vec![first], &frontier, &BTreeSet::new()).await).await.unwrap().is_some());
+	let forfeited: i64 = db.read(async |tx| Ok(tx.query_one("SELECT c.forfeited_sat FROM expiry_allocation_coin c \
+		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1", &[&small.leaf.id().to_string()]).await?.get(0))).await.unwrap();
+	assert_eq!(forfeited, 500);
+	assert_eq!(db.read(async |tx| tx.expiry_hold_count().await).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn dust_hold_ends_at_deadline() {
+	let (_ctx, db) = test_db("dust_hold_ends_at_k144").await;
+	let small = dust_decision_board(&db, 86, 500, false).await;
+	let other = dust_decision_board(&db, 87, 2_000, false).await;
+	for (cap, watch) in [(243, 243), (244, 243), (244, 244)] {
+		let view = dust_decision_view(&db, cap, watch).await;
+		let first = dust_decision_ready(&db, &small, view).await;
+		let second = dust_decision_ready(&db, &other, view).await;
+		let frontier = first.dust_candidates().into_iter().chain(second.dust_candidates()).collect::<Vec<_>>();
+		let group = db.write(async |tx| tx.commit_expiry_group(view, vec![first], &frontier, &BTreeSet::new()).await).await.unwrap();
+		assert_eq!(group.is_some(), cap == 244 && watch == 244, "K uses the completed paired view only");
+	}
+	let row = db.read(async |tx| Ok(tx.query_one("SELECT c.forfeited_sat,c.fee_sat,c.payout_sat FROM expiry_allocation_coin c \
+		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1", &[&small.leaf.id().to_string()]).await?)).await.unwrap();
+	assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1), row.get::<_, i64>(2)), (500, 0, 0));
+	assert_eq!(db.read(async |tx| tx.expiry_hold_count().await).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn dropped_group_leaves_no_cancellation() {
+	let (_ctx, db) = test_db("dust_drop_has_no_cancellation_effect").await;
+	let small = dust_decision_board(&db, 88, 500, false).await;
+	let large = dust_decision_board(&db, 89, 2_000, false).await;
+	let unlock: ark::tree::signed::UnlockPreimage = [88; 32];
+	let output = server::database::rounds::StoredRoundOutput {
+		vtxo_request: ark::VtxoRequest { policy: ark::VtxoPolicy::new_pubkey(small.key.public_key()), amount: Amount::from_sat(500) },
+		unblinded_mailbox_id: Some(MailboxIdentifier::from(small.mailbox.public_key())),
+	};
+	db.write(async |tx| tx.try_store_round_participation(BlockHeight::ZERO, unlock,
+		&[small.leaf.id()], std::iter::once(&output), None).await).await.unwrap();
+	let participation: i64 = db.read(async |tx| Ok(tx.query_one("SELECT participation_id FROM round_part_input WHERE vtxo_id=$1",
+		&[&small.leaf.id().to_string()]).await?.get(0))).await.unwrap();
+	let before = vtxo_history_state(&db, small.leaf.id()).await;
+	let view = dust_decision_view(&db, 104, 104).await;
+	let first = dust_decision_ready(&db, &small, view).await;
+	let second = dust_decision_ready(&db, &large, view).await;
+	let frontier = first.dust_candidates().into_iter().chain(second.dust_candidates()).collect::<Vec<_>>();
+	let mut included = BTreeSet::new();
+	assert!(db.write(async |tx| tx.commit_expiry_group(view, vec![first], &frontier, &included).await).await.unwrap().is_none());
+	assert_eq!(vtxo_history_state(&db, small.leaf.id()).await, before);
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM expiry_cancelled_participation WHERE participation_id=$1",
+		&[&participation]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+	assert_eq!(db.read(async |tx| tx.get_all_pending_round_participations(BlockHeight::ZERO).await).await.unwrap().len(), 1);
+	let group = db.write(async |tx| tx.commit_expiry_group(view, vec![second], &frontier, &included).await).await.unwrap().unwrap();
+	included.extend(group.included);
+	let first = dust_decision_ready(&db, &small, view).await;
+	assert!(db.write(async |tx| tx.commit_expiry_group(view, vec![first], &frontier, &included).await).await.unwrap().is_some());
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM expiry_cancelled_participation WHERE participation_id=$1",
+		&[&participation]).await?.get::<_, i64>(0))).await.unwrap(), 1,
+		"only the final selected decision may cancel the original participation");
+}

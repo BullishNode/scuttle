@@ -56,7 +56,7 @@ pub enum OwnershipEvidence {
 	HtlcChain { payment_hash: PaymentHash, resolution: HtlcResolution, block: BlockRef },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OwnershipProposal {
 	pub id: VtxoId,
 	pub gross: Amount,

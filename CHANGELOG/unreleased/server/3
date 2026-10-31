@@ -39,3 +39,8 @@
   [#3](https://github.com/BullishNode/scuttle/pull/3)
   - **BREAKING:** Registration and legacy-proof dispatch are removed. Use fresh
     matched stores; registration-era databases are refused before writes.
+- Bound dust aggregation to currently ready payouts for the same script and
+  expiry, ending that hold after 144 blocks in the completed chain view.
+  Only committed groups affect pass inclusion, and dropped groups leave their
+  unfinished round participations unchanged.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
