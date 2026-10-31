@@ -286,7 +286,7 @@ impl<T> Daemon<T>
 	}
 
 	#[cfg(target_os = "linux")]
-	pub(crate) async fn native_child(&self) -> anyhow::Result<NativeProcessIdentity> {
+	pub async fn native_child(&self) -> anyhow::Result<NativeProcessIdentity> {
 		let mut child = self.child.lock().await;
 		let child = child.as_mut().context("daemon has no child")?;
 		ensure!(child.try_wait()?.is_none(), "daemon child already exited");
@@ -331,6 +331,11 @@ impl<T> Daemon<T>
 
 	pub async fn stop(&self) -> anyhow::Result<()> {
 		self.stop_with_signal(signal::Signal::SIGTERM).await
+	}
+
+	/// Kill and reap this owned child without a graceful shutdown.
+	pub async fn crash_stop(&self) -> anyhow::Result<()> {
+		self.stop_with_signal(signal::Signal::SIGKILL).await
 	}
 
 	pub(crate) async fn stop_with_signal(&self, stop_signal: signal::Signal) -> anyhow::Result<()> {
