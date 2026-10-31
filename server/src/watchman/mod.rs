@@ -459,6 +459,11 @@ impl Watchman {
 			let mut fee_rate = self.fee_estimator.regular();
 			self.update_mempool_spend(root.id()).await;
 			if let Some(spend) = self.get_mempool_spend(root.id()) {
+				if spend.txid != txid {
+					warn!(vtxo_id = %root.id(), expected = %txid, actual = %spend.txid,
+						"Expiry progress is pinned by a different spender; retaining its hold");
+					continue;
+				}
 				if spend.fee_rate >= fee_rate { continue; }
 				fee_rate = fee_rate.max(saturating_add_feerates(
 					spend.fee_rate, self.config.incremental_relay_fee

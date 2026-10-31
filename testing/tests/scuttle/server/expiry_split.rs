@@ -7,7 +7,8 @@ use ark_testing::{sat, TestContext};
 use bitcoin::consensus::deserialize;
 use bitcoin::Transaction;
 use bitcoin_ext::{BlockDelta, BlockHeight};
-use bitcoin_ext::rpc::RpcApi;
+use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
+use bark::onchain::MakeCpfpFees;
 use server::database::Db;
 use server_rpc::protos;
 
@@ -36,7 +37,17 @@ async fn payout(db: &Db, id: ark::VtxoId) -> Transaction {
 /// its SQL checks; both daemon progression and subsequent payouts are automatic.
 #[tokio::test]
 async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
-	let ctx = TestContext::new("server/expiry_requested_mixed_split").await;
+	Box::pin(mixed_split(false)).await;
+}
+
+#[tokio::test]
+async fn mempool_pinned_root_is_fee_bumped() {
+	Box::pin(mixed_split(true)).await;
+}
+
+async fn mixed_split(pin: bool) {
+	let ctx = TestContext::new(if pin { "server/mempool_pinned_root_is_fee_bumped" }
+		else { "server/expiry_requested_mixed_split" }).await;
 	let srv = ctx.captaind("server").no_vtxo_pool()
 		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24)).watchmand().create().await;
 	let wallet = ctx.bark("abandoned", &srv).funded(sat(200_000)).create().await;
@@ -62,20 +73,63 @@ async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
 	let ordinary = leaves.iter().find(|v| matches!(v.policy(), VtxoPolicy::Pubkey(_))).unwrap().id();
 	let htlc = leaves.iter().find(|v| matches!(v.policy(), VtxoPolicy::ServerHtlcSend(_))).unwrap().id();
 	client.register_vtxo_transactions_with_server(&leaves).await.unwrap();
+	if pin { client.sync_onchain().await.unwrap(); }
+	let pin_sponsor = pin.then(|| client.onchain().unwrap());
 	drop(client);
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	ctx.bitcoind().fund_addr(fee_address, sat(100_000)).await;
 	ctx.generate_blocks(2).await;
+	if pin { srv.watchmand().stop().await.unwrap(); }
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	let expired = ctx.generate_blocks(input.expiry_height().to_u32() + 1 - height).await;
 	srv.wait_for_sync_height(expired).await;
-	srv.watchmand().wait_for_sync_height(expired).await;
+	if !pin { srv.watchmand().wait_for_sync_height(expired).await; }
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let root = db.read(async |t| {
 		let snapshot = t.backing_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()],
 			server::database::expiry_inventory::BackingSnapshotLimits { max_rows: 10_000, max_serialized_bytes: 10_000_000 }).await?;
 		Ok(snapshot.regular.into_iter().find(|f| f.state.vtxo.point() == input.chain_anchor()).unwrap().state.vtxo)
 	}).await.unwrap();
+	if let Some(sponsor) = pin_sponsor {
+		let prefix = db.read(async |tx| {
+			let row = tx.query_one("SELECT t.signed_tx FROM vtxo v JOIN virtual_transaction t ON t.txid=v.oor_spent_txid \
+				WHERE v.vtxo_id=$1", &[&root.id().to_string()]).await?;
+			Ok(deserialize::<Transaction>(row.get("signed_tx"))?)
+		}).await.unwrap();
+		assert_eq!(prefix.input.len(), 1);
+		assert_eq!(prefix.input[0].previous_output, root.point());
+		assert!(!prefix.input[0].witness.is_empty());
+		let mut sponsor = sponsor.write().await;
+		let child = sponsor.make_signed_p2a_cpfp(&prefix,
+			MakeCpfpFees::Effective(bitcoin::FeeRate::from_sat_per_vb(1).unwrap())).await.unwrap();
+		sponsor.store_signed_p2a_cpfp(&child).await.unwrap();
+		drop(sponsor);
+		let core = ctx.bitcoind().sync_client();
+		assert_eq!(core.submit_package(&[&prefix, &child]).unwrap().package_msg, "success");
+		assert!(core.get_tx_out(&root.point().txid, root.point().vout, Some(true)).unwrap().is_none());
+		let initial_fee = super::expiry_test::actual_fee(&ctx, &child).await;
+		assert!(db.read(async |tx| Ok(tx.query_one("SELECT onchain_spent_height FROM vtxo WHERE vtxo_id=$1",
+			&[&root.id().to_string()]).await?.get::<_, Option<i32>>(0))).await.unwrap().is_none());
+		srv.watchmand().start().await.unwrap();
+		srv.watchmand().wait_for_sync_height(expired).await;
+		srv.watchmand().trigger_sweep().await;
+		let bumped = tokio::time::timeout(Duration::from_secs(30), async {
+			loop {
+				if let Some((replacement, fee)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &prefix) {
+					if replacement.compute_txid() != child.compute_txid() && fee > initial_fee.to_sat() as i64 {
+						break replacement;
+					}
+				}
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+		}).await.expect("the known pinned prefix did not receive its native watchman fee bump");
+		assert_ne!(bumped.compute_txid(), child.compute_txid());
+		assert_eq!(ctx.bitcoind().await_transaction(prefix.compute_txid()).await, prefix);
+		assert!(core.get_mempool_entry(&child.compute_txid()).is_err(), "the superseded fee child must not remain a second payment");
+		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT progress_txid FROM expiry_split_request WHERE vtxo_id=$1",
+			&[&root.id().to_string()]).await?.get::<_, String>(0))).await.unwrap(), prefix.compute_txid().to_string(),
+			"the mempool-null readiness path must request this exact signed progress");
+	}
 	tokio::time::timeout(Duration::from_secs(15), async {
 		loop {
 			let result = db.write(async |t| {
