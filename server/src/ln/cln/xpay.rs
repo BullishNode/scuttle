@@ -746,7 +746,7 @@ impl NativeNoRoute {
 		ensure!(self.record.label.as_deref() == Some(attempt.id.to_string().as_str())
 			&& self.record.lightning_node_id == attempt.lightning_node_id
 			&& self.record.payment_hash == attempt.payment_hash
-			&& self.record.payment_amount_msat == attempt.amount_msat
+			&& original_amounts_match(&self.record, attempt)
 			&& !attempt.is_self_payment(), "native completion belongs to another attempt");
 		let current = xpay::get_xpay_by_id(&**tx, self.record.id).await?
 			.context("native completion lost its original ledger row")?;
@@ -784,16 +784,12 @@ fn request_matches(
 	request: &cln_rpc::XpayRequest, amount: Amount, retry_for: Duration,
 ) -> bool {
 	let Ok(invoice) = record.original_invoice() else { return false; };
-	let expected_amount = match invoice.amount_msat() {
-		Some(msat) if msat == record.payment_amount_msat => None,
-		Some(_) => return false,
-		None => Some(record.payment_amount_msat),
-	};
+	let expected_amount = invoice.amount_msat().is_none().then_some(record.payment_amount_msat);
 	record.status == ClnXpayStatus::Pending && record.error_code.is_none()
 		&& !attempt.is_self_payment() && !attempt.status.is_final()
 		&& record.lightning_node_id == attempt.lightning_node_id
 		&& record.payment_hash == attempt.payment_hash
-		&& record.payment_amount_msat == amount.to_msat() && attempt.amount_msat == amount.to_msat()
+		&& record.payment_amount_msat == amount.to_msat() && original_amounts_match(record, attempt)
 		&& request.amount_msat.as_ref().map(|value| value.msat) == expected_amount
 		&& record.label.as_deref() == Some(attempt.id.to_string().as_str())
 		&& record.signed_invoice.as_deref() == Some(request.invstring.as_str())
@@ -803,6 +799,16 @@ fn request_matches(
 		&& attempt.retry_for == Some(retry_for) && request.retry_for == u32::try_from(retry_for.as_secs()).ok()
 		&& request.partial_msat.is_none() && request.layers.is_empty()
 		&& request.payer_note.is_none() && request.localinvreqid.is_none() && request.dev_use_shadow.is_none()
+}
+
+/// The VTXO quote is rounded up to sats, while a fixed invoice and the attempt
+/// retain its exact msat principal. Reuse the existing invoice payment policy.
+fn original_amounts_match(record: &ClnXpayRecord, attempt: &LightningPaymentAttempt) -> bool {
+	let Ok(invoice) = record.original_invoice() else { return false; };
+	if record.payment_amount_msat % 1000 != 0 { return false; }
+	let quoted = Amount::from_sat(record.payment_amount_msat / 1000);
+	invoice.get_payment_amount(Some(quoted)).is_ok()
+		&& attempt.amount_msat == invoice.amount_msat().unwrap_or(record.payment_amount_msat)
 }
 
 /// This is request evidence only, never authority to dispatch or refund.
@@ -817,7 +823,7 @@ fn retained_request(records: Vec<ClnXpayRecord>, attempt: &LightningPaymentAttem
 			&& record.lightning_node_id == attempt.lightning_node_id
 			&& record.payment_hash == attempt.payment_hash && invoice.payment_hash() == attempt.payment_hash
 			&& record.label.as_deref() == Some(attempt.id.to_string().as_str())
-			&& record.payment_amount_msat == attempt.amount_msat && record.partial_msat.is_none()
+			&& original_amounts_match(&record, attempt) && record.partial_msat.is_none()
 			&& record.max_routing_fee_msat == attempt.max_routing_fee.map(|fee| fee.to_msat())
 			&& record.error_code.is_none() && record.htlc_expiry.is_some()
 			&& attempt.retry_for.is_some() && attempt.block_height.is_some() && attempt.max_routing_fee.is_some(),
@@ -944,7 +950,7 @@ mod test {
 	use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 	use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
 
-	fn binding_invoice(fixed_amount: bool, amount: Amount) -> Invoice {
+	fn binding_invoice(fixed_msat: Option<u64>) -> Invoice {
 		let secp = Secp256k1::new();
 		let key = SecretKey::from_slice(&[3; 32]).unwrap();
 		let builder = InvoiceBuilder::new(Currency::Regtest)
@@ -954,8 +960,8 @@ mod test {
 			.duration_since_epoch(Duration::from_secs(1_700_000_000))
 			.min_final_cltv_expiry_delta(144);
 		let sign = |hash: &Message| secp.sign_ecdsa_recoverable(hash, &key);
-		Invoice::Bolt11(if fixed_amount {
-			builder.amount_milli_satoshis(amount.to_msat()).build_signed(sign)
+		Invoice::Bolt11(if let Some(msat) = fixed_msat {
+			builder.amount_milli_satoshis(msat).build_signed(sign)
 		} else { builder.build_signed(sign) }.unwrap())
 	}
 
@@ -1042,15 +1048,15 @@ mod test {
 
 	#[test]
 	fn native_no_route_cannot_certify_a_stale_or_different_request() {
-		for fixed_amount in [false, true] {
+		for fixed_msat in [None, Some(90_000_000), Some(90_000_001)] {
 			let now = Local::now();
 					let retry = Duration::from_secs(5);
-			let amount = Amount::from_sat(90_000);
+			let invoice = binding_invoice(fixed_msat);
+			let amount = invoice.get_payment_amount(fixed_msat.is_none().then_some(Amount::from_sat(90_000))).unwrap();
 			let fee = Amount::from_sat(1_000);
-			let invoice = binding_invoice(fixed_amount, amount);
 			let hash = invoice.payment_hash();
 			let attempt = LightningPaymentAttempt {
-				id: 42, lightning_node_id: 7, payment_hash: hash, amount_msat: amount.to_msat(),
+				id: 42, lightning_node_id: 7, payment_hash: hash, amount_msat: fixed_msat.unwrap_or(amount.to_msat()),
 				final_amount_msat: None, status: LightningPaymentStatus::Requested,
 				lightning_htlc_subscription_id: None, error: None, block_height: None,
 				user_fee: None, user_agent: None, retry_for: Some(retry), max_routing_fee: Some(fee),
@@ -1065,8 +1071,10 @@ mod test {
 				routing_fee_msat: None, error_code: None, created_at: now, updated_at: now,
 			};
 			let request = xpay_request(&invoice, amount, fee, BlockDelta::new(20), retry, "42".into());
-			assert_eq!(request.amount_msat.as_ref().map(|a| a.msat), if fixed_amount { None } else { Some(amount.to_msat()) });
+			assert_eq!(request.amount_msat.as_ref().map(|a| a.msat), if fixed_msat.is_some() { None } else { Some(amount.to_msat()) });
 			assert!(request_matches(&record, &attempt, &request, amount, retry));
+			let mut wrong_principal = attempt.clone(); wrong_principal.amount_msat += 1;
+			assert!(!request_matches(&record, &wrong_principal, &request, amount, retry));
 			for change in 0..8 {
 				let mut bad = record.clone();
 				match change {
@@ -1086,7 +1094,7 @@ mod test {
 			stale.label = Some("41".into());
 			assert!(!request_matches(&record, &attempt, &stale, amount, retry));
 			stale = request.clone();
-			stale.amount_msat = if fixed_amount { Some(amount.into()) } else { None };
+			stale.amount_msat = if fixed_msat.is_some() { Some(amount.into()) } else { None };
 			assert!(!request_matches(&record, &attempt, &stale, amount, retry));
 			assert!(!request_matches(&record, &attempt, &request, amount, retry + Duration::from_secs(1)));
 		}
