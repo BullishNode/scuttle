@@ -292,7 +292,10 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 		let refused = Arc::new(Mutex::new(false));
 		let observed = refused.clone();
 		srv.add_stdout_handler(move |line: &str| {
-			if line.contains("payment refused before recording an attempt") { *observed.lock().unwrap() = true; }
+			if line.contains("payment refused before recording an attempt")
+				&& (!initial_zero_delay || line.contains("no HTLC delay remains to perform a lightning payment")) {
+				*observed.lock().unwrap() = true;
+			}
 			false
 		});
 		let native_identity = if initial_zero_delay {
@@ -1275,10 +1278,17 @@ async fn crash_before_first_native_rpc(
 			node.wait_for_block(bound).await;
 			ensure!(BlockHeight::new(ctx.bitcoind().get_block_count().await as u32) == bound,
 				"the zero-room test must observe equality, not a later-height rejection");
-			srv.start().await?;
-			let cap_after = srv.native_child().await?;
-			ensure!(cap_after != cap_before, "same-store start did not create a new owned app child");
-			let mut alarms = srv.subscribe_log::<ExpiryHoldObserved>();
+			let (cap_after, mut alarms) = db.write(async |tx| {
+				let locked = tx.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 FOR UPDATE",
+					&[&sources[0].to_string()]).await?;
+				ensure!(locked.len() == 1, "the held source disappeared before startup observation");
+				srv.start().await?;
+				let cap_after = srv.native_child().await?;
+				ensure!(cap_after != cap_before, "same-store start did not create a new owned app child");
+				// As in the existing fee observer, keep the source lock across
+				// startup and subscription. Only then may the real hold emit.
+				Ok((cap_after, srv.subscribe_log::<ExpiryHoldObserved>()))
+			}).await?;
 			ctx.await_block_count_sync().await;
 			let info = node.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await?.into_inner();
 			ensure!(info.blockheight == bound.to_u32(), "native tip did not reach the actual recorded bound");
