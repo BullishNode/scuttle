@@ -2127,11 +2127,24 @@ mod tests {
 		).unwrap();
 
 		let flux = VtxosInFlux::new();
-		state.register_interactive_participation(flux.empty_guard(), inputs, outputs.clone(), pre, "test", 0);
+		state.locked_inputs = flux.empty_guard().into_owned();
+		let ids = inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
+		let guard = flux.try_lock(&ids).unwrap();
+		state.register_interactive_participation(guard, inputs, outputs.clone(), pre, "test", 0);
 		assert_eq!(state.all_inputs.len(), 1);
 		assert_eq!(state.all_outputs.len(), 1);
 		assert_eq!(state.inputs_per_cosigner.len(), 1);
 		assert_eq!(1, state.inputs_per_cosigner.get(&outputs[0].cosign_pubkey).unwrap().len());
+		// Readiness uses this same lock while preparing and committing. A
+		// conflicting acquisition must not steal the round's input or keep any
+		// earlier uncontested ID. Round teardown releases the original guard.
+		let other = VTXO_VECTORS.board_vtxo.id();
+		assert_ne!(other, ids[0]);
+		assert_eq!(flux.try_lock([other, ids[0]]).unwrap_err().id, ids[0]);
+		drop(flux.try_lock([other]).unwrap());
+		assert!(flux.try_lock(&ids).is_err());
+		drop(state);
+		drop(flux.try_lock(&ids).unwrap());
 	}
 
 	#[test]
