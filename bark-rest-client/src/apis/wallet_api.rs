@@ -67,19 +67,19 @@ pub enum CreateWalletError {
     UnknownValue(serde_json::Value),
 }
 
-/// struct for typed errors of method [`fallback_registration`]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum FallbackRegistrationError {
-    Status404(models::NotFoundError),
-    Status500(models::InternalServerError),
-    UnknownValue(serde_json::Value),
-}
-
 /// struct for typed errors of method [`debug_info`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DebugInfoError {
+    Status500(models::InternalServerError),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`fallback_destination`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FallbackDestinationError {
+    Status404(models::NotFoundError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -162,8 +162,8 @@ pub enum OffboardAllError {
 #[serde(untagged)]
 pub enum OffboardVtxosError {
     Status400(models::BadRequestError),
-    Status409(models::FallbackRefusalError),
     Status404(models::NotFoundError),
+    Status409(models::FallbackRefusalError),
     Status500(),
     UnknownValue(serde_json::Value),
 }
@@ -208,8 +208,8 @@ pub enum RefreshCounterpartyError {
 #[serde(untagged)]
 pub enum RefreshDelegatedError {
     Status400(models::BadRequestError),
-    Status409(models::FallbackRefusalError),
     Status404(models::NotFoundError),
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -219,8 +219,8 @@ pub enum RefreshDelegatedError {
 #[serde(untagged)]
 pub enum RefreshVtxosError {
     Status400(models::BadRequestError),
-    Status409(models::FallbackRefusalError),
     Status404(models::NotFoundError),
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -562,7 +562,7 @@ pub async fn debug_info(configuration: &configuration::Configuration, ) -> Resul
     }
 }
 
-pub async fn fallback_registration(configuration: &configuration::Configuration, ) -> Result<models::FallbackRegistrationInfo, Error<FallbackRegistrationError>> {
+pub async fn fallback_destination(configuration: &configuration::Configuration, ) -> Result<models::FallbackInfo, Error<FallbackDestinationError>> {
 
     let uri_str = format!("{}/api/v1/wallet/fallback", configuration.base_path);
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
@@ -589,12 +589,12 @@ pub async fn fallback_registration(configuration: &configuration::Configuration,
         let content = resp.text().await?;
         match content_type {
             ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
-            ContentType::Text => return Err(Error::from(serde_json::Error::custom("Received `text/plain` content type response that cannot be converted to `models::FallbackRegistrationInfo`"))),
-            ContentType::Unsupported(unknown_type) => return Err(Error::from(serde_json::Error::custom(format!("Received `{unknown_type}` content type response that cannot be converted to `models::FallbackRegistrationInfo`")))),
+            ContentType::Text => return Err(Error::from(serde_json::Error::custom("Received `text/plain` content type response that cannot be converted to `models::FallbackInfo`"))),
+            ContentType::Unsupported(unknown_type) => return Err(Error::from(serde_json::Error::custom(format!("Received `{unknown_type}` content type response that cannot be converted to `models::FallbackInfo`")))),
         }
     } else {
         let content = resp.text().await?;
-        let entity: Option<FallbackRegistrationError> = serde_json::from_str(&content).ok();
+        let entity: Option<FallbackDestinationError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent { status, content, entity }))
     }
 }
