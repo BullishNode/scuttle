@@ -24,6 +24,8 @@ pub struct BlockIndex {
 	pub(super) listeners: Vec<Box<dyn ChainEventListener>>,
 	/// Which block table this index uses for persistence
 	block_table: BlockTable,
+	/// SQL rollback committed, but local listener caches still need refreshing.
+	reorg_cache_pending: Option<BlockRef>,
 }
 
 impl BlockIndex {
@@ -65,7 +67,7 @@ impl BlockIndex {
 
 		let (chain_tip_tx, _) = watch::channel(chain_tip);
 		let (sync_height_tx, _ ) = watch::channel(sync_tip);
-		Ok(Self { chain_tip_tx, sync_height_tx, bitcoind, db, listeners, block_table })
+		Ok(Self { chain_tip_tx, sync_height_tx, bitcoind, db, listeners, block_table, reorg_cache_pending: None })
 	}
 
 	/// Get the latest observed tip of bitcoind
@@ -115,6 +117,10 @@ impl BlockIndex {
 	///
 	/// Returns `Ok(true)` if blocks were synced, `Ok(false)` if already in sync.
 	pub async fn sync(&mut self) -> anyhow::Result<bool> {
+		// A transient cache failure can follow a successful SQL rollback. The
+		// old indexed tip is then absent: retry caches before ancestor lookup
+		// or any completed-view publication, not the already committed SQL.
+		self.refresh_reorg_caches().await?;
 		let bitcoind_tip = bcd::tip(&self.bitcoind).await
 			.context("Failed to get bitcoind tip")?;
 
@@ -217,7 +223,7 @@ impl BlockIndex {
 	/// Listeners must handle being called multiple times for the same reorg due to
 	/// retries. Orphaned blocks are not provided directly - listeners can look them
 	/// up by height if needed before the database is updated.
-	async fn org_out_blocks_above(&self, block: BlockRef) -> anyhow::Result<()> {
+	async fn org_out_blocks_above(&mut self, block: BlockRef) -> anyhow::Result<()> {
 		// Commit the invalid generation first. Then retain the conflicting
 		// exclusive row lock through every rollback callback and block delete.
 		// Watchmand cannot publish a completed view over a partial rollback by
@@ -242,6 +248,12 @@ impl BlockIndex {
 			}).await?;
 			if rolled_back { break; }
 		}
+		self.reorg_cache_pending = Some(block);
+		self.refresh_reorg_caches().await
+	}
+
+	async fn refresh_reorg_caches(&mut self) -> anyhow::Result<()> {
+		let Some(block) = self.reorg_cache_pending else { return Ok(()); };
 		// Cache locks can be held by ordinary readers borrowing the same pool.
 		// Acquire them only after releasing the rollback connection. The view
 		// remains durably invalid until the full replacement cycle completes.
@@ -254,6 +266,7 @@ impl BlockIndex {
 		// database delete have succeeded. This mirrors `add_block` and keeps
 		// the reorg retryable if a listener fails.
 		self.update_sync_height(block);
+		self.reorg_cache_pending = None;
 		Ok(())
 	}
 

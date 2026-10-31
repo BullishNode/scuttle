@@ -184,12 +184,14 @@ async fn test_block_index_basic_sync() {
 pub struct FailOnceReorgListener {
 	calls: Arc<AtomicUsize>,
 	completed: Arc<AtomicUsize>,
+	cache_calls: Arc<AtomicUsize>,
 	db: Db,
 }
 
 impl FailOnceReorgListener {
 	pub fn new(db: Db) -> Self {
-		Self { calls: Arc::new(AtomicUsize::new(0)), completed: Arc::new(AtomicUsize::new(0)), db }
+		Self { calls: Arc::new(AtomicUsize::new(0)), completed: Arc::new(AtomicUsize::new(0)),
+			cache_calls: Arc::new(AtomicUsize::new(0)), db }
 	}
 }
 
@@ -223,6 +225,9 @@ impl ChainEventListener for FailOnceReorgListener {
 	async fn on_reorg_committed(&self, block: BlockRef) -> anyhow::Result<()> {
 		let tip = self.db.read(async |t| t.get_highest_block(BlockTable::Captaind).await).await?;
 		assert_eq!(tip, Some(block), "cache refresh must observe the committed rollback with one pooled connection");
+		if self.cache_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+			bail!("simulated postcommit cache failure");
+		}
 		Ok(())
 	}
 }
@@ -250,6 +255,7 @@ async fn test_block_index_reorg_retry() {
 	let listener = FailOnceReorgListener::new(db.clone());
 	let completed = listener.completed.clone();
 	let call_count = listener.calls.clone();
+	let cache_calls = listener.cache_calls.clone();
 	let listeners = vec![Box::new(listener) as Box<dyn ChainEventListener>];
 	let birthday = bitcoind.deep_tip().expect("deep tip");
 	let mut block_index = BlockIndex::new(bitcoind_async, db.clone(), listeners, birthday, BlockTable::Captaind).await.expect("blockindex created");
@@ -270,13 +276,17 @@ async fn test_block_index_reorg_retry() {
 	assert!(result.is_err(), "First sync should fail due to listener failure");
 	assert_eq!(completed.load(Ordering::SeqCst), 1, "failed listener must not acknowledge a completed sync");
 
-	// Second sync should re-detect the same reorg, retry, and converge.
-	block_index.sync().await.expect("Second sync should succeed after retry");
+	// The retry commits SQL, but a failed cache refresh must neither publish
+	// completion nor make the following ancestor lookup use deleted blocks.
+	assert!(block_index.sync().await.is_err());
+	assert_eq!(completed.load(Ordering::SeqCst), 1);
+	block_index.sync().await.expect("Third sync should retry caches and converge");
 
 	check_block_index_is_consistent(&db, BlockTable::Captaind, &bitcoind).await;
 
 	// The listener must have been called twice: one failure, then one success.
 	assert_eq!(call_count.load(Ordering::SeqCst), 2);
+	assert_eq!(cache_calls.load(Ordering::SeqCst), 2, "cache retry must not repeat the committed rollback");
 	assert_eq!(completed.load(Ordering::SeqCst), 2);
 	assert!(!block_index.sync().await.unwrap());
 	assert_eq!(completed.load(Ordering::SeqCst), 3, "equal-tip restart cycles must acknowledge completion");
