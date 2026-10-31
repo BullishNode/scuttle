@@ -5,7 +5,7 @@ use std::io;
 use bitcoin::constants::ChainHash;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use bitcoin::secp256k1::{self, ecdh, schnorr, Keypair, Message, PublicKey, Scalar, SecretKey};
-use bitcoin::Network;
+use bitcoin::{Network, ScriptBuf};
 
 use crate::{ProtocolDecodingError, ProtocolEncoding, ReadExt, WriteExt, SECP};
 use crate::mailbox::{BlindedMailboxIdentifier, MailboxBlindingError, MailboxIdentifier};
@@ -23,6 +23,13 @@ fn tagged_message(tag: &str, fields: &[&[u8]]) -> Message {
 	engine.input(tag_hash.as_byte_array());
 	for field in fields { engine.input(field); }
 	Message::from_digest(sha256::Hash::from_engine(engine).to_byte_array())
+}
+
+/// The BIP86 output that expired coins of mailbox `M` are paid to: `M` lifted
+/// to even Y, tweaked with `TapTweak` and an empty script tree. This is the
+/// wallet's ordinary BIP86 receive script when `M` is a BIP86 account key.
+pub fn payout_script(mailbox: PublicKey) -> ScriptBuf {
+	ScriptBuf::new_p2tr(&SECP, mailbox.x_only_public_key().0, None)
 }
 
 /// Joint authorization of a network- and server-specific coin-to-mailbox link.
@@ -142,7 +149,9 @@ impl ProtocolEncoding for OwnerLink {
 mod tests {
 	use super::*;
 	use bitcoin::hex::DisplayHex;
-	use bitcoin::ScriptBuf;
+	use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+	use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+	use bitcoin_ext::KeypairExt;
 
 	fn key(number: u8) -> Keypair {
 		let mut secret = [0; 32];
@@ -211,7 +220,7 @@ mod tests {
 			assert!(resigned.verify_joint(network, &key(12), coin.public_key()).is_err());
 			let other_network = if network == Network::Bitcoin { Network::Signet } else { Network::Bitcoin };
 			assert!(resigned.verify_joint(other_network, &server, coin.public_key()).is_err());
-			assert_eq!(ScriptBuf::new_p2tr(&SECP, mailbox.x_only_public_key().0, None).to_hex_string(), vector["payout_script"]);
+			assert_eq!(payout_script(mailbox.public_key()).to_hex_string(), vector["payout_script"]);
 		}
 		assert_eq!(parities, [2, 3].into_iter().collect());
 	}
@@ -254,6 +263,39 @@ mod tests {
 			assert!(changed.verify_joint(Network::Regtest, &server, coin.public_key()).is_err());
 		} } }
 		assert_eq!(parities, [2, 3].into_iter().collect());
+	}
+
+	#[test]
+	fn owner_link_mailbox_signature_cannot_authorize_a_taproot_input() {
+		// The mailbox key also controls the BIP86 payout. Its owner-link half
+		// signs a tagged intent with a server-specific tweak; a key-path spend
+		// signs a BIP341 sighash with the TapTweak. Neither verifies as the other.
+		let server = key(11); let coin = key(3);
+		let mailbox = key(6);
+		assert_eq!(mailbox.public_key().serialize()[0], 3, "exercise an odd full mailbox point");
+		let link = OwnerLink::new_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap();
+		link.verify_joint(Network::Regtest, &server, coin.public_key()).unwrap();
+		let prevout = TxOut { value: Amount::from_sat(10_000), script_pubkey: payout_script(mailbox.public_key()) };
+		let spend = Transaction {
+			version: bitcoin::transaction::Version::TWO, lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![TxIn { previous_output: OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+				script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() }],
+			output: vec![TxOut { value: Amount::from_sat(9_000), script_pubkey: prevout.script_pubkey.clone() }],
+		};
+		let sighash: Message = SighashCache::new(&spend).taproot_key_spend_signature_hash(
+			0, &Prevouts::All(&[prevout]), TapSighashType::Default,
+		).unwrap().into();
+		let output_key = mailbox.for_keyspend_only(&SECP);
+		assert_eq!(payout_script(mailbox.public_key()).as_bytes()[2..], output_key.x_only_public_key().0.serialize());
+		let input_signature = SECP.sign_schnorr_no_aux_rand(&sighash, &output_key);
+		SECP.verify_schnorr(&input_signature, &sighash, &output_key.x_only_public_key().0).unwrap();
+		for key in [output_key.x_only_public_key().0, mailbox.x_only_public_key().0] {
+			assert!(SECP.verify_schnorr(&link.mailbox_signature, &sighash, &key).is_err());
+		}
+		for signature in [input_signature, SECP.sign_schnorr_no_aux_rand(&sighash, &mailbox)] {
+			let forged = OwnerLink { mailbox_signature: signature, ..link };
+			assert!(forged.verify_joint(Network::Regtest, &server, coin.public_key()).is_err());
+		}
 	}
 
 	#[test]

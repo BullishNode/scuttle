@@ -198,3 +198,24 @@ impl Tx<'_> {
 		Ok(if funded { SourceSettlement::Funded } else { SourceSettlement::Disjoint })
 	}
 }
+
+impl Tx<'_> {
+	/// Open external payment attempts and open receives per Lightning node.
+	/// Only that node's monitor and hold sweep can resolve them.
+	pub async fn open_lightning_obligations_by_node(
+		&self,
+	) -> anyhow::Result<Vec<(super::LightningNodeId, u64, u64)>> {
+		let rows = self.query("SELECT n.id, \
+			(SELECT count(*) FROM lightning_payment_attempt a WHERE a.lightning_node_id=n.id \
+				AND a.lightning_htlc_subscription_id IS NULL \
+				AND a.status NOT IN ('succeeded','failed')) AS attempts, \
+			(SELECT count(*) FROM lightning_htlc_subscription s WHERE s.lightning_node_id=n.id \
+				AND s.status NOT IN ('settled','canceled')) AS receives \
+			FROM lightning_node n ORDER BY n.id", &[]).await?;
+		rows.into_iter().map(|row| Ok((
+			row.get("id"),
+			u64::try_from(row.get::<_, i64>("attempts"))?,
+			u64::try_from(row.get::<_, i64>("receives"))?,
+		))).collect()
+	}
+}

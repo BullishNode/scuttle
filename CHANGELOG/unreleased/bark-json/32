@@ -1,3 +1,0 @@
-- Expose principal awaiting settlement
-  Clients can distinguish spendable bitcoin from a pending emergency payout.
-  [#32](https://github.com/BullishNode/abandon-ship-bark/pull/32)

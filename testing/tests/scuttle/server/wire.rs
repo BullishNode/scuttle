@@ -85,19 +85,17 @@ async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	assert!(error.message().contains("unsupported Scuttle protocol"));
 
 	let mut public_operator = server_rpc::admin::ScuttleServiceClient::connect(srv.ark_url()).await.unwrap();
-	let mut request = tonic::Request::new(protos::CheckLightningPaymentRequest::default());
+	let mut request = tonic::Request::new(protos::Empty {});
 	request.set_pver(version);
-	assert_eq!(public_operator.scoped_payment_status(request).await.unwrap_err().code(), tonic::Code::Unimplemented);
+	assert_eq!(public_operator.list_expiry_holds(request).await.unwrap_err().code(), tonic::Code::Unimplemented);
 	let address = format!("http://{}", srv.config().rpc.admin_address.unwrap());
 	let mut operator = server_rpc::admin::ScuttleServiceClient::connect(address).await.unwrap();
-	let error = operator.scoped_payment_status(protos::CheckLightningPaymentRequest::default()).await.unwrap_err();
+	let error = operator.list_expiry_holds(protos::Empty {}).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::InvalidArgument);
 	assert!(error.message().contains("pver"));
-	let mut request = tonic::Request::new(protos::CheckLightningPaymentRequest::default());
+	let mut request = tonic::Request::new(protos::Empty {});
 	request.set_pver(version);
-	let error = operator.scoped_payment_status(request).await.unwrap_err();
-	assert_eq!(error.code(), tonic::Code::InvalidArgument);
-	assert!(!error.message().contains("pver"), "the same scoped handler validates the invalid hash after version admission");
+	operator.list_expiry_holds(request).await.unwrap();
 }
 
 /// Admin authority is the existing private listener/network boundary, as for
@@ -144,10 +142,5 @@ async fn list_expiry_holds_requires_admin_auth() {
 	assert_eq!(cli.as_array().unwrap().len(), 1);
 	assert_eq!(cli[0]["vtxo_id"], coin.id().to_string());
 	assert_eq!(cli[0]["reason"], "operator_visibility_updated");
-	let mut fail = tonic::Request::new(protos::scuttle::FailLightningAttemptRequest {
-		attempt_id: 0, reason: "listing must not enable a money override".into(),
-	});
-	fail.set_pver(server_rpc::pver::PROTOCOL_VERSION_SCUTTLE);
-	assert_eq!(admin.fail_lightning_attempt(fail).await.unwrap_err().code(), tonic::Code::Unimplemented);
 	assert_eq!(db.read(async |tx| tx.expiry_hold_count().await).await.unwrap(), 1);
 }

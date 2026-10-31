@@ -32,7 +32,7 @@ impl Wallet {
 
 	/// BIP86 destination of the exact mailbox identity checked at open.
 	pub fn fallback_script(&self) -> ScriptBuf {
-		ScriptBuf::new_p2tr(&ark::SECP, self.mailbox_keypair().x_only_public_key().0, None)
+		ark::fallback::payout_script(self.mailbox_keypair().public_key())
 	}
 
 	/// Current committed claims, including explicit no-output forfeitures and

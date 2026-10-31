@@ -671,7 +671,7 @@ impl rpc::server::ArkService for Server {
 		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
-		if pver < server_rpc::pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF {
+		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
 			macros::badarg!("Your client version is too old, you need to update \
 				in order to be able to receive Lightning payments.");
 		}

@@ -3,6 +3,7 @@
 
 use ark::VtxoId;
 use chrono::{DateTime, Local};
+use tracing::info;
 
 use super::Tx;
 
@@ -59,6 +60,22 @@ impl Tx<'_> {
 			slog!(ExpiryHoldDecision, vtxo_id: id);
 		}
 		Ok(())
+	}
+
+	/// A hold names a coin that still waits for a decision. A coin that got a
+	/// successor (arkoor, round, offboard) or whose output was spent on chain
+	/// left the expiry inventory, so no decision will ever clear its hold.
+	/// Returns the number of holds removed.
+	pub async fn clear_stale_expiry_holds(&self) -> anyhow::Result<usize> {
+		let rows = self.query("DELETE FROM expiry_hold h USING vtxo v WHERE h.vtxo_id=v.vtxo_id \
+			AND (v.oor_spent_txid IS NOT NULL OR v.spent_in_round IS NOT NULL \
+				OR v.offboarded_in IS NOT NULL OR v.onchain_spent_txid IS NOT NULL) \
+			RETURNING h.vtxo_id,h.reason", &[]).await?;
+		for row in &rows {
+			info!(vtxo_id = row.get::<_, &str>(0), reason = row.get::<_, &str>(1),
+				"Expiry hold removed: the coin left the expiry inventory");
+		}
+		Ok(rows.len())
 	}
 
 	pub async fn list_expiry_holds(&self) -> anyhow::Result<Vec<ExpiryHold>> {

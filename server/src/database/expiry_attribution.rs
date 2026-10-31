@@ -56,7 +56,7 @@ impl Tx<'_> {
 			return Ok(Attribution::Unresolved);
 		}
 		Ok(Attribution::Owned { mailbox_pk: mailbox,
-			spk: ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None) })
+			spk: ark::fallback::payout_script(mailbox) })
 	}
 
 	/// Verify both holders once at admission and keep the first signed binding.
@@ -87,6 +87,21 @@ impl Tx<'_> {
 		let Ok(mailbox) = PublicKey::from_str(row.get("mailbox_pk"))
 			else { return Ok(Attribution::Unresolved); };
 		Ok(Attribution::Owned { mailbox_pk: mailbox,
-			spk: ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None) })
+			spk: ark::fallback::payout_script(mailbox) })
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use ark::{ProtocolEncoding, ServerVtxoPolicy, VtxoPolicy};
+	use bitcoin::hex::DisplayHex;
+
+	/// The customer-birth trigger repeats the round padding policy as a byte
+	/// literal. Fail here, not at the first padded round, if the key changes.
+	#[test]
+	fn customer_coin_owner_trigger_exempts_the_round_padding_policy() {
+		let policy = ServerVtxoPolicy::User(VtxoPolicy::new_pubkey(*crate::round::UNSPENDABLE));
+		let literal = format!("decode('{}', 'hex')", policy.serialize().as_hex());
+		assert!(include_str!("scuttle.sql").contains(&literal), "{literal}");
 	}
 }

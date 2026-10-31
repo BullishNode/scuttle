@@ -1,6 +1,0 @@
-- Carry joint coin and mailbox authorization in recipient addresses.
-  Bind both signatures to the same network, server, output key and mailbox link.
-  Supported Bitcoin destinations require no Bitcoin private-key proof.
-  [#2](https://github.com/BullishNode/scuttle/pull/2)
-  - **BREAKING:** New recipient addresses use delivery type 3. Legacy addresses
-    remain decodable but cannot authorize new coin-only issuance.

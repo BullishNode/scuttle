@@ -6,6 +6,12 @@ use tokio_postgres::{Row, Transaction};
 /// Acquire the same coin locks as allocation, then re-read the durable fences.
 /// The locks live until the caller's transaction commits. Process-local flux
 /// locks alone cannot serialize the server against the separate watchman.
+///
+/// A physical input is fenced while an allocation that spends it can still
+/// confirm. A customer entitlement stays fenced for good: the customer is owed
+/// it whatever happens to its backing. An operator-only entitlement whose every
+/// allocation conflicted reserves nothing, so upstream's own claim and progress
+/// broadcasts for that exposed output may proceed.
 pub(crate) async fn guard_obligation_changes(
 	tx: &Transaction<'_>,
 	ids: &[VtxoId],
@@ -14,9 +20,18 @@ pub(crate) async fn guard_obligation_changes(
 	let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 	tx.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id = ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
 	if let Some(row) = tx.query_opt(
-		"SELECT vtxo_id FROM (SELECT vtxo_id FROM expiry_entitlement WHERE vtxo_id=ANY($1) \
-			UNION SELECT vtxo_id FROM expiry_allocation_input WHERE vtxo_id=ANY($1)) fenced \
-			ORDER BY vtxo_id LIMIT 1",
+		"SELECT vtxo_id FROM ( \
+			SELECT i.vtxo_id FROM expiry_allocation_input i \
+			JOIN expiry_allocation a ON a.id=i.allocation_id \
+			WHERE i.vtxo_id=ANY($1) AND a.status<>'conflicted' \
+			UNION \
+			SELECT e.vtxo_id FROM expiry_entitlement e \
+			WHERE e.vtxo_id=ANY($1) AND ( \
+				NOT EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id) \
+				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c \
+					JOIN expiry_allocation a ON a.id=c.allocation_id \
+					WHERE c.entitlement_id=e.id AND (c.disposition='customer' OR a.status<>'conflicted'))) \
+		) fenced ORDER BY vtxo_id LIMIT 1",
 		&[&ids],
 	).await? {
 		return Err(crate::error::FallbackRefusal::DecidedForFallback(row.get::<_, &str>("vtxo_id").parse()?).into());
