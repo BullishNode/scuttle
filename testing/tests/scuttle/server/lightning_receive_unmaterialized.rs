@@ -695,6 +695,15 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	assert!(local.get_wallet_vtxo(original.source.id()).await.unwrap().is_none());
 	assert_eq!(returned.balance().await.unwrap().total(), sat(0));
 	let history = returned.history().await.unwrap();
+	assert_eq!(history.len(), 1, "an unmaterialized receive discovers only its actual fallback receipt");
+	assert_eq!(history[0].subsystem.name, "scuttle.fallback");
+	assert_eq!(history[0].status, bark::movement::MovementStatus::Successful);
+	assert_eq!(history[0].intended_balance, bitcoin::SignedAmount::ZERO);
+	assert_eq!(history[0].effective_balance, bitcoin::SignedAmount::ZERO,
+		"receipt discovery cannot debit Ark principal this wallet never held");
+	assert_eq!(history[0].offchain_fee, sat(1_000));
+	assert!(history[0].input_vtxos.is_empty() && history[0].output_vtxos.is_empty());
+	assert_eq!(history[0].metadata.get("fallback_receipt"), Some(&serde_json::to_value(receipt).unwrap()));
 	for _ in 0..2 {
 		returned.sync_fallback_payouts().await.unwrap();
 		assert_eq!(returned.fallback_receipts().await.unwrap(), receipts);
