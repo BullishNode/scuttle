@@ -36,6 +36,11 @@ enum PreparedCoin {
 	NeedsHtlcProgress,
 }
 
+fn database_failure(error: &anyhow::Error) -> bool {
+	error.downcast_ref::<tokio_postgres::Error>().is_some()
+		|| error.downcast_ref::<bb8::RunError<tokio_postgres::Error>>().is_some()
+}
+
 impl Tx<'_> {
 	async fn prepare_expiry_coin(
 		&self,
@@ -43,11 +48,27 @@ impl Tx<'_> {
 		funding: &Transaction,
 		view: ExpiryViewToken,
 	) -> anyhow::Result<PreparedCoin> {
+		match self.try_prepare_expiry_coin(fact, funding, view).await {
+			Ok(coin) => Ok(coin),
+			Err(error) => {
+				// Handle this terminal inside its transaction. An aborted SQL
+				// transaction cannot persist this hold and still propagates failure.
+				if database_failure(&error) { return Err(error); }
+				self.record_expiry_hold(fact.state.vtxo_id, "terminal_ownership_invalid").await?;
+				warn!(vtxo_id = %fact.state.vtxo_id, error = %format!("{error:#}"), "Invalid terminal ownership remains held");
+				Ok(PreparedCoin::Hold)
+			},
+		}
+	}
+
+	async fn try_prepare_expiry_coin(
+		&self,
+		fact: &BackingVtxoFact,
+		funding: &Transaction,
+		view: ExpiryViewToken,
+	) -> anyhow::Result<PreparedCoin> {
 		let ownership = self.propose_expiry_ownership(
-			fact,
-			funding,
-			view.captaind.height,
-			Some(view.watchmand.height),
+			fact, funding, view.captaind.height, Some(view.watchmand.height),
 		).await?;
 		let payee = match &ownership.disposition {
 			OwnershipDisposition::Customer { .. } => {
@@ -155,10 +176,11 @@ impl Server {
 			if let Err(error) = self.prepare_expiry_anchor(
 				view, anchor, roots, &mut ready, &mut prepared_bytes
 			).await {
-				self.db.write(async |tx| {
-					for id in &root_ids { tx.record_expiry_hold(*id, "anchor_preparation_failed").await?; }
-					Ok(())
-				}).await?;
+				if database_failure(&error) { return Err(error); }
+				for id in root_ids {
+					let root = self.db.read(async |tx| tx.get_server_vtxo_by_id(id).await).await?.vtxo;
+					self.request_held_expiry_split(view, &root, "anchor_preparation_failed").await?;
+				}
 				warn!(%anchor, %error, "Expiry anchor remains unready; other anchors continue");
 			}
 		}
@@ -171,11 +193,7 @@ impl Server {
 					self.commit_ready_group(view, std::mem::take(&mut group)).await?;
 				}
 				if !ReadyOutput::group_fits(&[&output])? {
-					self.db.write(async |t| {
-						let requested = t.request_expiry_split(view, output.root()).await?;
-						t.record_expiry_hold(output.root().id(), "output_requires_split").await?;
-						Ok(requested)
-					}).await?;
+					self.request_held_expiry_split(view, output.root(), "output_requires_split").await?;
 				} else {
 					group.push(output);
 				}
@@ -284,8 +302,7 @@ impl Server {
 					// Separate held siblings only through signed steps that preserve
 					// every branch's server recovery path, as checked by the split request.
 					if needs_htlc_progress || (hold && cut.terminals.len() > 1) {
-						self.db.write(async |t| t.request_expiry_split(view, &root).await).await
-							.context("expiry readiness split request")?;
+						self.request_held_expiry_split(view, &root, "output_requires_split").await?;
 					}
 					return Ok(());
 				}
@@ -311,12 +328,33 @@ impl Server {
 				Ok::<_, anyhow::Error>(())
 			}.await;
 			if let Err(error) = result {
-				self.db.write(async |tx| tx.record_expiry_hold(root.id(), "output_preparation_failed").await).await?;
+				if database_failure(&error) { return Err(error); }
+				self.request_held_expiry_split(view, &root, "output_preparation_failed").await?;
 				warn!(vtxo_id = %root.id(), %anchor, error = %format!("{error:#}"),
 					"Expiry output remains unready; siblings continue");
 			}
 		}
 		Ok(())
+	}
+
+	/// A failed signed-path preparation cannot stop unrelated outputs. This
+	/// catches only split preparation, never a financial allocation transaction.
+	async fn request_held_expiry_split(&self, view: ExpiryViewToken, root: &ServerVtxo, reason: &str) -> anyhow::Result<()> {
+		self.db.write(async |tx| tx.record_expiry_hold(root.id(), reason).await).await?;
+		self.db.write(async |tx| {
+			match tx.request_expiry_split(view, root).await {
+				Ok(true) => tx.record_expiry_hold(root.id(), "output_requires_split").await,
+				Ok(false) => Ok(()),
+				Err(error) => {
+					// Database failures propagate; only a proof/preparation refusal
+					// can leave this output held while the cursor continues.
+					if database_failure(&error) { return Err(error); }
+					tx.record_expiry_hold(root.id(), reason).await?;
+					warn!(vtxo_id = %root.id(), error = %format!("{error:#}"), "Signed expiry split remains unavailable; other outputs continue");
+					Ok(())
+				},
+			}
+		}).await
 	}
 
 	async fn commit_ready_group(&self, view: ExpiryViewToken, outputs: Vec<ReadyOutput>) -> anyhow::Result<()> {
@@ -335,7 +373,7 @@ impl Server {
 				"Expiry payout decision committed"
 			),
 			Ok(None) => {},
-			Err(error) => warn!(%error, "Expiry group was not committed; other ready groups continue"),
+			Err(error) => return Err(error.context("expiry group was not committed")),
 		}
 		Ok(())
 	}

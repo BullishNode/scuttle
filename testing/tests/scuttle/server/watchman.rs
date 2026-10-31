@@ -94,3 +94,32 @@ async fn expiry_same_owner_fragments_merge_before_dust_forfeiture() {
 async fn expiry_small_fragment_decided_first_waits_for_siblings() {
 	fallback::expiry_small_fragment_decided_first_waits_for_siblings().await
 }
+
+#[tokio::test]
+async fn operator_sweeps_run_while_captaind_is_down() {
+	fallback::operator_sweeps_run_while_captaind_is_down().await
+}
+
+#[tokio::test]
+async fn watchmand_refuses_node_without_txindex() {
+	let ctx = TestContext::new("server/watchmand_refuses_node_without_txindex").await;
+	let srv = ctx.captaind("server").no_vtxo_pool().watchmand().create().await;
+	let wm = srv.watchmand();
+	wm.stop().await.unwrap();
+	let mut node_cfg = ctx.bitcoind_default_cfg("no_txindex");
+	node_cfg.txindex = false;
+	node_cfg.snapshot_dir = None;
+	let node = ctx.new_bitcoind_with_cfg("no_txindex", node_cfg).await;
+	let mut cfg = wm.config().clone();
+	cfg.bitcoind.url = node.rpc_url();
+	cfg.bitcoind.cookie = Some(node.rpc_cookie());
+	let path = ctx.datadir.join("watchmand-no-txindex.toml");
+	cfg.write_into(&mut std::fs::File::create(&path).unwrap()).unwrap();
+	let mut command = Watchmand::base_cmd();
+	command.args(["start", "--config"]).arg(&path).kill_on_drop(true);
+	let output = tokio::time::timeout(Duration::from_secs(10), command.output()).await
+		.expect("watchmand must refuse the node before starting background actors").unwrap();
+	assert!(!output.status.success());
+	let response = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+	assert!(response.contains("txindex is not enabled"), "unexpected startup refusal: {response}");
+}

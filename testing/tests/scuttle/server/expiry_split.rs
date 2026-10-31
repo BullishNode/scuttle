@@ -156,7 +156,17 @@ async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
 /// sibling under the same anchor receives its ordinary expiry payout.
 #[tokio::test]
 async fn expiry_unregistered_owner_does_not_block_registered_sibling() {
-	let ctx = TestContext::new("server/expiry_unregistered_owner_with_registered_sibling").await;
+	held_sibling(false).await;
+}
+
+#[tokio::test]
+async fn one_bad_terminal_holds_only_itself() {
+	held_sibling(true).await;
+}
+
+async fn held_sibling(invalid_terminal: bool) {
+	let ctx = TestContext::new(if invalid_terminal { "server/one_bad_terminal_holds_only_itself" }
+		else { "server/expiry_unregistered_owner_with_registered_sibling" }).await;
 	let srv = ctx.captaind("server").no_vtxo_pool()
 		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24)).watchmand().create().await;
 	let wallet = ctx.bark("sender", &srv).funded(sat(200_000))
@@ -205,7 +215,15 @@ async fn expiry_unregistered_owner_does_not_block_registered_sibling() {
 	// Deliberately corrupt attribution evidence after genuine signed admission.
 	assert!(matches!(db.read(async |tx| tx.expiry_owner(unknown).await).await.unwrap(), server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. } if mailbox_pk == unknown));
 	db.write(async |tx| {
-		tx.execute("DELETE FROM owner_key WHERE user_pubkey=$1", &[&unknown.to_string()]).await?;
+		if invalid_terminal {
+			// The signed path and real owner remain valid. A malformed committed
+			// customer key makes only this terminal's ownership reader fail.
+			tx.execute("INSERT INTO expiry_entitlement(vtxo_id,gross_sat,irreversible_facts) VALUES($1,$2,$3::TEXT::JSONB)",
+				&[&held.id().to_string(), &10_000i64, &r#"{"kind":"pubkey","customer_key":"not-a-public-key"}"#]).await?;
+			tx.execute("UPDATE vtxo SET spend_state='Spent',updated_at=NOW() WHERE vtxo_id=$1", &[&held.id().to_string()]).await?;
+		} else {
+			tx.execute("DELETE FROM owner_key WHERE user_pubkey=$1", &[&unknown.to_string()]).await?;
+		}
 		Ok(())
 	}).await.unwrap();
 	let height = ctx.bitcoind().get_block_count().await as u32;
@@ -244,12 +262,21 @@ async fn expiry_unregistered_owner_does_not_block_registered_sibling() {
 	assert!(paid.confirmations >= 6);
 	assert_eq!(paid.value, sat(89_000));
 	let state = db.read(async |tx| tx.expiry_owner(unknown).await).await.unwrap();
-	assert_eq!(state, server::database::expiry_attribution::Attribution::Unresolved);
-	assert!(db.read(async |tx| Ok(tx.query_one("SELECT \
-		NOT EXISTS(SELECT 1 FROM owner_key WHERE user_pubkey=$1) \
-		AND NOT EXISTS(SELECT 1 FROM expiry_entitlement WHERE vtxo_id=$2)",
-		&[&unknown.to_string(), &held.id().to_string()],
-	).await?.get::<_, bool>(0))).await.unwrap());
+	if invalid_terminal {
+		assert!(matches!(state, server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. } if mailbox_pk == unknown));
+		assert!(db.read(async |tx| Ok(tx.query_one("SELECT e.irreversible_facts->>'customer_key'='not-a-public-key' \
+			AND EXISTS(SELECT 1 FROM expiry_hold h WHERE h.vtxo_id=e.vtxo_id AND h.reason='terminal_ownership_invalid') \
+			AND NOT EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id) \
+			FROM expiry_entitlement e WHERE e.vtxo_id=$1", &[&held.id().to_string()],
+		).await?.get::<_, bool>(0))).await.unwrap());
+	} else {
+		assert_eq!(state, server::database::expiry_attribution::Attribution::Unresolved);
+		assert!(db.read(async |tx| Ok(tx.query_one("SELECT \
+			NOT EXISTS(SELECT 1 FROM owner_key WHERE user_pubkey=$1) \
+			AND NOT EXISTS(SELECT 1 FROM expiry_entitlement WHERE vtxo_id=$2)",
+			&[&unknown.to_string(), &held.id().to_string()],
+		).await?.get::<_, bool>(0))).await.unwrap());
+	}
 	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 		WHERE e.vtxo_id=ANY($1) AND c.active", &[&leaves.iter().map(|leaf| leaf.id().to_string()).collect::<Vec<_>>()],
