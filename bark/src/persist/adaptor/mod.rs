@@ -1031,7 +1031,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	}
 
 	async fn remove_fallback_receipt(&self, id: VtxoId) -> anyhow::Result<()> {
-		self.inner.write().await.delete(partition::FALLBACK_RECEIPT, &id.to_bytes()).await
+		self.inner.write().await.delete(partition::FALLBACK_RECEIPT, &id.to_bytes()).await.map(|_| ())
 	}
 
 

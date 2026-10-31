@@ -35,6 +35,7 @@ use crate::movement::{MovementDestination, MovementStatus};
 use crate::movement::update::MovementUpdate;
 use crate::subsystem::{ArkoorMovement, Subsystem};
 use crate::utils::ReconnectBackoff;
+use crate::vtxo::VtxoState;
 
 /// Key for the lock that serializes the arkoor receive dedup within a wallet.
 ///
