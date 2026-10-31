@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, trace, warn};
 
 use ark::lightning::{Invoice, PaymentHash, Preimage};
-use bitcoin_ext::BlockDelta;
+use bitcoin_ext::{AmountExt, BlockDelta};
 use cln_rpc::listpays_pays::ListpaysPaysStatus;
 
 use crate::database;
