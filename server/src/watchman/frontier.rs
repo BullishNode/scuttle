@@ -95,21 +95,25 @@ impl VtxoExitFrontier {
 			// in-memory frontier is rebuilt from the DB, restoring this VTXO entry.
 			// If the HTLC tx gets unconfirmed and re-confirmed in a reorg, settle()
 			// is called again but the DB insert is idempotent (ON CONFLICT DO NOTHING).
-			if let Some(preimage) = try_extract_preimage(&vtxo, witness) {
-				self.htlc_settler.settle(preimage).await
-					.context("failed to record HTLC settlement from on-chain spend")?;
-			}
+			let preimage = try_extract_preimage(&vtxo, witness);
 
 			let chain_resolution = classify_htlc_spend(&vtxo, witness);
-			self.db.write(async |t| {
+			let checkpoint = self.db.write(async |t| {
+				let checkpoint = if let Some(preimage) = preimage {
+					t.store_htlc_settlement_from(preimage,
+						crate::database::ln::HtlcSettlementOrigin::Onchain(vtxo_id)).await?
+				} else { None };
 				t.register_vtxo_spend(vtxo_id, spent_height, spent_txid).await?;
 				if let Some(resolution) = chain_resolution {
 					htlc_vtxo::set_htlc_vtxo_chain_resolution(
 						&t, vtxo_id, resolution, spent_height,
 					).await?;
 				}
-				Ok(())
+				Ok(checkpoint)
 			}).await?;
+			if let Some(preimage) = preimage {
+				self.htlc_settler.notify_stored(checkpoint, preimage.compute_payment_hash());
+			}
 
 			if let Some(resolution) = chain_resolution {
 				slog!(HtlcVtxoResolvedOnChain, vtxo_id, height: spent_height,

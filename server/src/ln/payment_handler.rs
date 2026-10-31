@@ -121,22 +121,27 @@ impl<'a> PaymentAttemptHandler<'a> {
 		final_amount_msat: Option<u64>,
 		preimage: Option<Preimage>,
 	) -> anyhow::Result<()> {
-		// Store the preimage in the settlement table so the
-		// watchman can use it to claim HTLC VTXOs on-chain.
+		// Native success is authoritative even when an optimistic status write
+		// loses its race. Its actual attempt provenance and WAL commit together.
 		if let Some(preimage) = preimage {
-			debug_assert!(
+			ensure!(
 				matches!(status, LightningPaymentStatus::Succeeded),
 				"payment is succeeded if preimage is known, not {}", status,
 			);
-			debug_assert!(
+			ensure!(
 				preimage.compute_payment_hash() == attempt.payment_hash,
 				"preimage must match payment hash",
 			);
-			settler.settle(preimage).await?;
 		}
 
-		let updated = self.db.write(async |t| {
-			t.lock_lightning_attempt_sources(attempt.id).await?;
+		let (updated, checkpoint) = self.db.write(async |t| {
+			let checkpoint = if let Some(preimage) = preimage {
+				t.store_htlc_settlement_from(preimage,
+					crate::database::ln::HtlcSettlementOrigin::Attempt(attempt.id)).await?
+			} else {
+				t.lock_settlement_sources(attempt.payment_hash).await?;
+				None
+			};
 			let updated = t.verify_and_update_payment_attempt(
 				attempt, status, payment_error, final_amount_msat
 			).await?;
@@ -170,8 +175,9 @@ impl<'a> PaymentAttemptHandler<'a> {
 				}
 			}
 
-			Ok(updated)
+			Ok((updated, checkpoint))
 		}).await?;
+		settler.notify_stored(checkpoint, attempt.payment_hash);
 
 		if updated {
 			trace!("Lightning payment attempt ({}): status updated to {} for payment hash {}.",

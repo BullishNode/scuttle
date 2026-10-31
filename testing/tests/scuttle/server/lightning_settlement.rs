@@ -21,6 +21,15 @@ async fn settled_spendable_htlcs_cannot_be_revoked() {
 	assert!(!sources.is_empty());
 	let ids = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	for source in &sources {
+		assert_eq!(db.read(async |tx| tx.source_settlement(hash, *source).await).await.unwrap(),
+			server::database::ln::SourceSettlement::Funded);
+		assert!(db.read(async |tx| Ok(tx.query_one("SELECT EXISTS(SELECT 1 FROM htlc_settlement_source p \
+			JOIN htlc_settlement s ON s.id=p.settlement_id \
+			JOIN lightning_payment_attempt_htlc_vtxo l ON l.lightning_payment_attempt_id=p.attempt_id \
+			WHERE s.payment_hash=$1 AND p.kind='attempt' AND l.vtxo_id=$2)",
+			&[&hash.to_string(), &source.to_string()]).await?.get::<_, bool>(0))).await.unwrap());
+	}
 	db.write(async |tx| {
 		assert!(tx.get_htlc_settlement_by_payment_hash(hash).await?.is_some());
 		assert_eq!(tx.execute("UPDATE lightning_payment_attempt SET status='failed',updated_at=NOW() WHERE payment_hash=$1",
@@ -39,6 +48,8 @@ async fn settled_spendable_htlcs_cannot_be_revoked() {
 	assert!(status.message().contains("invoice has already been paid"), "{status:?}");
 	assert!(!status.message().to_lowercase().contains("preimage"));
 	for id in sources {
+		assert_eq!(db.read(async |tx| tx.source_settlement(hash, id).await).await.unwrap(),
+			server::database::ln::SourceSettlement::Funded, "cached Failed must not erase authentic settlement origin");
 		let source = db.read(async |tx| tx.get_user_vtxo_by_id(id).await).await.unwrap();
 		assert_eq!(source.spend_state, server::database::SpendState::Spendable);
 		assert!(source.oor_spent_txid.is_none(), "refused revoke must not commit a refund spend");

@@ -1,6 +1,8 @@
 
 mod model;
 pub use model::*;
+mod settlement;
+pub use settlement::{HtlcSettlementOrigin, SourceSettlement};
 
 
 use std::str::FromStr;
@@ -931,6 +933,13 @@ impl<'t> Tx<'t> {
 		&self,
 		preimage: Preimage,
 	) -> anyhow::Result<Option<Checkpoint>> {
+		self.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Unknown).await
+	}
+
+	async fn store_htlc_settlement_wal(
+		&self,
+		preimage: Preimage,
+	) -> anyhow::Result<Option<Checkpoint>> {
 		let payment_hash = preimage.compute_payment_hash();
 
 		// ON CONFLICT DO NOTHING makes this idempotent: if an HTLC tx
@@ -1030,19 +1039,18 @@ impl<'t> Tx<'t> {
 		Ok(())
 	}
 
-	/// The sole sanctioned settlement gate for any fund-releasing path
-	/// (revocation, refund, re-issuing sender vtxos): errors with a
+	/// Conservative hash-level gate retained alongside the source predicate
+	/// until the source-specific release controls have passed: errors with a
 	/// [`BadArgument`](crate::error::BadArgument) if the invoice was already paid.
 	///
 	/// The `htlc_settlement` table is the single source of truth for
 	/// settlement. A preimage here means the payment completed, regardless of
 	/// [`LightningPaymentStatus`]: the node can settle without the status write
-	/// committing (a lost optimistic-lock race, or a crash between recording the
-	/// preimage and updating the status), so the status may still read
+	/// committing (for example a lost optimistic-lock race), so status may read
 	/// `Submitted`/`Failed` for a payment that actually went through. Never gate
 	/// a fund-releasing decision on the status; call this instead.
 	///
-	/// Call this INSIDE the write transaction that releases the funds so a
+	/// Hold the shared settlement lock INSIDE the write transaction so a
 	/// settlement racing between an earlier read-check and the write cannot
 	/// slip through.
 	pub async fn ensure_not_settled(

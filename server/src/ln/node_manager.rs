@@ -533,13 +533,17 @@ impl LightningManager {
 		payment_hash: PaymentHash,
 		source_ids: &[VtxoId],
 	) -> anyhow::Result<(PaymentStatus, Vec<VtxoId>)> {
-		let Some(outcome) = self.db.read(async |t|
-			t.lightning_payment_outcome(payment_hash, source_ids).await
-		).await? else { return Ok((PaymentStatus::Pending, Vec::new())); };
+		let (outcome, preimage) = self.db.write(async |t| {
+			t.lock_settlement_sources(payment_hash).await?;
+			t.lock_htlc_settlements().await?;
+			let outcome = t.lightning_payment_outcome(payment_hash, source_ids).await?;
+			let preimage = t.get_htlc_settlement_by_payment_hash(payment_hash).await?;
+			Ok((outcome, preimage))
+		}).await?;
+		let Some(outcome) = outcome else { return Ok((PaymentStatus::Pending, Vec::new())); };
 		let status = match outcome.state {
 			LightningSourceState::Discharged => {
-				let preimage = self.settler.is_settled(payment_hash).await?
-					.context("source-specific payment success has no preimage")?;
+				let preimage = preimage.context("source-specific payment success has no preimage")?;
 				PaymentStatus::Success(preimage)
 			},
 			LightningSourceState::Failed => PaymentStatus::Failed,

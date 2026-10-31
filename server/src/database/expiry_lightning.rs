@@ -9,7 +9,7 @@ use ark::lightning::PaymentHash;
 use bitcoin_ext::{BlockHeight, BlockRef};
 
 use super::{BlockTable, Tx};
-use super::ln::LightningPaymentStatus;
+use super::ln::{LightningPaymentStatus, SourceSettlement};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LightningSourceState {
@@ -106,6 +106,8 @@ impl Tx<'_> {
 	}
 
 	/// Keep a complete existing source scope, without inferring from hash siblings.
+	/// Called under source/settlement locks in a write transaction so unknown
+	/// provenance commits its alarmed hold even though the status stays Pending.
 	pub(crate) async fn lightning_payment_outcome(
 		&self, hash: PaymentHash, source_ids: &[VtxoId],
 	) -> anyhow::Result<Option<LightningPaymentOutcome>> {
@@ -133,7 +135,27 @@ impl Tx<'_> {
 		let statuses = attempts.values().filter(|(_, sources)| *sources == requested)
 			.map(|(status, _)| *status).collect::<Vec<_>>();
 		if statuses.is_empty() { return Ok(None); }
-		Ok(Some(LightningPaymentOutcome { sources: requested, state: source_state(statuses) }))
+		let state = source_state(statuses);
+		let mut all_funded = true;
+		let mut any_funded = false;
+		let mut unknown = false;
+		for source in &requested {
+			match self.source_settlement(hash, *source).await? {
+				SourceSettlement::Funded => any_funded = true,
+				SourceSettlement::NotSettled | SourceSettlement::Disjoint => all_funded = false,
+				SourceSettlement::Unknown => {
+					self.hold_unknown_settlement(*source).await?;
+					unknown = true;
+				},
+			}
+		}
+		// A cached failure cannot refund a source that paid. Conversely, a
+		// same-hash preimage from a disjoint source cannot prove its success.
+		let state = if unknown { LightningSourceState::Pending }
+			else if all_funded { LightningSourceState::Discharged }
+			else if any_funded || state == LightningSourceState::Discharged { LightningSourceState::Pending }
+			else { state };
+		Ok(Some(LightningPaymentOutcome { sources: requested, state }))
 	}
 }
 

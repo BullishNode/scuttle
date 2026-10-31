@@ -79,13 +79,19 @@ impl HtlcSettler {
 	}
 
 	/// Record a settlement: write preimage to the WAL table, notify watchers.
-	/// If this preimage was already recorded, this is a no-op.
+	/// An observation without an authentic source is retained as unknown.
 	pub async fn settle(&self, preimage: Preimage) -> anyhow::Result<()> {
-		if let Some(checkpoint) = self.db.write(async |t| t.store_htlc_settlement(preimage).await).await? {
-			slog!(HtlcSettled, payment_hash: preimage.compute_payment_hash());
+		let checkpoint = self.db.write(async |t| t.store_htlc_settlement(preimage).await).await?;
+		self.notify_stored(checkpoint, preimage.compute_payment_hash());
+		Ok(())
+	}
+
+	/// Notify only after the caller's provenance/status transaction committed.
+	pub(crate) fn notify_stored(&self, checkpoint: Option<Checkpoint>, hash: PaymentHash) {
+		if let Some(checkpoint) = checkpoint {
+			slog!(HtlcSettled, payment_hash: hash);
 			self.watch.update(checkpoint);
 		}
-		Ok(())
 	}
 
 	/// Check if a payment hash has been settled. Returns the preimage if so.
