@@ -220,7 +220,7 @@ async fn held_sibling(invalid_terminal: bool) {
 			// customer key makes only this terminal's ownership reader fail.
 			tx.execute("INSERT INTO expiry_entitlement(vtxo_id,gross_sat,irreversible_facts) VALUES($1,$2,$3::TEXT::JSONB)",
 				&[&held.id().to_string(), &10_000i64, &r#"{"kind":"pubkey","customer_key":"not-a-public-key"}"#]).await?;
-			tx.execute("UPDATE vtxo SET spend_state='Spent',updated_at=NOW() WHERE vtxo_id=$1", &[&held.id().to_string()]).await?;
+			tx.execute("UPDATE vtxo SET spend_state='spent',updated_at=NOW() WHERE vtxo_id=$1", &[&held.id().to_string()]).await?;
 		} else {
 			tx.execute("DELETE FROM owner_key WHERE user_pubkey=$1", &[&unknown.to_string()]).await?;
 		}
