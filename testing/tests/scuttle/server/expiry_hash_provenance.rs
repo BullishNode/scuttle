@@ -111,7 +111,7 @@ async fn same_hash_sources(cooperative_refund: bool) {
 			}).await.unwrap();
 			let held = db.read(async |t| t.propose_expiry_ownership(
 				fact, &funding, height, Some(height),
-			)).await.unwrap();
+			).await).await.unwrap();
 			assert!(matches!(held.disposition, OwnershipDisposition::Unresolved(_)));
 			assert!(held.settlement_integrity_hold, "cached Failed cannot authorize a paid-source refund or operator allocation");
 			db.write(async |t| {
