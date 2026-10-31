@@ -10,7 +10,8 @@ use std::time::Duration;
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::fees::VtxoFeeInfo;
 use ark::lightning::{PaymentHash, Preimage};
-use ark::{ProtocolEncoding, VtxoId, VtxoPolicy};
+use ark::{ProtocolEncoding, VtxoId, VtxoPolicy, SECP};
+use ark::vtxo::TapScriptClause;
 use bark::{LightningSendOptions, OpenWalletArgs, Wallet, WalletSeed};
 use bark::actions::lightning::pay::{LightningSendState, Progress};
 use bark::movement::MovementStatus;
@@ -21,7 +22,9 @@ use ark_testing::constants::BOARD_CONFIRMATIONS;
 use ark_testing::daemon::lightningd::Lightningd;
 use ark_testing::daemon::captaind::Captaind;
 use ark_testing::onchain::AppBip86Wallet;
-use bitcoin::{Amount, Network, OutPoint, Transaction};
+use bitcoin::{Amount, Network, OutPoint, Transaction, TxIn, TxOut, Witness};
+use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+use bitcoin::taproot::{LeafVersion, TapLeafHash};
 use bitcoin::consensus::deserialize;
 use bitcoin::hex::DisplayHex;
 use bitcoin::hashes::{sha256, Hash};
@@ -30,7 +33,7 @@ use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use cln_rpc::listpays_pays::ListpaysPaysStatus;
 use cln_rpc::plugins::hold;
 use server::database::Db;
-use server_log::{ArkFeeRecorded, XpayRpcReturned};
+use server_log::{ArkFeeRecorded, ExpiryHoldObserved, XpayRpcReturned};
 use server_rpc::protos;
 
 async fn remote_pays(node: &Lightningd, hash: PaymentHash) -> Vec<cln_rpc::ListpaysPays> {
@@ -104,8 +107,26 @@ async fn recorded_request_survives_crash_before_first_native_rpc() {
 		.expect("the genuine count-zero cut, automatic first send and original settlement tail must finish");
 }
 
+/// A real unavailable native endpoint refuses the original public intent,
+/// before any attempt is recorded; the fully signed HTLC remains revocable.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn native_preflight_refusal_leaves_original_htlc_revocable() {
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(true, false, false, RestartCut::PreflightRefusal)).await
+		.expect("preflight refusal and the normal signed revocation must finish");
+}
+
+/// The real committed count-zero request reaches its exact absolute source
+/// bound before the same app/store restarts. Height is not terminal authority.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recorded_count_zero_request_with_no_delay_room_stays_held() {
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(true, false, false, RestartCut::NoDelayRoom)).await
+		.expect("the original request's zero-room hold and retained unilateral path must finish");
+}
+
 #[derive(Clone, Copy)]
-enum RestartCut { None, QueuedNative, BeforeFirstRpc }
+enum RestartCut { None, QueuedNative, BeforeFirstRpc, PreflightRefusal, NoDelayRoom }
 
 async fn external_success_during_restart(routed: bool) {
 	external_success_with_fault(routed, false, false, RestartCut::None).await;
@@ -113,8 +134,12 @@ async fn external_success_during_restart(routed: bool) {
 
 async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadline: bool, restart: RestartCut) {
 	let zero_part_restart = matches!(restart, RestartCut::QueuedNative);
-	let count_zero_restart = matches!(restart, RestartCut::BeforeFirstRpc);
-	let ctx = TestContext::new(if count_zero_restart { "scuttle/count_zero_native_bark_crash_recovery" }
+	let no_delay_room = matches!(restart, RestartCut::NoDelayRoom);
+	let preflight_refusal = matches!(restart, RestartCut::PreflightRefusal);
+	let count_zero_restart = matches!(restart, RestartCut::BeforeFirstRpc | RestartCut::NoDelayRoom);
+	let ctx = TestContext::new(if no_delay_room { "scuttle/count_zero_no_delay_room" }
+		else if preflight_refusal { "scuttle/native_preflight_refusal_revocation" }
+		else if count_zero_restart { "scuttle/count_zero_native_bark_crash_recovery" }
 		else if zero_part_restart { "scuttle/zero_part_native_bark_crash_redrive" }
 		else if rpc_deadline { "scuttle/timed_out_rpc_that_later_completes_settles" }
 		else if plugin_fault { "scuttle/coded_xpay_error_own_pending" }
@@ -250,8 +275,67 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 		mailbox_id: (routed || plugin_fault || rpc_deadline || zero_part_restart).then(|| mailbox.mailbox().serialize()), retry_for_secs: Some(5),
 	};
 	#[cfg(target_os = "linux")]
+	if preflight_refusal {
+		let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+		let before = super::owner_helpers::source_rows(&db, &sources).await;
+		let refused = Arc::new(Mutex::new(false));
+		let observed = refused.clone();
+		srv.add_stdout_handler(move |line: &str| {
+			if line.contains("payment refused before recording an attempt") { *observed.lock().unwrap() = true; }
+			false
+		});
+		// This changes only the real owned daemon's availability. The proxy
+		// never substitutes an error or a financial/native status.
+		lightning.internal.stop().await.unwrap();
+		let response = rpc.initiate_lightning_payment(request).await;
+		tokio::fs::write(ctx.datadir.join("preflight-public-reply.json"), serde_json::to_vec_pretty(
+			&serde_json::json!({ "accepted":response.is_ok(), "code":response.as_ref().err().map(|e|format!("{:?}",e.code())) })
+		).unwrap()).await.unwrap();
+		assert_eq!(response.expect_err("the real unavailable native endpoint must refuse before attempt").code(), tonic::Code::Internal);
+		tokio::time::timeout(Duration::from_secs(10), async {
+			while !*refused.lock().unwrap() { tokio::time::sleep(Duration::from_millis(20)).await; }
+		}).await.expect("the real RPC log must identify PaymentPreflightRefusal, not an unrelated error");
+		let counts = db.read(async |tx| Ok(tx.query_one("SELECT \
+			(SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$1), \
+			(SELECT COUNT(*) FROM cln_xpay WHERE payment_hash=$1), \
+			(SELECT COUNT(*) FROM lightning_payment_attempt_htlc_vtxo WHERE vtxo_id=$2), \
+			(SELECT COUNT(*) FROM mailbox WHERE payment_hash=$1), \
+			(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$2)",
+			&[&hash.to_string(), &sources[0].to_string()]).await?)).await.unwrap();
+		for column in 0..5 { assert_eq!(counts.get::<_, i64>(column), 0); }
+		assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+		assert_eq!(super::owner_helpers::source_rows(&db, &sources).await, before);
+		let source = &grants[0];
+		let key = client.get_vtxo_key(source).await.unwrap();
+		let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints([source.clone()],
+			VtxoPolicy::new_pubkey(key.public_key())).unwrap().generate_user_nonces(&[key]).unwrap();
+		let reply = rpc.request_lightning_pay_htlc_revocation(super::signed_package(&srv, &[&client],
+			protos::ArkoorPackageCosignRequest::from(builder.cosign_request())).await).await.unwrap().into_inner();
+		let refund = builder.user_cosign(&[key], ArkoorPackageCosignResponse::try_from(reply).unwrap())
+			.unwrap().build_signed_vtxos();
+		assert_eq!(refund.len(), 1);
+		assert_eq!(refund[0].amount(), source_amount, "the refused preflight earns no send fee or principal");
+		client.register_vtxo_transactions_with_server(&refund).await.unwrap();
+		let state = db.read(async |tx| server::database::htlc_vtxo::get_htlc_vtxo(tx, source.id()).await).await.unwrap().unwrap();
+		assert_eq!(state.htlc.offchain_resolution, Some(server::database::htlc_vtxo::HtlcResolution::Revoked));
+		let registered = db.read(async |tx| tx.get_user_vtxos_by_id(&[refund[0].id()]).await).await.unwrap();
+		assert_eq!(registered.len(), 1);
+		registered[0].check_spendable(ctx.bitcoind().sync_client().tip().unwrap().height).unwrap();
+		assert!(refund[0].has_all_witnesses());
+		refund[0].validate(&ctx.bitcoind().await_transaction(refund[0].chain_anchor().txid).await).unwrap();
+		// Normal same-store reopening permits an honest native readback. No
+		// public payment is replayed and no receiver action pays this invoice.
+		lightning.internal.start().await.unwrap();
+		assert!(remote_pays(&lightning.internal, hash).await.is_empty());
+		assert!(lightning.internal.grpc_client().await.list_send_pays(cln_rpc::ListsendpaysRequest {
+			payment_hash:Some(hash.to_vec()), ..Default::default()
+		}).await.unwrap().into_inner().payments.is_empty());
+		assert!(ctx.bitcoind().get_block_count().await - first_height <= 96);
+		return; // Raw RPC/refund scope, not a claim that the SDK hard-aborted.
+	}
+	#[cfg(target_os = "linux")]
 	if count_zero_restart {
-		let result = crash_before_first_native_rpc(&ctx, &srv, &lightning.internal, receiving_node, hash, &sources, request).await;
+		let result = crash_before_first_native_rpc(&ctx, &srv, &lightning.internal, receiving_node, hash, &sources, request, no_delay_room).await;
 		let record = match &result {
 			Ok(record) => record.clone(),
 			Err(error) => {
@@ -262,6 +346,46 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 		tokio::fs::write(ctx.datadir.join("count-zero-native-recovery.json"), serde_json::to_vec_pretty(&record).unwrap()).await.unwrap();
 		result.unwrap();
 		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 0).await;
+		if no_delay_room {
+			// The negative case must not enter the genuine-payment success tail.
+			// Retain the owner's real signed path without manufacturing Failed.
+			srv.watchmand().stop().await.unwrap();
+			let source = &grants[0];
+			let key = client.get_vtxo_key(source).await.unwrap();
+			let mut seen = BTreeSet::new();
+			super::expiry_internal_partial_terminal::confirm_actual_path(&ctx, source, &mut seen).await;
+			let clause = source.policy().as_server_htlc_send().unwrap().user_claim_after_expiry_clause(source.exit_delta());
+			let height = ctx.bitcoind().get_block_count().await as u32;
+			let target = clause.timelock_height.to_u32().max(height + source.exit_delta().to_u32());
+			ctx.generate_blocks(target - height).await;
+			let mut claim = Transaction {
+				version: bitcoin::transaction::Version::TWO,
+				lock_time: bitcoin::absolute::LockTime::from_height(clause.timelock_height.to_u32()).unwrap(),
+				input: vec![TxIn { previous_output:source.point(), script_sig:Default::default(), sequence:clause.sequence(), witness:Witness::new() }],
+				output: vec![TxOut { value:source.amount()-sat(2_000), script_pubkey:destination.clone() }],
+			};
+			let sighash = SighashCache::new(&claim).taproot_script_spend_signature_hash(0,
+				&Prevouts::All(&[source.txout()]), TapLeafHash::from_script(&clause.tapscript(), LeafVersion::TapScript),
+				TapSighashType::Default).unwrap();
+			claim.input[0].witness = clause.witness(&SECP.sign_schnorr(&sighash.into(), &key), &clause.control_block(source));
+			let accepted = ctx.bitcoind().sync_client().test_mempool_accept(&[&claim]).unwrap();
+			assert!(accepted[0].allowed, "the exact source's real timeout path must remain valid");
+			tokio::fs::write(ctx.datadir.join("no-room-unilateral-acceptance.json"), serde_json::to_vec_pretty(
+				&serde_json::json!({"source":source.id().to_string(),"claim_txid":claim.compute_txid().to_string(),
+					"allowed":accepted[0].allowed,"source_sat":source.amount().to_sat(),"claim_fee_sat":2_000,
+					"output_sat":claim.output[0].value.to_sat(),"scope":"Core acceptance only; no broadcast, terminal native outcome or N6 withdrawal"})
+			).unwrap()).await.unwrap();
+			let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+			let held = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
+			assert!(!held.status.is_final());
+			assert!(held.final_amount_msat.is_none());
+			let requests = db.read(async |tx| server::database::xpay::get_xpays_by_payment_hash(&**tx, hash).await).await.unwrap();
+			assert_eq!(requests.len(), 1);
+			assert_eq!(requests[0].dispatch_count, Some(0));
+			assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+			assert!(ctx.bitcoind().get_block_count().await - first_height <= 96);
+			return;
+		}
 	} else {
 		rpc.initiate_lightning_payment(request).await.unwrap();
 	}
@@ -926,7 +1050,7 @@ async fn observe_queued_redrive(
 #[cfg(target_os = "linux")]
 async fn crash_before_first_native_rpc(
 	ctx: &TestContext, srv: &Captaind, node: &Lightningd, recipient: &Lightningd,
-	hash: PaymentHash, sources: &[VtxoId], request: protos::InitiateLightningPaymentRequest,
+	hash: PaymentHash, sources: &[VtxoId], request: protos::InitiateLightningPaymentRequest, no_delay_room: bool,
 ) -> anyhow::Result<serde_json::Value> {
 	const LATCH_CLASS: i32 = 0x5343544c;
 	const LATCH_OBJECT: i32 = 1;
@@ -1058,6 +1182,96 @@ async fn crash_before_first_native_rpc(
 			.context("original public request did not finish after its owned app was reaped")??;
 		let reply = match reply { Ok(_) => "ok".to_owned(), Err(error) => format!("{:?}", error.code()) };
 		ensure!(node.native_child().await? == native, "crash cut restarted the native node");
+		if no_delay_room {
+			let bound = record.htlc_expiry.context("the genuine count-zero request has no original source bound")?;
+			let current = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+			ensure!(bound > current, "MISSED_TARGET: no positive original room before the real cut");
+			let eligible = db.read(async |tx| tx.get_user_vtxos_by_id(sources).await).await?;
+			ensure!(eligible.len() == sources.len(), "a retained source disappeared");
+			for source in eligible {
+				ensure!(source.vtxo.expiry_height() > bound, "MISSED_TARGET: coin expiry would mask the zero-room predicate");
+				source.check_htlc_send_spendable(bound)?;
+			}
+			let ids = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
+			let prior = db.read(async |tx| Ok(tx.query_one("SELECT \
+				(SELECT COUNT(*) FROM expiry_hold WHERE vtxo_id=ANY($1)), \
+				(SELECT COUNT(*) FROM expiry_allocation_input WHERE vtxo_id=ANY($1))", &[&ids]).await?)).await?;
+			ensure!(prior.get::<_,i64>(0)==0 && prior.get::<_,i64>(1)==0,
+				"MISSED_TARGET: an existing hold or allocation would mask the zero-room predicate");
+			// Normal all-node mining waits for captaind; it is intentionally
+			// reaped here. Mine only to the ACTUAL retained bound, then observe.
+			ctx.generate_blocks_unsynced(bound.checked_blocks_since(current).unwrap()).await;
+			node.wait_for_block(bound).await;
+			ensure!(BlockHeight::new(ctx.bitcoind().get_block_count().await as u32) == bound,
+				"the zero-room test must observe equality, not a later-height rejection");
+			srv.start().await?;
+			let cap_after = srv.native_child().await?;
+			ensure!(cap_after != cap_before, "same-store start did not create a new owned app child");
+			let mut alarms = srv.subscribe_log::<ExpiryHoldObserved>();
+			ctx.await_block_count_sync().await;
+			let info = node.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await?.into_inner();
+			ensure!(info.blockheight == bound.to_u32(), "native tip did not reach the actual recorded bound");
+			let hold = tokio::time::timeout(Duration::from_secs(40), async {
+				loop {
+					let rows = db.read(async |tx| server::database::xpay::get_xpays_by_payment_hash(&**tx, hash).await).await?;
+					ensure!(rows == vec![record.clone()], "zero room changed or admitted the original count-zero request");
+					let state = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await?.context("held attempt missing")?;
+					ensure!(state.id == original.id && state.lightning_node_id == original.lightning_node_id
+						&& state.payment_hash == original.payment_hash && state.amount_msat == original.amount_msat
+						&& state.final_amount_msat == original.final_amount_msat && state.status == original.status
+						&& state.lightning_htlc_subscription_id == original.lightning_htlc_subscription_id
+						&& state.error == original.error && state.block_height == original.block_height
+						&& state.user_fee == original.user_fee && state.user_agent == original.user_agent
+						&& state.retry_for == original.retry_for && state.max_routing_fee == original.max_routing_fee
+						&& state.created_at == original.created_at && state.updated_at == original.updated_at,
+						"elapsed height or missing native record altered the original attempt");
+					let held = db.read(async |tx| Ok(tx.query_opt("SELECT reason FROM expiry_hold WHERE vtxo_id=$1", &[&sources[0].to_string()]).await?
+						.map(|row|row.get::<_,String>(0)))).await?;
+					if let Some(reason) = held {
+						ensure!(reason == "lightning_dispatch_unqualified", "another hold masked the exact zero-room branch");
+						break Ok::<_,anyhow::Error>(reason);
+					}
+					tokio::time::sleep(Duration::from_millis(20)).await;
+				}
+			}).await.context("the normal monitor did not hold the exhausted original request")??;
+			let alarm = tokio::time::timeout(Duration::from_secs(10), async {
+				loop {
+					let alarm = alarms.recv().await.context("expiry hold alarm stream closed")?;
+					if alarm.vtxo_id == sources[0] { break Ok::<_,anyhow::Error>(alarm); }
+				}
+			}).await.context("the real zero-room hold emitted no operator alarm")??;
+			ensure!(alarm.reason == hold, "durable hold and emitted alarm differ");
+			tokio::time::timeout(Duration::from_secs(10), async {
+				loop {
+					let original_log = tokio::fs::read_to_string(ctx.datadir.join("server/stdout.log")).await?;
+					if original_log.lines().any(|line| line.contains("Could not qualify native xpay dispatch; retaining custody without dispatch")
+						&& line.contains("no source delay remains before xpay dispatch") && line.contains(&hash.to_string())) {
+						break Ok::<_,anyhow::Error>(());
+					}
+					tokio::time::sleep(Duration::from_millis(20)).await;
+				}
+			}).await.context("another qualification failure masked the exact zero-room predicate")??;
+			ensure!(remote_pays(node, hash).await.is_empty() && node.grpc_client().await.list_send_pays(cln_rpc::ListsendpaysRequest {
+				payment_hash:Some(hash.to_vec()), ..Default::default()
+			}).await?.into_inner().payments.is_empty(), "the exhausted count-zero request gained a native payment or part");
+			ensure!(logs.lock().unwrap().payments.is_empty(), "zero room called native Xpay");
+			ensure!(super::owner_helpers::source_rows(&db, sources).await == source_rows, "no-room source custody changed");
+			ensure!(node.native_child().await? == native && normal_channels(node).await? == channels,
+				"native process/store/channel continuity changed");
+			ensure!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await?.is_none(), "held source gained a preimage");
+			let ids = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
+			let counts = db.read(async |tx| Ok(tx.query_one("SELECT \
+				(SELECT COUNT(*) FROM mailbox WHERE payment_hash=$1), \
+				(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($2))",
+				&[&hash.to_string(), &ids]).await?)).await?;
+			ensure!(counts.get::<_,i64>(0)==0 && counts.get::<_,i64>(1)==0, "zero room emitted terminal mail or allocated a refund");
+			return Ok(serde_json::json!({"disposition":"COUNT_ZERO_NO_ROOM_HELD","payment_hash":hash.to_string(),
+				"attempt":original.id,"label":original.id.to_string(),"recorded_bound":bound.to_u32(),"native_tip":info.blockheight,
+				"dispatch_count_before":record.dispatch_count,"dispatch_count_after":record.dispatch_count,"hold":hold,
+				"alarm_observed":true,"original_public_reply":reply,"crashed_captaind":cap_before,"restarted_captaind":cap_after,
+				"native_process":native,"native_observations":logs.lock().unwrap().clone(),
+				"scope":"real public count-zero request, exact zero room, no native call or terminal release"}));
+		}
 		srv.start().await?;
 		let cap_after = srv.native_child().await?;
 		ensure!(cap_after != cap_before, "same-store start did not create a new owned app child");
