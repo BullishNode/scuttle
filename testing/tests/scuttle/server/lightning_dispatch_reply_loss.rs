@@ -75,16 +75,26 @@ async fn recovery_records_its_native_routing_fee() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn coded_xpay_error_retains_its_own_pending_payment() {
-	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, true)).await
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, true, false)).await
 		.expect("the native plugin fault and original settlement tail must finish");
 }
 
-async fn external_success_during_restart(routed: bool) {
-	external_success_with_fault(routed, false).await;
+/// One real held invoice covers both release of the deadline-bound unary
+/// waiter and later settlement of its original native part without replay.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn timed_out_rpc_that_later_completes_settles() {
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, false, true)).await
+		.expect("the genuine deadline, Pending custody and late completion must finish");
 }
 
-async fn external_success_with_fault(routed: bool, plugin_fault: bool) {
-	let ctx = TestContext::new(if plugin_fault { "scuttle/coded_xpay_error_own_pending" }
+async fn external_success_during_restart(routed: bool) {
+	external_success_with_fault(routed, false, false).await;
+}
+
+async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadline: bool) {
+	let ctx = TestContext::new(if rpc_deadline { "scuttle/timed_out_rpc_that_later_completes_settles" }
+		else if plugin_fault { "scuttle/coded_xpay_error_own_pending" }
 		else if routed { "server/recovery_records_its_native_routing_fee" }
 		else { "server/recovery_binds_restarted_payment_success_to_source" }).await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -201,10 +211,10 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool) {
 		min_final_cltv_expiry: Some(18), expiry: Some(3600), routing_hints: vec![],
 	}).await.unwrap().into_inner().bolt11;
 	lightning.sync().await;
-	let mut xpay_returned = plugin_fault.then(|| srv.subscribe_log::<XpayRpcReturned>());
+	let mut xpay_returned = (plugin_fault || rpc_deadline).then(|| srv.subscribe_log::<XpayRpcReturned>());
 	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 100_000, htlc_vtxo_ids: vec![sources[0].to_bytes().to_vec()],
-		mailbox_id: (routed || plugin_fault).then(|| mailbox.mailbox().serialize()), retry_for_secs: Some(5),
+		mailbox_id: (routed || plugin_fault || rpc_deadline).then(|| mailbox.mailbox().serialize()), retry_for_secs: Some(5),
 	}).await.unwrap();
 	receiving_node.wait_for_hold_invoice_accepted(hash).await;
 	drop(client);
@@ -237,6 +247,80 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool) {
 		assert!(part.created_index > 0);
 		Some((part.id, part.groupid, part.partid, part.created_index))
 	} else { None };
+	#[cfg(target_os = "linux")]
+	if rpc_deadline {
+		let original_parts = pending_parts(&lightning.internal, hash, &label).await.unwrap();
+		let before_deadline = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
+		assert_eq!(before_deadline.id, attempt);
+		assert_eq!(before_deadline.status, server::database::ln::LightningPaymentStatus::Requested,
+			"MISSED_TARGET: the original xpay waiter was no longer held before the deadline");
+		let event = tokio::time::timeout(Duration::from_secs(30), async {
+			loop {
+				let event = xpay_returned.as_mut().unwrap().recv().await.unwrap();
+				if event.payment_hash == hash { break event; }
+			}
+		}).await.expect("the actual xpay unary deadline did not release its waiter");
+		let error = event.error.as_deref().expect("a held payment cannot complete before the receiver settles");
+		assert!(error.contains("deadline") || error.contains("Timeout expired"),
+			"MISSED_TARGET: this is not the actual gRPC deadline: {error}");
+		assert!(!error.contains("RpcError {"), "a native coded error is not deadline evidence");
+		// Only the normal monitor can advance this still-unpaid attempt after
+		// the timed-out call drops the existing dispatch guard. No restart,
+		// second dispatch, status write or receiver settlement releases it.
+		tokio::time::timeout(Duration::from_secs(10), async {
+			loop {
+				let row = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
+				assert_eq!(row.id, attempt);
+				assert!(!row.status.is_final());
+				assert!(row.error.is_none());
+				if row.status == server::database::ln::LightningPaymentStatus::Submitted { break; }
+				tokio::time::sleep(Duration::from_millis(20)).await;
+			}
+		}).await.expect("the timed-out call kept the dispatch waiter locked");
+		assert_eq!(pending_parts(&lightning.internal, hash, &label).await.unwrap(), original_parts);
+		assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+		let ledger = db.read(async |tx| Ok(tx.query_one("SELECT status::TEXT,error_code FROM cln_xpay WHERE label=$1",
+			&[&label]).await?)).await.unwrap();
+		assert_eq!(ledger.get::<_, &str>("status"), "pending");
+		assert!(ledger.get::<_, Option<i32>>("error_code").is_none());
+		assert_one_source_dispatch(&db, hash, &sources, attempt, &label, false, user_fee).await;
+		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 0).await;
+
+		// Genuine late completion of the SAME native part, with the product
+		// still running. A deadline is neither cancellation nor refund proof.
+		receiver.settle(hold::SettleRequest { payment_preimage: preimage.to_vec() }).await.unwrap();
+		tokio::time::timeout(Duration::from_secs(30), async {
+			loop {
+				let row = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
+				assert_eq!(row.id, attempt);
+				assert_ne!(row.status, server::database::ln::LightningPaymentStatus::Failed);
+				if row.status == server::database::ln::LightningPaymentStatus::Succeeded { break; }
+				tokio::time::sleep(Duration::from_millis(20)).await;
+			}
+		}).await.expect("the original native part's late completion did not settle");
+		assert_eq!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
+		let paid = remote_pays(&lightning.internal, hash).await;
+		assert_eq!(paid.len(), 1);
+		assert_eq!(paid[0].status(), ListpaysPaysStatus::Complete);
+		assert_eq!(paid[0].label.as_deref(), Some(label.as_str()));
+		assert_eq!(paid[0].preimage.as_deref(), Some(preimage.as_ref()));
+		assert_eq!(paid[0].amount_msat.as_ref().unwrap().msat, 100_000_000);
+		assert_eq!(paid[0].amount_sent_msat.as_ref().unwrap().msat, 100_000_000);
+		let parts = lightning.internal.grpc_client().await.list_send_pays(cln_rpc::ListsendpaysRequest {
+			payment_hash: Some(hash.to_vec()), ..Default::default()
+		}).await.unwrap().into_inner().payments;
+		assert_eq!(parts.len(), original_parts.len());
+		for part in parts {
+			assert_eq!(part.status(), cln_rpc::listsendpays_payments::ListsendpaysPaymentsStatus::Complete);
+			assert_eq!(part.payment_hash, hash.to_vec());
+			assert_eq!(part.label.as_deref(), Some(label.as_str()));
+			assert_eq!(part.payment_preimage.as_deref(), Some(preimage.as_ref()));
+			assert!(original_parts.iter().any(|old| old["id"] == part.id && old["group"] == part.groupid
+				&& old["part"] == serde_json::json!(part.partid) && old["created_index"] == part.created_index));
+		}
+		assert_one_source_dispatch(&db, hash, &sources, attempt, &label, true, user_fee).await;
+		return;
+	}
 	let mut fault_target = None;
 	#[cfg(target_os = "linux")]
 	if plugin_fault {

@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, trace, warn};
 
 use ark::lightning::{Invoice, PaymentHash, Preimage};
-use bitcoin_ext::{AmountExt, BlockDelta};
+use bitcoin_ext::{AmountExt, BlockDelta, BlockHeight};
 use cln_rpc::listpays_pays::ListpaysPaysStatus;
 
 use crate::database;
@@ -129,17 +129,22 @@ impl ClnXpayClient {
 		let qualified = match self.prepare_call(&mut rpc, &attempt, &request, payment_amount, retry_for).await {
 			Ok(qualified) => qualified,
 			Err(error) => {
+				// No Xpay was called. The existing monitor cannot resume this
+				// queued work from an empty lookup; recovery is a separate
+				// liveness gap, not authority to fail or replay an unknown call.
 				error!(attempt_id, %payment_hash, %error,
 					"Could not qualify native xpay dispatch; retaining custody without dispatch");
 				return;
 			},
 		};
+		// Use the exact request after the dispatch-time height bound; the
+		// queued relative budget can only shrink, never extend its deadline.
+		let request = qualified.request.clone();
 		// Only place CLN says whether the route was pruned on cost or on delay.
 		// A route it never found leaves no `listpays` record either, so
 		// dropping this loses the reason entirely.
 		let result = call_xpay(
-			&mut rpc, &invoice, payment_amount, max_routing_fee, max_cltv_expiry_delta,
-			&request,
+			&mut rpc, &invoice, payment_amount, max_routing_fee, &request,
 		).await;
 		// Only the reply to this exact live call can create this receipt. A
 		// stored error, mirror, empty lookup or monitor invocation cannot.
@@ -227,12 +232,20 @@ impl ClnXpayClient {
 			config: "xpay-slow-mode".into(), val: Some("true".into()), transient: Some(false),
 		}).await?.into_inner();
 		ensure!(slow_mode_ack(&ack), "native xpay-slow-mode acknowledgement is missing or inconsistent");
-		let records = self.db.read(async |t| xpay::get_xpays_by_payment_hash(&**t, attempt.payment_hash).await).await?;
+		let (records, server_tip) = self.db.read(async |t| Ok((
+			xpay::get_xpays_by_payment_hash(&**t, attempt.payment_hash).await?,
+			t.get_highest_block(database::BlockTable::Captaind).await?.map(|block| block.height),
+		))).await?;
 		let mut records = records.into_iter().filter(|r| r.status == ClnXpayStatus::Pending);
 		let record = records.next().context("missing original pending xpay call")?;
 		ensure!(records.next().is_none(), "multiple pending xpay calls");
-		ensure!(request_matches(&record, attempt, request, amount, retry_for), "xpay request differs from its original attempt/label");
-		Ok(QualifiedCall { record, request: request.clone(), info, ack })
+		let attempt_height = attempt.block_height.context("xpay attempt has no recorded height")?;
+		let available = maxdelay_until(record.htlc_expiry.context("xpay call has no source deadline")?,
+			BlockHeight::new(info.blockheight), server_tip.unwrap_or(attempt_height), attempt_height)?;
+		let mut request = request.clone();
+		request.maxdelay = Some(request.maxdelay.context("xpay call has no original maxdelay")?.min(available.to_u32()));
+		ensure!(request_matches(&record, attempt, &request, amount, retry_for), "xpay request differs from its original attempt/label");
+		Ok(QualifiedCall { record, request, info, ack })
 	}
 
 	/// Stores the xpay error on `attempt` and returns it as stored, so later
@@ -659,6 +672,7 @@ impl QualifiedCall {
 				"localinvreqid": self.request.localinvreqid, "dev_use_shadow": self.request.dev_use_shadow },
 			"payment_hash": self.record.payment_hash.to_string(),
 			"payment_amount_msat": self.record.payment_amount_msat,
+			"rpc_deadline_secs": self.request.retry_for.map(|retry| u64::from(retry) + XPAY_TIMEOUT_BUFFER.as_secs()),
 			"original_attempt_expiry": self.record.attempt_expiry.to_rfc3339(),
 			"original_htlc_expiry": self.record.htlc_expiry.map(|h| h.to_u32()),
 			"native_reply": error.downcast_ref::<tonic::Status>().expect("native reply").message(),
@@ -697,6 +711,16 @@ impl NativeNoRoute {
 			"native completion lost the pending ledger update");
 		Ok(())
 	}
+}
+
+/// Bound a relative native request by its original absolute source deadline.
+/// Neither CLN lag nor time spent waiting to dispatch can enlarge that budget.
+fn maxdelay_until(
+	deadline: BlockHeight, cln_tip: BlockHeight, server_tip: BlockHeight, attempt_height: BlockHeight,
+) -> anyhow::Result<BlockDelta> {
+	let tip = cln_tip.max(server_tip).max(attempt_height);
+	let blocks = deadline.checked_blocks_since(tip).context("source deadline passed before xpay dispatch")?;
+	Ok(BlockDelta::try_from(blocks).unwrap_or(BlockDelta::MAX))
 }
 
 fn qualified_node(info: &cln_rpc::GetinfoResponse, pubkey: PublicKey, network: Network) -> bool {
@@ -798,7 +822,6 @@ async fn call_xpay(
 	invoice: &Invoice,
 	payment_amount: Amount,
 	max_routing_fee: Amount,
-	max_cltv_expiry_delta: BlockDelta,
 	request: &cln_rpc::XpayRequest,
 ) -> anyhow::Result<Preimage> {
 	let payment_hash = invoice.payment_hash();
@@ -806,10 +829,19 @@ async fn call_xpay(
 	slog!(XpayRpcCalled,
 		payment_hash, payment_amount, max_routing_fee,
 		invoice: invoice.to_string(),
-		max_delay: max_cltv_expiry_delta.to_u32(),
+		max_delay: request.maxdelay.context("xpay request has no maxdelay")?,
 	);
 
-	let pay_result = rpc.xpay(request.clone()).await;
+	// The unary deadline releases this waiter, not the native payment. CLN
+	// may retain its parts and complete after this future/HTTP2 stream ends.
+	let deadline = Duration::from_secs(request.retry_for.context("xpay request has no retry time")?.into())
+		+ XPAY_TIMEOUT_BUFFER;
+	let mut rpc_request = tonic::Request::new(request.clone());
+	rpc_request.set_timeout(deadline);
+	let pay_result = match tokio::time::timeout(deadline, rpc.xpay(rpc_request)).await {
+		Ok(result) => result,
+		Err(_) => Err(tonic::Status::deadline_exceeded("xpay RPC deadline elapsed; native payment remains unresolved")),
+	};
 
 	let result = match pay_result {
 		Err(e) => Err(e.into()),
@@ -834,6 +866,15 @@ async fn call_xpay(
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	#[test]
+	fn maxdelay_is_bounded_by_every_observed_or_recorded_height() {
+		let height = BlockHeight::new;
+		assert_eq!(maxdelay_until(height(200), height(90), height(120), height(110)).unwrap(), BlockDelta::new(80));
+		assert_eq!(maxdelay_until(height(200), height(130), height(120), height(110)).unwrap(), BlockDelta::new(70));
+		assert_eq!(maxdelay_until(height(200), height(90), height(120), height(140)).unwrap(), BlockDelta::new(60));
+		assert!(maxdelay_until(height(200), height(90), height(201), height(110)).is_err());
+	}
 
 	#[test]
 	fn is_cln_error_tells_cln_errors_from_transport_errors() {
