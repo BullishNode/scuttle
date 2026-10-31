@@ -11,11 +11,15 @@ async fn forwarded_claim_refusals_leave_the_native_payer_uncollected() {
 	let other = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	super::expiry_admission::unmapped_owner_link(&srv, &other, &other).await;
 	let checked = Arc::new(AtomicBool::new(false));
+	let prepare_checked = Arc::new(AtomicBool::new(false));
+	let prepare_wallet = Arc::new(std::sync::OnceLock::new());
 	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	let proxy = srv.start_proxy_no_mailbox(CheckClaim { wallet: recipient.clone(), db,
 		server: srv.mailbox_keypair(), other_mailbox: other,
-		hold: lightning.internal.hold_client().await, native_payment: true, checked: checked.clone() }).await;
+		hold: lightning.internal.hold_client().await, native_payment: true, checked: checked.clone(),
+		prepare_wallet: Some(prepare_wallet.clone()), prepare_checked: prepare_checked.clone() }).await;
 	let provider = ctx.bark_sdk("claimant", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
+	assert!(prepare_wallet.set(provider.clone()).is_ok());
 	assert_ne!(provider.mailbox_identifier(), recipient.mailbox_identifier());
 	let invoice = provider.bolt11_invoice_for_address(sat(50_000), address.clone(), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
@@ -25,6 +29,7 @@ async fn forwarded_claim_refusals_leave_the_native_payer_uncollected() {
 	}).await.unwrap();
 	paid.unwrap(); claimed.unwrap();
 	assert!(checked.load(Ordering::SeqCst));
+	assert!(prepare_checked.load(Ordering::SeqCst), "the actual cached HtlcsReady grant must reject all prepare probes before collection");
 	recipient.sync_mailbox().await.unwrap();
 	assert_eq!(recipient.balance().await.unwrap().spendable, sat(50_000));
 	assert_eq!(provider.balance().await.unwrap().spendable, Amount::ZERO);

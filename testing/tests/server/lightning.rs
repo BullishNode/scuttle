@@ -2011,6 +2011,7 @@ async fn server_claim_lightning_receive_is_idempotent(
 		wallet: bark.client().await, db, server: srv.mailbox_keypair(),
 		other_mailbox: other,
 		hold: _lightning.internal.hold_client().await, native_payment: false, checked: checked.clone(),
+		prepare_wallet: None, prepare_checked: Arc::new(AtomicBool::new(false)),
 	}).await;
 	bark.set_ark_url(&proxy.address).await;
 	let invoice_info = bark.bolt11_invoice(btc(1)).await;
