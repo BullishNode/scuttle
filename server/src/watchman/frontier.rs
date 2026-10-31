@@ -11,7 +11,7 @@ use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 use ark::vtxo::policy::clause::{HashDelaySignClause, HashDelaySignClause_v0, TapScriptClause};
 use bitcoin_ext::BlockHeight;
 
-use crate::database::Db;
+use crate::database::{Db, Tx};
 use crate::database::htlc_vtxo::{self, HtlcResolution};
 use crate::ln::settler::HtlcSettler;
 use crate::sync::{BlockData, ChainEventListener, RawMempool};
@@ -329,24 +329,18 @@ impl ChainEventListener for Arc<RwLock<VtxoExitFrontier>> {
 		Ok(())
 	}
 
-	async fn on_reorg(&self, block_ref: bitcoin_ext::BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, tx: &Tx<'_>, block_ref: bitcoin_ext::BlockRef) -> anyhow::Result<()> {
+		tx.reorg_frontier(block_ref.height).await?;
+		htlc_vtxo::clear_htlc_vtxo_chain_resolutions_above(tx, block_ref.height).await?;
+		Ok(())
+	}
+
+	async fn on_reorg_committed(&self, _block_ref: bitcoin_ext::BlockRef) -> anyhow::Result<()> {
+		// No connection is retained while waiting for the cache lock. A full
+		// reload includes newly registered entries as well as restored spends.
 		let mut frontier = self.write().await;
-
-		// Sync any vtxos added to the DB frontier since the last block
-		// (e.g. by finish_round, register_board, vtxopool) so that spend
-		// detection below works correctly for all frontier entries.
-		frontier.sync_new_vtxos_from_db().await?;
-
-		// Rollback all transactions that ocurred above this block
-		frontier.db.write(async |t| {
-			t.reorg_frontier(block_ref.height).await?;
-			htlc_vtxo::clear_htlc_vtxo_chain_resolutions_above(&t, block_ref.height).await?;
-			Ok(())
-		}).await?;
-
-		// Reload in-memory frontier
 		frontier.reload().await?;
-
+		frontier.last_db_sync = chrono::Utc::now();
 		Ok(())
 	}
 

@@ -11,7 +11,7 @@ use bitcoin_ext::rpc::{BitcoinRpcExt, BitcoinRpcClient, RpcApi};
 
 use server::sync::{ChainEventListener, RawMempool, BlockData};
 use server::sync::block_index::{BlockIndex};
-use server::database::{BlockTable, Db};
+use server::database::{BlockTable, Db, Tx};
 
 use ark_testing::TestContext;
 
@@ -70,7 +70,7 @@ impl ChainEventListener for BlockIndexListener {
 		Ok(())
 	}
 
-	async fn on_reorg(&self, block: BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, _tx: &Tx<'_>, block: BlockRef) -> anyhow::Result<()> {
 		if let Some(tip) = *self.tip.lock() {
 			if block.height > tip.height {
 				panic!(
@@ -210,11 +210,19 @@ impl ChainEventListener for FailOnceReorgListener {
 		Ok(())
 	}
 
-	async fn on_reorg(&self, _block: BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, tx: &Tx<'_>, _block: BlockRef) -> anyhow::Result<()> {
+		assert!(tx.query_one("SELECT invalid FROM expiry_chain_view WHERE id=1", &[]).await?.get::<_, bool>(0),
+			"rollback callbacks must share the invalidated outer transaction");
 		let calls = self.calls.fetch_add(1, Ordering::SeqCst);
 		if calls == 0 {
 			bail!("simulated reorg failure");
 		}
+		Ok(())
+	}
+
+	async fn on_reorg_committed(&self, block: BlockRef) -> anyhow::Result<()> {
+		let tip = self.db.read(async |t| t.get_highest_block(BlockTable::Captaind).await).await?;
+		assert_eq!(tip, Some(block), "cache refresh must observe the committed rollback with one pooled connection");
 		Ok(())
 	}
 }
@@ -230,7 +238,8 @@ async fn test_block_index_reorg_retry() {
 	let mut ctx = TestContext::new_minimal("block_index/reorg_retry").await;
 
 	ctx.init_central_postgres().await;
-	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+	let mut postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+	postgres_cfg.max_connections = 1;
 	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
 	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 

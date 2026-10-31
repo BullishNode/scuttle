@@ -230,7 +230,7 @@ impl BlockIndex {
 				// transactions. Start no rollback unless invalid=TRUE is already
 				// durable: a crash must not roll the barrier back to a valid row.
 				if !row.get::<_, bool>("invalid") { return Ok(false); }
-				let results = join_all(self.listeners.iter().map(|listener| listener.on_reorg(block))).await;
+				let results = join_all(self.listeners.iter().map(|listener| listener.on_reorg(t, block))).await;
 				for result in results {
 					if result.is_err() { bail!("Failed to process reorg: {:#?}", result); }
 				}
@@ -241,6 +241,13 @@ impl BlockIndex {
 				Ok(true)
 			}).await?;
 			if rolled_back { break; }
+		}
+		// Cache locks can be held by ordinary readers borrowing the same pool.
+		// Acquire them only after releasing the rollback connection. The view
+		// remains durably invalid until the full replacement cycle completes.
+		let results = join_all(self.listeners.iter().map(|listener| listener.on_reorg_committed(block))).await;
+		for result in results {
+			result.context("Failed to refresh listener after reorg")?;
 		}
 
 		// Only advance the in-memory sync height once the listeners and the

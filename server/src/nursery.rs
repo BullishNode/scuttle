@@ -32,7 +32,7 @@ use tracing::warn;
 use bitcoin_ext::{BlockHeight, BlockRef, DEEPLY_CONFIRMED};
 
 use crate::bitcoind as bcd;
-use crate::database::Db;
+use crate::database::{Db, Tx};
 use crate::database::nursery::NurseryTx;
 use crate::sync::{BlockData, ChainEventListener, RawMempool};
 
@@ -281,13 +281,12 @@ impl ChainEventListener for TxNursery {
 		self.process_block(block).await
 	}
 
-	async fn on_reorg(&self, block_ref: BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, tx: &Tx<'_>, block_ref: BlockRef) -> anyhow::Result<()> {
 		// NB errors are propagated here: they make the SyncManager
 		// re-deliver the reorg, which is important because a missed
 		// eviction would leave txs marked confirmed in orphaned blocks.
-		let reorged = self.db.write(async |t| {
-			t.clear_nursery_confirmations_after(block_ref.height).await
-		}).await.context("failed to clear reorged nursery confirmations")?;
+		let reorged = tx.clear_nursery_confirmations_after(block_ref.height).await
+			.context("failed to clear reorged nursery confirmations")?;
 
 		for (txid, kind, previous_height) in reorged {
 			slog!(NurseryTxReorged, txid, kind: kind.name().into(), previous_height);
