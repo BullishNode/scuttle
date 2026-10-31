@@ -217,6 +217,7 @@ async fn progress_exit_tx(
 					ctx.get_exit_tx_status(exit).await
 				},
 				Some(ref c) if c.status == TxStatus::NotFound => {
+					if !ctx.allow_broadcast { return ctx.get_exit_tx_status(exit).await; }
 					debug!("Exit CPFP tx {} fell out of mempool, rebroadcasting", child_txid);
 					let package = ctx.tx_manager.get_package(exit.txid)?;
 					let guard = package.read().await;
