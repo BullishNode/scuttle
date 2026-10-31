@@ -79,7 +79,7 @@ impl std::fmt::Display for ClnXpayStatus {
 }
 
 /// A row of the `cln_xpay` table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClnXpayRecord {
 	pub id: i64,
 	pub lightning_node_id: LightningNodeId,
@@ -107,6 +107,11 @@ pub struct ClnXpayRecord {
 	/// the server subsidized the payment so that the recipient still received
 	/// the intended amount.
 	pub routing_fee_msat: Option<i64>,
+	/// On fresh Scuttle calls, Some(205) is written only with a qualified live
+	/// 26.06.6 slow-mode NoRoute receipt in the attempt's error column, in the
+	/// same source-serialized terminal transaction. Other outcome writers and
+	/// upstream backfill leave it NULL. Neither this column nor status=fail
+	/// alone authorizes a transition or certifies any old/restored row.
 	pub error_code: Option<i32>,
 
 	pub created_at: DateTime<Local>,

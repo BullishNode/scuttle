@@ -161,6 +161,8 @@ impl ClnNodeInfo {
 			db.clone(),
 			payment_update_tx.clone(),
 			id,
+			pubkey,
+			expected_network,
 			rpc.clone(),
 			xpay_config.clone(),
 			settler.clone(),

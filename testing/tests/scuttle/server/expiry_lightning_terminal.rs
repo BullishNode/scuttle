@@ -143,6 +143,7 @@ async fn failed_external_payout(no_channel: bool) {
 	client.register_vtxo_transactions_with_server(&leaves).await.unwrap();
 	let id = leaves[0].id();
 	lightning.sync().await;
+	let dispatched_invoice = invoice.clone();
 	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 90_000, htlc_vtxo_ids: vec![id.to_bytes().to_vec()],
 		mailbox_id: None, retry_for_secs: Some(5),
@@ -168,6 +169,45 @@ async fn failed_external_payout(no_channel: bool) {
 	assert!(native.iter().all(|payment| payment.status == cln_rpc::listsendpays_payments::ListsendpaysPaymentsStatus::Failed as i32));
 	if !no_channel { assert!(!native.is_empty(), "the accepted native HTLC must have a terminal failure"); }
 	assert!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+	if no_channel {
+		// This native completion is the missing zero-part authority. Neither
+		// empty parts nor the copied failed status is its substitute.
+		assert!(native.is_empty(), "the no-channel case must exercise a genuine zero-part reply");
+		let row = db.read(async |t| Ok(t.query_one("SELECT x.id,x.lightning_node_id,x.label,x.payment_hash, \
+			x.payment_amount_msat,x.max_routing_fee_msat,x.status::TEXT,x.error_code,a.error, \
+			a.lightning_node_id AS attempt_node,n.pubkey FROM cln_xpay x \
+			JOIN lightning_payment_attempt a ON a.id=$1 JOIN lightning_node n ON n.id=x.lightning_node_id \
+			WHERE x.label=$2", &[&attempt, &attempt.to_string()]).await?)).await.unwrap();
+		assert_eq!(row.get::<_, &str>("status"), "fail");
+		assert_eq!(row.get::<_, Option<i32>>("error_code"), Some(205));
+		assert_eq!(row.get::<_, &str>("label"), attempt.to_string());
+		assert_eq!(row.get::<_, &str>("payment_hash"), hash.to_string());
+		assert_eq!(row.get::<_, i64>("payment_amount_msat"), 90_000_000);
+		assert_eq!(row.get::<_, i64>("lightning_node_id"), row.get::<_, i64>("attempt_node"));
+		let receipt: serde_json::Value = serde_json::from_str(row.get::<_, &str>("error")).unwrap();
+		assert_eq!(receipt["native_completion"], "cln-26.06.6-slow-xpay-noroute-v1");
+		assert_eq!(receipt["code"], 205);
+		assert_eq!(receipt["attempt_id"], attempt.to_string());
+		assert_eq!(receipt["payment_hash"], hash.to_string());
+		assert_eq!(receipt["lightning_node_id"], row.get::<_, i64>("lightning_node_id"));
+		assert_eq!(receipt["request"]["invstring"], dispatched_invoice);
+		assert_eq!(receipt["request"]["label"], attempt.to_string());
+		assert_eq!(receipt["request"]["maxfee_msat"], row.get::<_, Option<i64>>("max_routing_fee_msat").unwrap());
+		assert_eq!(receipt["request"]["retry_for"], 5);
+		assert_eq!(receipt["slow_mode"]["config"], "xpay-slow-mode");
+		assert_eq!(receipt["slow_mode"]["value_bool"], true);
+		assert_eq!(receipt["slow_mode"]["dynamic"], true);
+		assert_eq!(receipt["slow_mode"]["transient"], false);
+		assert!(receipt["native_reply"].as_str().unwrap().starts_with(
+			"Error calling method Xpay: RpcError { code: Some(205), message: "));
+		let info = lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner();
+		assert_eq!(info.version, "v26.06.6");
+		assert_eq!(receipt["version"], info.version);
+		assert_eq!(receipt["network"], info.network);
+		let node = bitcoin::secp256k1::PublicKey::from_slice(&info.id).unwrap();
+		assert_eq!(receipt["node_pubkey"], node.to_string());
+		assert_eq!(row.get::<_, Vec<u8>>("pubkey"), info.id);
+	}
 	drop(client);
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	ctx.bitcoind().fund_addr(fee_address, sat(100_000)).await;

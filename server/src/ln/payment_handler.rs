@@ -121,6 +121,26 @@ impl<'a> PaymentAttemptHandler<'a> {
 		final_amount_msat: Option<u64>,
 		preimage: Option<Preimage>,
 	) -> anyhow::Result<()> {
+		self.process_attempt(settler, attempt, status, payment_error, final_amount_msat, preimage, None).await
+	}
+
+	/// A fresh qualified native reply and the attempt's failure commit together.
+	/// Monitors and copied ledger outcomes cannot call this with a reconstructed
+	/// receipt. A native Pending/success lookup is handled before this boundary.
+	pub(crate) async fn process_native_no_route(
+		&self, settler: &HtlcSettler, attempt: &LightningPaymentAttempt,
+		receipt: &super::cln::xpay::NativeNoRoute,
+	) -> anyhow::Result<()> {
+		self.process_attempt(settler, attempt, LightningPaymentStatus::Failed,
+			Some(receipt.error()), None, None, Some(receipt)).await
+	}
+
+	async fn process_attempt(
+		&self, settler: &HtlcSettler, attempt: &LightningPaymentAttempt,
+		status: LightningPaymentStatus, payment_error: Option<&str>,
+		final_amount_msat: Option<u64>, preimage: Option<Preimage>,
+		native_no_route: Option<&super::cln::xpay::NativeNoRoute>,
+	) -> anyhow::Result<()> {
 		// Native success is authoritative even when an optimistic status write
 		// loses its race. Its actual attempt provenance and WAL commit together.
 		if let Some(preimage) = preimage {
@@ -142,6 +162,10 @@ impl<'a> PaymentAttemptHandler<'a> {
 				t.lock_settlement_sources(attempt.payment_hash).await?;
 				None
 			};
+			if native_no_route.is_some() {
+				t.lock_htlc_settlements().await?;
+				t.ensure_not_settled(attempt.payment_hash).await?;
+			}
 			let updated = t.verify_and_update_payment_attempt(
 				attempt, status, payment_error, final_amount_msat
 			).await?;
@@ -157,7 +181,11 @@ impl<'a> PaymentAttemptHandler<'a> {
 					},
 					_ => ClnXpayOutcome::Fail { error_code: None },
 				};
-				end_xpay(t, attempt, outcome).await?;
+				if let Some(receipt) = native_no_route {
+					receipt.record(t, attempt).await?;
+				} else {
+					end_xpay(t, attempt, outcome).await?;
+				}
 			}
 
 			// Only mark linked HTLC-send vtxos as ln-spent once the attempt

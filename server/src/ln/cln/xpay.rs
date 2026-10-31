@@ -27,7 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use bitcoin::Amount;
+use bitcoin::{Amount, Network};
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::hex::DisplayHex;
 use chrono::{DateTime, Local};
 use tokio::sync::{broadcast, Notify};
@@ -40,6 +41,7 @@ use cln_rpc::listpays_pays::ListpaysPaysStatus;
 
 use crate::database;
 use crate::database::ln::{LightningNodeId, LightningPaymentAttempt, LightningPaymentStatus};
+use crate::database::xpay::{self, ClnXpayRecord, ClnXpayStatus};
 use crate::ln::settler::HtlcSettler;
 use crate::ln::guard::PaymentGuards;
 use crate::system::RuntimeManager;
@@ -59,6 +61,9 @@ pub const XPAY_TIMEOUT_BUFFER: Duration = Duration::from_secs(15);
 pub(crate) struct ClnXpayClient {
 	db: database::Db,
 	rpc: ClnGrpcClient,
+	node_id: LightningNodeId,
+	node_pubkey: PublicKey,
+	network: Network,
 	settler: Arc<HtlcSettler>,
 	/// Notifies [`LightningManager::wait_payment_status`] when a payment reaches a final state.
 	///
@@ -77,11 +82,15 @@ impl ClnXpayClient {
 		db: database::Db,
 		payment_update_tx: broadcast::Sender<PaymentHash>,
 		rpc: ClnGrpcClient,
+		node_id: LightningNodeId,
+		node_pubkey: PublicKey,
+		network: Network,
 		settler: Arc<HtlcSettler>,
 		mailbox_manager: Arc<crate::mailbox_manager::MailboxManager>,
 		payment_guards: PaymentGuards,
 	) -> Arc<Self> {
-		Arc::new(Self { db, payment_update_tx, rpc, settler, mailbox_manager, payment_guards })
+		Arc::new(Self { db, payment_update_tx, rpc, node_id, node_pubkey, network,
+			settler, mailbox_manager, payment_guards })
 	}
 
 	/// Calls xpay and then reconciles the attempt status against CLN.
@@ -110,18 +119,45 @@ impl ClnXpayClient {
 		let mut rpc = self.rpc.clone();
 		let payment_hash = invoice.payment_hash();
 		let dispatch = self.payment_guards.lock_dispatch(payment_hash).await;
-		match self.db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await).await {
-			Ok(Some(current)) if current.id == attempt_id => {},
+		let attempt = match self.db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await).await {
+			Ok(Some(current)) if current.id == attempt_id && current.lightning_node_id == self.node_id => current,
 			Ok(_) => return,
 			Err(error) => { error!(%payment_hash, %error, "Could not check queued payment"); return; },
-		}
+		};
+		let request = xpay_request(&invoice, payment_amount, max_routing_fee,
+			max_cltv_expiry_delta, retry_for, attempt_id.to_string());
+		let qualified = match self.prepare_call(&mut rpc, &attempt, &request, payment_amount, retry_for).await {
+			Ok(qualified) => qualified,
+			Err(error) => {
+				error!(attempt_id, %payment_hash, %error,
+					"Could not qualify native xpay dispatch; retaining custody without dispatch");
+				return;
+			},
+		};
 		// Only place CLN says whether the route was pruned on cost or on delay.
 		// A route it never found leaves no `listpays` record either, so
 		// dropping this loses the reason entirely.
-		let pay_error = match call_xpay(
-			&mut rpc, &invoice, payment_amount, max_routing_fee, max_cltv_expiry_delta, retry_for,
-			Some(attempt_id.to_string()),
-		).await {
+		let result = call_xpay(
+			&mut rpc, &invoice, payment_amount, max_routing_fee, max_cltv_expiry_delta,
+			&request,
+		).await;
+		// Only the reply to this exact live call can create this receipt. A
+		// stored error, mirror, empty lookup or monitor invocation cannot.
+		let no_route = if result.as_ref().err().and_then(native_xpay_error_code) == Some(205) {
+			match rpc.getinfo(cln_rpc::GetinfoRequest {}).await {
+				Ok(info) => if qualified.same_node(&info.into_inner()) {
+					Some(qualified.finish(result.as_ref().unwrap_err()))
+				} else {
+					error!(attempt_id, %payment_hash, "Native NoRoute node identity changed; retaining custody");
+					None
+				},
+				Err(_) => {
+					error!(attempt_id, %payment_hash, "Native NoRoute reply has no stable qualified node identity; retaining custody");
+					None
+				},
+			}
+		} else { None };
+		let pay_error = match result {
 			Ok(_preimage) => {
 				// NB we don't do db stuff when it's succesful, because
 				// it will happen in the sendpay stream of the monitor process
@@ -158,8 +194,8 @@ impl ClnXpayClient {
 
 		match attempt_res {
 			Ok(Some(attempt)) => {
-				if let Err(e) = self.sync_payment_attempt_status(
-					attempt, pay_error.as_deref(),
+				if let Err(e) = self.reconcile_payment_attempt(
+					attempt, pay_error.as_deref(), no_route.as_ref(),
 				).await {
 					error!("Error syncing payment attempt status: {e:#}");
 				}
@@ -173,6 +209,30 @@ impl ClnXpayClient {
 				error!("Error getting open payment attempt by payment hash: {e:#}");
 			},
 		}
+	}
+
+	/// Re-acknowledge the supported persistent mode for every fresh dispatch.
+	/// Only this client's admitted node/network and pinned native version can
+	/// certify the completion semantics of a later NoRoute reply. Configuration
+	/// is operator-owned; this application never changes the option to false.
+	/// The persistent acknowledgement survives supported same-node restarts;
+	/// an unacknowledged/changed endpoint cannot certify an old call.
+	async fn prepare_call(
+		&self, rpc: &mut ClnGrpcClient, attempt: &LightningPaymentAttempt,
+		request: &cln_rpc::XpayRequest, amount: Amount, retry_for: Duration,
+	) -> anyhow::Result<QualifiedCall> {
+		let info = rpc.getinfo(cln_rpc::GetinfoRequest {}).await?.into_inner();
+		ensure!(qualified_node(&info, self.node_pubkey, self.network), "unqualified xpay node/version/network");
+		let ack = rpc.set_config(cln_rpc::SetconfigRequest {
+			config: "xpay-slow-mode".into(), val: Some("true".into()), transient: Some(false),
+		}).await?.into_inner();
+		ensure!(slow_mode_ack(&ack), "native xpay-slow-mode acknowledgement is missing or inconsistent");
+		let records = self.db.read(async |t| xpay::get_xpays_by_payment_hash(&**t, attempt.payment_hash).await).await?;
+		let mut records = records.into_iter().filter(|r| r.status == ClnXpayStatus::Pending);
+		let record = records.next().context("missing original pending xpay call")?;
+		ensure!(records.next().is_none(), "multiple pending xpay calls");
+		ensure!(request_matches(&record, attempt, request, amount, retry_for), "xpay request differs from its original attempt/label");
+		Ok(QualifiedCall { record, request: request.clone(), info, ack })
 	}
 
 	/// Stores the xpay error on `attempt` and returns it as stored, so later
@@ -220,7 +280,15 @@ impl ClnXpayClient {
 		attempt: LightningPaymentAttempt,
 		pay_error: Option<&str>,
 	) -> anyhow::Result<()> {
+		self.reconcile_payment_attempt(attempt, pay_error, None).await
+	}
+
+	async fn reconcile_payment_attempt(
+		&self, attempt: LightningPaymentAttempt, pay_error: Option<&str>,
+		no_route: Option<&NativeNoRoute>,
+	) -> anyhow::Result<()> {
 		let payment_hash = attempt.payment_hash;
+		ensure!(attempt.lightning_node_id == self.node_id, "attempt belongs to a different native node");
 		let Some(_dispatch) = self.payment_guards.try_lock_dispatch(payment_hash) else { return Ok(()); };
 		let error = pay_error.or(attempt.error.as_deref());
 		debug!("Lightning payment attempt ({}): with payment hash {} is being verified.",
@@ -242,7 +310,13 @@ impl ClnXpayClient {
 			.into_inner();
 		let label = attempt.id.to_string();
 		listpays_response.pays.retain(|pay| pay.label.as_deref() == Some(label.as_str()));
+		ensure!(listpays_response.pays.iter().all(|p| p.payment_hash == payment_hash.to_vec()),
+			"own native payment lookup returned a different hash");
 		if listpays_response.pays.is_empty() {
+			if let Some(receipt) = no_route {
+				self.payment_handler().process_native_no_route(&self.settler, &attempt, receipt).await?;
+				return Ok(());
+			}
 			match attempt.status {
 				LightningPaymentStatus::Succeeded => {
 					error!("Lightning payment attempt ({}): flagged succeeded \
@@ -265,9 +339,9 @@ impl ClnXpayClient {
 				},
 			}
 		} else {
-			let latest = listpays_response.pays.into_iter().max_by_key(|p| {
-				p.created_index.expect("should have index")
-			}).expect("we have at least one");
+			// A newer failed group cannot override another own Pending group
+			// or an actual successful payment. Unknown enum values also hold.
+			let latest = select_own_payment(listpays_response.pays)?;
 
 			let updated_status = match latest.status() {
 				ListpaysPaysStatus::Pending => LightningPaymentStatus::Submitted,
@@ -358,6 +432,8 @@ impl ClnXpay {
 		db: database::Db,
 		payment_update_tx: broadcast::Sender<PaymentHash>,
 		node_id: LightningNodeId,
+		node_pubkey: PublicKey,
+		network: Network,
 		rpc: ClnGrpcClient,
 		config: ClnXpayConfig,
 		settler: Arc<HtlcSettler>,
@@ -374,7 +450,8 @@ impl ClnXpay {
 			updated_index: payment_idxs.updated_index,
 		);
 
-		let client = ClnXpayClient::new(db.clone(), payment_update_tx, rpc, settler, mailbox_manager, payment_guards).await;
+		let client = ClnXpayClient::new(db.clone(), payment_update_tx, rpc, node_id, node_pubkey,
+			network, settler, mailbox_manager, payment_guards).await;
 
 		let proc = ClnXpayProcess {
 			config, db, node_id,
@@ -545,6 +622,141 @@ impl ClnXpayProcess {
 	}
 }
 
+/// Runtime/mode admission for one live unary call. Nothing read from an old
+/// ledger outcome can construct a native completion receipt.
+struct QualifiedCall {
+	record: ClnXpayRecord,
+	request: cln_rpc::XpayRequest,
+	info: cln_rpc::GetinfoResponse,
+	ack: cln_rpc::SetconfigResponse,
+}
+
+impl QualifiedCall {
+	fn same_node(&self, info: &cln_rpc::GetinfoResponse) -> bool {
+		info.id == self.info.id && info.version == self.info.version && info.network == self.info.network
+	}
+
+	fn finish(self, error: &anyhow::Error) -> NativeNoRoute {
+		let config = self.ack.config.as_ref().expect("qualified acknowledgement");
+		// Kept in the existing error column with the terminal transaction. This
+		// is provenance for this fresh receipt, not a string the monitor trusts.
+		let error = serde_json::json!({
+			"native_completion": "cln-26.06.6-slow-xpay-noroute-v1",
+			"code": 205,
+			"attempt_id": self.record.label,
+			"lightning_node_id": self.record.lightning_node_id,
+			"node_pubkey": self.info.id.as_hex().to_string(),
+			"network": self.info.network,
+			"version": self.info.version,
+			"slow_mode": { "config": config.config, "value_bool": config.value_bool,
+				"dynamic": config.dynamic, "plugin": config.plugin, "transient": false },
+			"request": { "invstring": self.request.invstring, "label": self.request.label,
+				"amount_msat": self.request.amount_msat.as_ref().map(|v| v.msat),
+				"maxfee_msat": self.request.maxfee.as_ref().map(|v| v.msat),
+				"retry_for": self.request.retry_for, "maxdelay": self.request.maxdelay,
+				"partial_msat": self.request.partial_msat.as_ref().map(|v| v.msat),
+				"layers": self.request.layers, "payer_note": self.request.payer_note,
+				"localinvreqid": self.request.localinvreqid, "dev_use_shadow": self.request.dev_use_shadow },
+			"payment_hash": self.record.payment_hash.to_string(),
+			"payment_amount_msat": self.record.payment_amount_msat,
+			"original_attempt_expiry": self.record.attempt_expiry.to_rfc3339(),
+			"original_htlc_expiry": self.record.htlc_expiry.map(|h| h.to_u32()),
+			"native_reply": error.downcast_ref::<tonic::Status>().expect("native reply").message(),
+		}).to_string();
+		NativeNoRoute { record: self.record, error }
+	}
+}
+
+/// Only the qualified live-call path above creates this capability. It is not
+/// deserialized from an error, cln_xpay row, status mirror or monitor snapshot.
+/// If the process loses it before commit, an empty native lookup remains unknown.
+pub(crate) struct NativeNoRoute {
+	record: ClnXpayRecord,
+	error: String,
+}
+
+impl NativeNoRoute {
+	pub(crate) fn error(&self) -> &str { &self.error }
+
+	/// Called inside the attempt's source/settlement transaction, after its
+	/// optimistic status update. A mismatched or already-ended row rolls back
+	/// that update, so the two terminal facts cannot commit separately.
+	pub(crate) async fn record(
+		&self, tx: &database::Tx<'_>, attempt: &LightningPaymentAttempt,
+	) -> anyhow::Result<()> {
+		ensure!(self.record.label.as_deref() == Some(attempt.id.to_string().as_str())
+			&& self.record.lightning_node_id == attempt.lightning_node_id
+			&& self.record.payment_hash == attempt.payment_hash
+			&& self.record.payment_amount_msat == attempt.amount_msat
+			&& !attempt.is_self_payment(), "native completion belongs to another attempt");
+		let current = xpay::get_xpay_by_id(&**tx, self.record.id).await?
+			.context("native completion lost its original ledger row")?;
+		ensure!(current == self.record && current.status == ClnXpayStatus::Pending
+			&& current.error_code.is_none(), "native completion ledger changed during the call");
+		ensure!(xpay::mark_xpay_fail(&**tx, current.id, Some(205)).await?.is_some(),
+			"native completion lost the pending ledger update");
+		Ok(())
+	}
+}
+
+fn qualified_node(info: &cln_rpc::GetinfoResponse, pubkey: PublicKey, network: Network) -> bool {
+	info.id.as_slice() == pubkey.serialize().as_slice() && info.network == network.to_string()
+		&& info.version == "v26.06.6"
+}
+
+fn slow_mode_ack(ack: &cln_rpc::SetconfigResponse) -> bool {
+	ack.config.as_ref().is_some_and(|c| c.config == "xpay-slow-mode"
+		&& c.dynamic && c.value_bool == Some(true)
+		&& c.plugin.as_deref().is_some_and(|p| p.rsplit('/').next() == Some("cln-xpay")))
+}
+
+fn request_matches(
+	record: &ClnXpayRecord, attempt: &LightningPaymentAttempt,
+	request: &cln_rpc::XpayRequest, amount: Amount, retry_for: Duration,
+) -> bool {
+	record.status == ClnXpayStatus::Pending && record.error_code.is_none()
+		&& !attempt.is_self_payment() && !attempt.status.is_final()
+		&& record.lightning_node_id == attempt.lightning_node_id
+		&& record.payment_hash == attempt.payment_hash
+		&& record.payment_amount_msat == amount.to_msat() && attempt.amount_msat == amount.to_msat()
+		&& record.label.as_deref() == Some(attempt.id.to_string().as_str())
+		&& request.label == record.label && record.partial_msat.is_none()
+		&& record.max_routing_fee_msat == request.maxfee.as_ref().map(|v| v.msat)
+		&& attempt.max_routing_fee.map(|v| v.to_msat()) == record.max_routing_fee_msat
+		&& attempt.retry_for == Some(retry_for) && request.retry_for == u32::try_from(retry_for.as_secs()).ok()
+		&& request.partial_msat.is_none() && request.layers.is_empty()
+		&& request.payer_note.is_none() && request.localinvreqid.is_none() && request.dev_use_shadow.is_none()
+}
+
+/// cln-grpc 26.06.6 formats the *outer* Xpay RpcError using Debug. Only the
+/// complete exact envelope with data=None is supported here; a future encoding,
+/// transport/deadline status, embedded code text or another method fails closed.
+fn native_xpay_error_code(error: &anyhow::Error) -> Option<i32> {
+	let status = error.downcast_ref::<tonic::Status>()?;
+	if status.code() != tonic::Code::Unknown { return None; }
+	let rest = status.message().strip_prefix("Error calling method Xpay: RpcError { code: Some(")?;
+	let (code, rest) = rest.split_once("), message: ")?;
+	let parsed: i32 = code.parse().ok()?;
+	if code != parsed.to_string() { return None; }
+	let message = rest.strip_suffix(", data: None }")?;
+	serde_json::from_str::<String>(message).ok()?;
+	Some(parsed)
+}
+
+fn select_own_payment(payments: Vec<cln_rpc::ListpaysPays>) -> anyhow::Result<cln_rpc::ListpaysPays> {
+	for payment in &payments {
+		ensure!(ListpaysPaysStatus::try_from(payment.status).is_ok(), "unknown native payment status");
+	}
+	payments.into_iter().max_by_key(|p| {
+		let priority = match p.status() {
+			ListpaysPaysStatus::Complete => 2,
+			ListpaysPaysStatus::Pending => 1,
+			ListpaysPaysStatus::Failed => 0,
+		};
+		(priority, p.created_index)
+	}).context("no own native payment")
+}
+
 /// Whether lightningd itself answered with a coded RPC error. This is not a
 /// terminal payment record. cln-grpc words every failed call as `Error calling
 /// method ...`, but only lightningd carries `RpcError { code: Some(..) }`.
@@ -553,27 +765,11 @@ fn is_cln_error(err: &anyhow::Error) -> bool {
 		.is_some_and(|s| s.message().contains("RpcError { code: Some("))
 }
 
-/// Calls the xpay-command over gRPC.
-/// If the payment completes successfully it will return the pre-image
-/// Otherwise, an error will be returned
-async fn call_xpay(
-	rpc: &mut ClnGrpcClient,
-	invoice: &Invoice,
-	payment_amount: Amount,
-	max_routing_fee: Amount,
-	max_cltv_expiry_delta: BlockDelta,
-	retry_for: Duration,
-	label: Option<String>,
-) -> anyhow::Result<Preimage> {
-	let payment_hash = invoice.payment_hash();
-
-	slog!(XpayRpcCalled,
-		payment_hash, payment_amount, max_routing_fee,
-		invoice: invoice.to_string(),
-		max_delay: max_cltv_expiry_delta.to_u32(),
-	);
-
-	let pay_result = rpc.xpay(cln_rpc::XpayRequest {
+fn xpay_request(
+	invoice: &Invoice, payment_amount: Amount, max_routing_fee: Amount,
+	max_cltv_expiry_delta: BlockDelta, retry_for: Duration, label: String,
+) -> cln_rpc::XpayRequest {
+	cln_rpc::XpayRequest {
 		invstring: invoice.to_string(),
 		// cln doesn't allow tipping
 		amount_msat: if invoice.amount_msat().is_none() {
@@ -587,10 +783,32 @@ async fn call_xpay(
 		partial_msat: None,
 		layers: vec![],
 		payer_note: None,
-		label,
+		label: Some(label),
 		localinvreqid: None,
 		dev_use_shadow: None,
-	}).await;
+	}
+}
+
+/// Calls the xpay-command over gRPC.
+/// If the payment completes successfully it will return the pre-image
+/// Otherwise, an error will be returned
+async fn call_xpay(
+	rpc: &mut ClnGrpcClient,
+	invoice: &Invoice,
+	payment_amount: Amount,
+	max_routing_fee: Amount,
+	max_cltv_expiry_delta: BlockDelta,
+	request: &cln_rpc::XpayRequest,
+) -> anyhow::Result<Preimage> {
+	let payment_hash = invoice.payment_hash();
+
+	slog!(XpayRpcCalled,
+		payment_hash, payment_amount, max_routing_fee,
+		invoice: invoice.to_string(),
+		max_delay: max_cltv_expiry_delta.to_u32(),
+	);
+
+	let pay_result = rpc.xpay(request.clone()).await;
 
 	let result = match pay_result {
 		Err(e) => Err(e.into()),
@@ -631,4 +849,124 @@ mod test {
 		assert!(!is_cln_error(&socket.into()));
 		assert!(!is_cln_error(&anyhow!("missing preimage")));
 	}
+	#[test]
+	fn native_no_route_requires_the_exact_outer_reply() {
+		let reply = "Error calling method Xpay: RpcError { code: Some(205), message: \"no route\", data: None }";
+		assert_eq!(native_xpay_error_code(&tonic::Status::unknown(reply).into()), Some(205));
+		assert_eq!(native_xpay_error_code(&tonic::Status::unknown(reply.replace("Some(205)", "Some(-4)")).into()), Some(-4));
+		for error in [
+			tonic::Status::deadline_exceeded(reply),
+			tonic::Status::unavailable(reply),
+			tonic::Status::unknown(reply.replace("method Xpay", "method Pay")),
+			tonic::Status::unknown(format!("prefix {reply}")),
+			tonic::Status::unknown(format!("{reply} trailing")),
+			tonic::Status::unknown(reply.replace("Some(205)", "Some(+205)")),
+			tonic::Status::unknown(reply.replace("data: None", "data: Some(Object {})")),
+			tonic::Status::unknown("Error calling method Xpay: RpcError { code: None, message: \"code: Some(205)\", data: None }"),
+			tonic::Status::unknown("Error calling method Xpay: RpcError { code: Some(-4), message: \"RpcError { code: Some(205), message: no route }\", data: None }"),
+		] {
+			assert_ne!(native_xpay_error_code(&error.into()), Some(205));
+		}
+		assert_eq!(native_xpay_error_code(&anyhow!(reply)), None);
+	}
+
+	#[test]
+	fn native_no_route_requires_slow_mode_and_the_admitted_node() {
+		let pubkey: PublicKey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".parse().unwrap();
+		let mut info = cln_rpc::GetinfoResponse {
+			id: pubkey.serialize().to_vec(), network: "regtest".into(), version: "v26.06.6".into(),
+			..Default::default()
+		};
+		assert!(qualified_node(&info, pubkey, Network::Regtest));
+		assert!(!qualified_node(&info, pubkey, Network::Signet));
+		info.version.push_str("-unknown");
+		assert!(!qualified_node(&info, pubkey, Network::Regtest));
+		info.version = "v26.06.6".into();
+		info.id[0] = 3;
+		assert!(!qualified_node(&info, pubkey, Network::Regtest));
+
+		let ack = cln_rpc::SetconfigResponse { config: Some(cln_rpc::SetconfigConfig {
+			config: "xpay-slow-mode".into(), plugin: Some("/native/plugins/cln-xpay".into()),
+			dynamic: true, value_bool: Some(true), ..Default::default()
+		}) };
+		assert!(slow_mode_ack(&ack));
+		assert!(!slow_mode_ack(&cln_rpc::SetconfigResponse::default()));
+		for change in 0..5 {
+			let mut bad = ack.clone();
+			let config = bad.config.as_mut().unwrap();
+			match change {
+				0 => config.config = "another-option".into(),
+				1 => config.value_bool = Some(false),
+				2 => config.value_bool = None,
+				3 => config.dynamic = false,
+				4 => config.plugin = Some("another-plugin".into()),
+				_ => unreachable!(),
+			}
+			assert!(!slow_mode_ack(&bad));
+		}
+	}
+
+	#[test]
+	fn native_no_route_cannot_certify_a_stale_or_different_request() {
+		let now = Local::now();
+		let hash = Preimage::random().compute_payment_hash();
+		let retry = Duration::from_secs(5);
+		let amount = Amount::from_sat(90_000);
+		let fee = Amount::from_sat(1_000);
+		let attempt = LightningPaymentAttempt {
+			id: 42, lightning_node_id: 7, payment_hash: hash, amount_msat: amount.to_msat(),
+			final_amount_msat: None, status: LightningPaymentStatus::Requested,
+			lightning_htlc_subscription_id: None, error: None, block_height: None,
+			user_fee: None, user_agent: None, retry_for: Some(retry), max_routing_fee: Some(fee),
+			created_at: now, updated_at: now,
+		};
+		let record = ClnXpayRecord {
+			id: 8, lightning_node_id: 7, payment_hash: hash, payment_amount_msat: amount.to_msat(),
+			max_routing_fee_msat: Some(fee.to_msat()), attempt_expiry: now,
+			partial_msat: None, htlc_expiry: Some(bitcoin_ext::BlockHeight::new(200)), label: Some("42".into()),
+			user_fee_msat: None, user_agent: None, status: ClnXpayStatus::Pending,
+			routing_fee_msat: None, error_code: None, created_at: now, updated_at: now,
+		};
+		let request = cln_rpc::XpayRequest {
+			invstring: "original request".into(), maxfee: Some(fee.into()), retry_for: Some(5),
+			maxdelay: Some(20), label: Some("42".into()), ..Default::default()
+		};
+		assert!(request_matches(&record, &attempt, &request, amount, retry));
+		for change in 0..6 {
+			let mut bad = record.clone();
+			match change {
+				0 => bad.label = Some("41".into()),
+				1 => bad.lightning_node_id += 1,
+				2 => bad.payment_hash = Preimage::random().compute_payment_hash(),
+				3 => bad.payment_amount_msat += 1,
+				4 => bad.status = ClnXpayStatus::Fail,
+				5 => bad.error_code = Some(205), // copied/old receipt is never fresh authority
+				_ => unreachable!(),
+			}
+			assert!(!request_matches(&bad, &attempt, &request, amount, retry));
+		}
+		let mut stale = request.clone();
+		stale.label = Some("41".into());
+		assert!(!request_matches(&record, &attempt, &stale, amount, retry));
+		assert!(!request_matches(&record, &attempt, &request, amount, retry + Duration::from_secs(1)));
+	}
+
+	#[test]
+	fn native_own_pending_and_success_precede_another_failed_group() {
+		let failed = cln_rpc::ListpaysPays {
+			status: ListpaysPaysStatus::Failed as i32, created_index: Some(3), ..Default::default()
+		};
+		let pending = cln_rpc::ListpaysPays {
+			status: ListpaysPaysStatus::Pending as i32, created_index: Some(1), ..Default::default()
+		};
+		let complete = cln_rpc::ListpaysPays {
+			status: ListpaysPaysStatus::Complete as i32, created_index: Some(2),
+			preimage: Some(vec![1; 32]), ..Default::default()
+		};
+		assert_eq!(select_own_payment(vec![pending.clone(), failed.clone()]).unwrap().status(), ListpaysPaysStatus::Pending);
+		assert_eq!(select_own_payment(vec![pending, failed, complete]).unwrap().status(), ListpaysPaysStatus::Complete);
+		assert!(select_own_payment(vec![]).is_err()); // empty is not a failed native record
+		assert!(select_own_payment(vec![cln_rpc::ListpaysPays { status: 99, ..Default::default() }]).is_err());
+	}
+
 }
