@@ -98,7 +98,32 @@ async fn same_hash_sources(cooperative_refund: bool) {
 		).await).await.unwrap();
 		if index == 0 {
 			assert_eq!(proposal.disposition, OwnershipDisposition::Operator, "the source that actually funded the paid invoice is discharged");
+			assert_eq!(db.read(async |t| t.source_settlement(hash, grants[0]).await).await.unwrap(),
+				server::database::ln::SourceSettlement::Funded);
+			// Reconstruct only stale outcome metadata after genuine native
+			// success. This is an integrity-divergence control, not a crash.
+			db.write(async |t| {
+				t.execute("UPDATE lightning_payment_attempt SET status='failed',updated_at=NOW() WHERE payment_hash=$1",
+					&[&hash.to_string()]).await?;
+				t.execute("UPDATE htlc_vtxo SET offchain_resolution=NULL WHERE id=(SELECT id FROM vtxo WHERE vtxo_id=$1)",
+					&[&grants[0].to_string()]).await?;
+				Ok(())
+			}).await.unwrap();
+			let held = db.read(async |t| t.propose_expiry_ownership(
+				fact, &funding, height, Some(height),
+			)).await.unwrap();
+			assert!(matches!(held.disposition, OwnershipDisposition::Unresolved(_)));
+			assert!(held.settlement_integrity_hold, "cached Failed cannot authorize a paid-source refund or operator allocation");
+			db.write(async |t| {
+				t.execute("UPDATE lightning_payment_attempt SET status='succeeded',updated_at=NOW() WHERE payment_hash=$1",
+					&[&hash.to_string()]).await?;
+				t.execute("UPDATE htlc_vtxo SET offchain_resolution='fulfilled' WHERE id=(SELECT id FROM vtxo WHERE vtxo_id=$1)",
+					&[&grants[0].to_string()]).await?;
+				Ok(())
+			}).await.unwrap();
 		} else {
+			assert_eq!(db.read(async |t| t.source_settlement(hash, grants[1]).await).await.unwrap(),
+				server::database::ln::SourceSettlement::Disjoint);
 			assert!(matches!(proposal.disposition, OwnershipDisposition::Unresolved(_)),
 				"the unused, unexpired source is not discharged by another source's preimage: {:?}", proposal.disposition);
 		}

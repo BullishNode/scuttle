@@ -68,6 +68,9 @@ impl Tx<'_> {
 			},
 			OwnershipDisposition::Operator => None,
 			OwnershipDisposition::Unresolved(reason) => {
+				if ownership.settlement_integrity_hold {
+					self.hold_settlement_integrity(ownership.id, reason).await?;
+				}
 				debug!(vtxo_id = %ownership.id, reason, "Expiry settlement remains unresolved");
 				return Ok(if ownership.needs_chain_progress {
 					PreparedCoin::NeedsHtlcProgress

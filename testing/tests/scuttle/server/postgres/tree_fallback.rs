@@ -98,7 +98,7 @@ async fn derived_expiry_owner_uses_the_stage_selected_key() {
 		id: coin.id(), gross: coin.amount(), updated_at: Local::now(), spend_state: SpendState::Spendable,
 		disposition: OwnershipDisposition::Customer { user_pubkey: coin.policy().user_pubkey().unwrap() },
 		evidence: Some(OwnershipEvidence::Pubkey), cancellations: Vec::new(),
-		has_stored_preimage: false, needs_chain_progress: false,
+		has_stored_preimage: false, needs_chain_progress: false, settlement_integrity_hold: false,
 	};
 	let original = Attribution::Owned { mailbox_pk: server.public_key(),
 		spk: bitcoin::ScriptBuf::new_p2tr(&ark::SECP, server.x_only_public_key().0, None) };

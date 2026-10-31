@@ -28,7 +28,7 @@ use server::database::data_migrations::backfill_cln_hold;
 use server::database::hold::{self, ClnHoldStatus, NewClnHold};
 use server::database::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
 use server::database::tree::VtxoTreeUpdate;
-use server::database::ln::LightningHtlcSubscriptionStatus;
+use server::database::ln::{HtlcSettlementOrigin, LightningHtlcSubscriptionStatus, SourceSettlement};
 use server::database::vtxopool::PoolVtxo;
 use server::database::xpay::{self, ClnXpayOutcome, ClnXpayStatus, NewClnXpay};
 use server::filters;

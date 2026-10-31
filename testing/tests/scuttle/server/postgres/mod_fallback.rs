@@ -316,3 +316,141 @@ async fn legacy_payment_attempt(db: &Db, node_id: i64, invoice: &Invoice, source
 		Ok(())
 	}).await.unwrap();
 }
+
+/// Real PostgreSQL transaction/provenance contracts with explicit metadata
+/// fixtures. These do not claim a native payment or witness was observed.
+#[tokio::test]
+async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
+	let mut ctx = TestContext::new_minimal("postgresd/settlement_provenance_origins").await;
+	ctx.init_central_postgres().await;
+	let config = ctx.new_postgres(&ctx.test_name).await;
+	Db::create(&config, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&config, bitcoin::Network::Regtest).await.unwrap();
+	super::register_vector_owners(&db).await;
+	let base = &VTXO_VECTORS.board_vtxo;
+	let key = base.user_pubkey();
+	let (node, _) = db.write(async |t| t.register_lightning_node(&key).await).await.unwrap();
+	let preimage = Preimage::from([46; 32]);
+	let hash = preimage.compute_payment_hash();
+	let expiry = BlockHeight::new(1_000);
+	let mut ids = Vec::new();
+	for index in 0..3 {
+		let point = bitcoin::OutPoint::new(base.point().txid, index);
+		let policy = if index == 2 {
+			VtxoPolicy::new_server_htlc_recv(key, hash, expiry, BlockDelta::new(40))
+		} else { VtxoPolicy::new_server_htlc_send(key, hash, expiry) };
+		let coin = ServerVtxo::new(point, policy.into(), sat(10_000), base.expiry_height(),
+			base.server_pubkey(), base.exit_delta(), point);
+		db.write(async |t| {
+			t.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_bare_vtxos([coin.clone()])).await?;
+			htlc_vtxo::create_htlc_vtxos(t, &[(coin.id(), hash, expiry)],
+				if index == 2 { HtlcDirection::Outgoing } else { HtlcDirection::Incoming }).await
+		}).await.unwrap();
+		ids.push(coin.id());
+	}
+	let invoice_key = SecretKey::from_slice(&[41; 32]).unwrap();
+	let secp = Secp256k1::new();
+	let bolt11 = InvoiceBuilder::new(Currency::Regtest)
+		.description("settlement source association fixture".into()).payment_hash(hash.to_sha256_hash())
+		.payment_secret(PaymentSecret([42; 32])).current_timestamp()
+		.min_final_cltv_expiry_delta(18).amount_milli_satoshis(10_000_000)
+		.build_signed(|message| secp.sign_ecdsa_recoverable(message, &invoice_key)).unwrap();
+	let subscription = db.write(async |t| {
+		t.store_generated_lightning_receive(node, &bolt11, 10_000_000, None, None).await?;
+		let sub = t.get_htlc_subscription_by_payment_hash(hash).await?.unwrap().id;
+		t.store_lightning_htlc_subscription_status(sub, LightningHtlcSubscriptionStatus::Accepted,
+			Some(expiry), None).await?;
+		t.update_lightning_htlc_subscription_with_htlcs(sub, [ids[2]]).await?;
+		Ok(sub)
+	}).await.unwrap();
+	let invoice = Invoice::Bolt11(bolt11);
+	for source in &ids[..2] { legacy_payment_attempt(&db, node, &invoice, &[*source]).await; }
+	let attempts = db.read(async |t| Ok(t.query("SELECT id FROM lightning_payment_attempt WHERE payment_hash=$1 ORDER BY id",
+		&[&hash.to_string()]).await?.into_iter().map(|r| r.get::<_, i64>(0)).collect::<Vec<_>>())).await.unwrap();
+	assert_eq!(attempts.len(), 2);
+	let predicate = async |source| db.read(async |t| t.source_settlement(hash, source).await).await.unwrap();
+	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
+	let rolled_back: anyhow::Result<()> = db.write(async |t| {
+		t.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Receive(subscription)).await?;
+		anyhow::bail!("roll back the original WAL and its origin together")
+	}).await;
+	assert!(rolled_back.is_err());
+	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
+	assert_eq!(db.read(async |t| Ok(t.query_one("SELECT count(*) FROM htlc_settlement_source", &[])
+		.await?.get::<_, i64>(0))).await.unwrap(), 0);
+	// No attempt funded this subscription: the genuine DB relation is external.
+	assert!(db.write(async |t| t.store_htlc_settlement_from(preimage,
+		HtlcSettlementOrigin::Receive(subscription)).await).await.unwrap().is_some());
+	assert_eq!(predicate(ids[0]).await, SourceSettlement::Disjoint);
+	assert_eq!(predicate(ids[1]).await, SourceSettlement::Disjoint);
+	// Add an actual subscription funding association in this controlled fixture.
+	// Until its complete origin is recorded, the old observation fails closed.
+	db.write(async |t| Ok(t.execute("UPDATE lightning_payment_attempt SET lightning_htlc_subscription_id=$2,updated_at=NOW() WHERE id=$1",
+		&[&attempts[0], &subscription]).await?)).await.unwrap();
+	assert_eq!(predicate(ids[0]).await, SourceSettlement::Unknown);
+	assert_eq!(db.write(async |t| t.store_htlc_settlement_from(preimage,
+		HtlcSettlementOrigin::Receive(subscription)).await).await.unwrap(), None);
+	assert_eq!(predicate(ids[0]).await, SourceSettlement::Funded);
+	assert_eq!(predicate(ids[1]).await, SourceSettlement::Disjoint);
+	// A truncated receive observation is not evidence of disjointness.
+	db.write(async |t| Ok(t.execute("DELETE FROM htlc_settlement_source WHERE kind='receive' AND attempt_id=$1",
+		&[&attempts[0]]).await?)).await.unwrap();
+	assert_eq!(predicate(ids[1]).await, SourceSettlement::Unknown);
+	assert_eq!(db.write(async |t| t.store_htlc_settlement_from(preimage,
+		HtlcSettlementOrigin::Receive(subscription)).await).await.unwrap(), None);
+	// A later native-attempt observation must survive an already-present WAL.
+	// Hold its transaction while the exact refund-side lock/predicate waits.
+	let (stored_tx, stored_rx) = tokio::sync::oneshot::channel();
+	let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+	let writer_db = db.clone();
+	let second_attempt = attempts[1];
+	let writer = tokio::spawn(async move {
+		writer_db.write(async move |t| {
+			assert_eq!(t.store_htlc_settlement_from(preimage,
+				HtlcSettlementOrigin::Attempt(second_attempt)).await?, None);
+			stored_tx.send(()).unwrap();
+			release_rx.await.unwrap();
+			Ok(())
+		}).await
+	});
+	stored_rx.await.unwrap();
+	let reader_db = db.clone();
+	let second_source = ids[1];
+	let mut decision = tokio::spawn(async move {
+		reader_db.write(async |t| {
+			t.lock_settlement_sources(hash).await?;
+			t.lock_htlc_settlements().await?;
+			t.source_settlement(hash, second_source).await
+		}).await
+	});
+	assert!(tokio::time::timeout(Duration::from_millis(250), &mut decision).await.is_err(),
+		"a refund decision must wait for the source's in-flight settlement observation");
+	release_tx.send(()).unwrap();
+	writer.await.unwrap().unwrap();
+	assert_eq!(decision.await.unwrap().unwrap(), SourceSettlement::Funded);
+	assert_eq!(predicate(ids[1]).await, SourceSettlement::Funded);
+	let count = async || db.read(async |t| Ok(t.query_one("SELECT count(*) FROM htlc_settlement_source", &[])
+		.await?.get::<_, i64>(0))).await.unwrap();
+	let before = count().await;
+	let rolled_back: anyhow::Result<()> = db.write(async |t| {
+		t.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Onchain(ids[2])).await?;
+		anyhow::bail!("roll back witness observation and its source records together")
+	}).await;
+	assert!(rolled_back.is_err());
+	assert_eq!(count().await, before);
+	assert_eq!(db.write(async |t| t.store_htlc_settlement_from(preimage,
+		HtlcSettlementOrigin::Onchain(ids[2])).await).await.unwrap(), None);
+	assert!(count().await > before);
+	assert_eq!(predicate(ids[0]).await, SourceSettlement::Funded);
+	// A second same-hash origin never creates another WAL entry or rewrites it.
+	assert_eq!(db.read(async |t| Ok(t.query_one("SELECT count(*) FROM htlc_settlement WHERE payment_hash=$1",
+		&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);
+	assert_eq!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
+	assert_eq!(db.write(async |t| t.store_htlc_settlement_from(preimage,
+		HtlcSettlementOrigin::Attempt(i64::MAX)).await).await.unwrap(), None);
+	for source in &ids {
+		assert_eq!(predicate(*source).await, SourceSettlement::Unknown);
+		assert_eq!(db.read(async |t| Ok(t.query_one("SELECT reason FROM expiry_hold WHERE vtxo_id=$1",
+			&[&source.to_string()]).await?.get::<_, String>(0))).await.unwrap(), "settlement_provenance_unknown");
+	}
+}

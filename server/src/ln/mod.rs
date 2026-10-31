@@ -519,7 +519,25 @@ impl Server {
 			.insert_oor_spent_vtxos(builder.build_unsigned_internal_vtxos())
 			.insert_unregistered_vtxos(builder.build_unsigned_vtxos().map(ServerVtxo::from))
 			.mark_vtxos_oor_spent(builder.input_spend_info());
-		self.db.write(async |t| {
+		let settlement_refusal = self.db.write(async |t| {
+			t.lock_settlement_sources(payment_hash).await?;
+			t.lock_htlc_settlements().await?;
+			let mut unknown = false;
+			for source in &htlc_vtxo_ids {
+				match t.source_settlement(payment_hash, *source).await? {
+					crate::database::ln::SourceSettlement::Funded => return badarg!("invoice has already been paid"),
+					crate::database::ln::SourceSettlement::Unknown => {
+						t.hold_unknown_settlement(*source).await?;
+						unknown = true;
+					},
+					crate::database::ln::SourceSettlement::NotSettled | crate::database::ln::SourceSettlement::Disjoint => {},
+				}
+			}
+			// Commit the durable alarm/hold without releasing any funds, then
+			// return the refusal outside this transaction.
+			if unknown { return Ok(true); }
+			// Retain the conservative hash gate until the disjoint-source
+			// replacement has passed its real native release controls.
 			t.ensure_not_settled(payment_hash).await?;
 			owner_links.verify_package(t, &builder, self.mailbox_key.leak_ref(), self.config.network).await?;
 			crate::database::expiry_guard::guard_obligation_changes(t, &htlc_vtxo_ids).await?;
@@ -571,8 +589,9 @@ impl Server {
 			htlc_vtxo::set_htlc_vtxo_resolutions(
 				&t, &htlc_vtxo_ids, HtlcResolution::Revoked,
 			).await?;
-			Ok(())
+			Ok(false)
 		}).await?;
+		if settlement_refusal { return badarg!("source settlement provenance is unknown"); }
 
 		let new_vtxo_ids = builder.build_unsigned_vtxos().map(|v| v.id()).collect::<Vec<_>>();
 
@@ -1085,17 +1104,19 @@ impl Server {
 		let receive_claims = crate::database::expiry_receive::ReceiveClaimBinding::from_package(&builder)
 			.badarg("invalid receive destination")?;
 		ensure!(receive_claims.len() == htlc_ids.len(), "receive claim contains a non-receive source");
-		self.db.write(async |t| {
+		let checkpoint = self.db.write(async |t| {
 			owner_links.verify_package(t, &builder, self.mailbox_key.leak_ref(), self.config.network).await?;
-			t.prepare_receive_claims(&receive_claims).await
+			let checkpoint = t.store_htlc_settlement_from(payment_preimage,
+				crate::database::ln::HtlcSettlementOrigin::Receive(sub.id)).await?;
+			t.prepare_receive_claims(&receive_claims).await?;
+			Ok(checkpoint)
 		}).await?;
 
 		// Record the preimage in the settler so the watchman signer/policy
 		// can find it if this VTXO ends up being claimed on-chain.
 		// The settler is the single source of truth for preimages; all
 		// settlement paths (cooperative and on-chain) converge here.
-		self.htlc_settler.settle(payment_preimage).await
-			.context("could not record htlc settlement")?;
+		self.htlc_settler.notify_stored(checkpoint, payment_hash);
 
 		// Settle the hold invoice before releasing the grant, so the inbound
 		// HTLC is collected while it is still live.
