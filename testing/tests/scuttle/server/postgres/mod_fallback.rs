@@ -363,7 +363,14 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 		LightningHtlcSubscriptionStatus::Accepted, Some(expiry), None).await).await.unwrap();
 	db.write(async |t| t.update_lightning_htlc_subscription_with_htlcs(subscription, [ids[2]]).await).await.unwrap();
 	let invoice = Invoice::Bolt11(bolt11);
-	for source in &ids[..2] { legacy_payment_attempt(&db, node, &invoice, &[*source]).await; }
+	for (index, source) in ids[..2].iter().enumerate() {
+		legacy_payment_attempt(&db, node, &invoice, &[*source]).await;
+		if index == 0 {
+			let attempt = db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
+			assert!(db.write(async |t| t.update_lightning_payment_attempt_status(&attempt,
+				server::database::ln::LightningPaymentStatus::Failed, None).await).await.unwrap().is_some());
+		}
+	}
 	let attempts = db.read(async |t| Ok(t.query("SELECT id FROM lightning_payment_attempt WHERE payment_hash=$1 ORDER BY id",
 		&[&hash.to_string()]).await?.into_iter().map(|r| r.get::<_, i64>(0)).collect::<Vec<_>>())).await.unwrap();
 	assert_eq!(attempts.len(), 2);
