@@ -178,7 +178,7 @@ impl Server {
 			).await {
 				if database_failure(&error) { return Err(error); }
 				for id in root_ids {
-					let root = self.db.read(async |tx| tx.get_server_vtxo_by_id(id).await).await?.vtxo;
+					let root = self.db.read(async |tx| tx.get_bare_vtxo_by_id(id).await).await?.vtxo;
 					self.request_held_expiry_split(view, &root, "anchor_preparation_failed").await?;
 				}
 				warn!(%anchor, %error, "Expiry anchor remains unready; other anchors continue");
