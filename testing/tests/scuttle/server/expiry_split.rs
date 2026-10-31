@@ -8,7 +8,7 @@ use bitcoin::consensus::deserialize;
 use bitcoin::Transaction;
 use bitcoin_ext::{BlockDelta, BlockHeight};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
-use bark::onchain::MakeCpfpFees;
+use bark::onchain::{MakeCpfpFees, OnchainWalletTrait};
 use server::database::Db;
 use server_rpc::protos;
 
@@ -73,8 +73,11 @@ async fn mixed_split(pin: bool) {
 	let ordinary = leaves.iter().find(|v| matches!(v.policy(), VtxoPolicy::Pubkey(_))).unwrap().id();
 	let htlc = leaves.iter().find(|v| matches!(v.policy(), VtxoPolicy::ServerHtlcSend(_))).unwrap().id();
 	client.register_vtxo_transactions_with_server(&leaves).await.unwrap();
-	if pin { client.sync_onchain().await.unwrap(); }
-	let pin_sponsor = pin.then(|| client.onchain().unwrap());
+	let pin_sponsor = if pin {
+		let mut sponsor = wallet.onchain_client().await;
+		sponsor.sync(client.chain()).await.unwrap();
+		Some(sponsor)
+	} else { None };
 	drop(client);
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	ctx.bitcoind().fund_addr(fee_address, sat(100_000)).await;
@@ -90,7 +93,7 @@ async fn mixed_split(pin: bool) {
 			server::database::expiry_inventory::BackingSnapshotLimits { max_rows: 10_000, max_serialized_bytes: 10_000_000 }).await?;
 		Ok(snapshot.regular.into_iter().find(|f| f.state.vtxo.point() == input.chain_anchor()).unwrap().state.vtxo)
 	}).await.unwrap();
-	if let Some(sponsor) = pin_sponsor {
+	if let Some(mut sponsor) = pin_sponsor {
 		let prefix = db.read(async |tx| {
 			let row = tx.query_one("SELECT t.signed_tx FROM vtxo v JOIN virtual_transaction t ON t.txid=v.oor_spent_txid \
 				WHERE v.vtxo_id=$1", &[&root.id().to_string()]).await?;
@@ -99,7 +102,6 @@ async fn mixed_split(pin: bool) {
 		assert_eq!(prefix.input.len(), 1);
 		assert_eq!(prefix.input[0].previous_output, root.point());
 		assert!(!prefix.input[0].witness.is_empty());
-		let mut sponsor = sponsor.write().await;
 		let child = sponsor.make_signed_p2a_cpfp(&prefix,
 			MakeCpfpFees::Effective(bitcoin::FeeRate::from_sat_per_vb(1).unwrap())).await.unwrap();
 		sponsor.store_signed_p2a_cpfp(&child).await.unwrap();
