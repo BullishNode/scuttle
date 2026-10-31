@@ -620,6 +620,13 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 			} else { tokio::time::sleep(Duration::from_millis(50)).await; }
 		}
 	}).await.expect("expiry path must publish the actual funded payout through its bounded signed prefix");
+	let pending = srv.get_public_rpc().await.check_lightning_receive(protos::CheckLightningReceiveRequest {
+		hash: hash.to_vec(), wait: false,
+	}).await.unwrap().into_inner();
+	assert_eq!(pending.invoice, invoice.to_string());
+	assert_eq!(pending.amount_sat, gross.to_sat());
+	assert_eq!(pending.fallback_spend_state, Some(protos::VtxoSpendState::FallbackPending as i32),
+		"the actual collected operation remains pending without a final coin row");
 	let outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(outputs.len(), 1);
 	assert_eq!(outputs[0].1.value, sat(99_000));
@@ -663,6 +670,11 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		assert_eq!(row.get::<_, String>("status"), "confirmed");
 		assert_eq!(row.get::<_, Option<String>>("sweep_txid"), Some(payout.txid.to_string()));
 		canonical_cut(&ctx, &srv, &db, &boundary, &destination, &provider_destination, payout, &original.source, &operator_pool).await;
+		let terminal = srv.get_public_rpc().await.check_lightning_receive(protos::CheckLightningReceiveRequest {
+			hash: hash.to_vec(), wait: false,
+		}).await.unwrap().into_inner();
+		assert_eq!(terminal.invoice, invoice.to_string());
+		assert_eq!(terminal.fallback_spend_state, Some(protos::VtxoSpendState::Spent as i32));
 	}
 	assert_eq!(gate.claims.load(Ordering::SeqCst), 1);
 	assert_eq!(gate.registrations.load(Ordering::SeqCst), 0);

@@ -35,6 +35,7 @@ impl From<LightningHtlcSubscription> for protos::CheckLightningReceiveResponse {
 			amount_sat: v.amount().to_sat(),
 			status: protos::LightningReceiveStatus::from(v.status) as i32,
 			htlc_vtxos: v.htlc_vtxos.into_iter().map(|v| v.to_bytes().to_vec()).collect(),
+			fallback_spend_state: None,
 		}
 	}
 }

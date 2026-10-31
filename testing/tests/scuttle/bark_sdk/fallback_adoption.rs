@@ -683,6 +683,12 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 	assert_eq!(sends[0].effective_balance, bitcoin::SignedAmount::ZERO,
 		"the input-owner commitment did not transfer 60k to the provisional recipient");
 	let mut rpc = srv.get_public_rpc().await;
+	let original_status = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: source.id().to_bytes().to_vec(),
+		attestation: VtxoStatusAttestation::new(source.id(), &owner.get_vtxo_key(&source).await.unwrap()).serialize(),
+	}).await.unwrap().into_inner();
+	assert_eq!(original_status.spend_state, own_status as i32,
+		"all provisional split portions project back to the known input owner");
 	let mut queries = Vec::new();
 	for coin in &leaves {
 		let key = if coin.user_pubkey() == recipient_key { recipient.get_vtxo_key(coin).await.unwrap() }

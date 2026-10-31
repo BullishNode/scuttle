@@ -13,7 +13,7 @@ use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 use super::expiry_chain::ExpiryViewToken;
 use super::expiry_lightning::LightningSourceState;
 use super::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
-use super::ln::LightningHtlcSubscriptionStatus;
+use super::ln::{LightningHtlcSubscription, LightningHtlcSubscriptionStatus};
 use super::expiry_inventory::BackingSnapshot;
 use super::Tx;
 use crate::watchman::readiness::INVENTORY_LIMITS;
@@ -32,6 +32,35 @@ pub struct FallbackClaim {
 	pub transaction_id: Option<Txid>,
 	pub output_index: Option<u32>,
 	pub confirmed_block: Option<BlockRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackOutcome {
+	Pending,
+	Spent,
+	Forfeited,
+}
+
+/// A known source cannot retire because only its first paid portion was
+/// returned. All of its principal must be covered by canonical decisions.
+fn fallback_outcome<'a>(principal: Amount, claims: impl IntoIterator<Item = &'a FallbackClaim>)
+	-> anyhow::Result<Option<FallbackOutcome>>
+{
+	let mut covered = Amount::ZERO;
+	let mut pending = false;
+	let mut paid = false;
+	let mut any = false;
+	for claim in claims {
+		any = true;
+		covered = covered.checked_add(claim.gross).context("fallback source coverage overflow")?;
+		pending |= claim.confirmed_block.is_none();
+		paid |= claim.payout > Amount::ZERO;
+	}
+	ensure!(covered <= principal, "fallback decisions exceed their known source");
+	Ok(if !any { None }
+		else if pending || covered != principal { Some(FallbackOutcome::Pending) }
+		else if paid { Some(FallbackOutcome::Spent) }
+		else { Some(FallbackOutcome::Forfeited) })
 }
 
 fn receive_timeout_allowed(
@@ -127,6 +156,86 @@ pub struct PendingExpiryPayout {
 }
 
 impl Tx<'_> {
+	/// Follow only immutable registered OOR edges. The stage resolver below
+	/// still decides whether a descendant is actually this input owner's right;
+	/// sharing a transaction or a mailbox is not sufficient.
+	async fn source_fallback_claims(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
+		if ids.is_empty() { return Ok(BTreeMap::new()); }
+		let raw = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+		let rows = self.query("WITH RECURSIVE branch AS (
+			SELECT vtxo_id,oor_spent_txid,spent_in_round,offboarded_in FROM vtxo WHERE vtxo_id=ANY($1)
+			UNION
+			SELECT v.vtxo_id,v.oor_spent_txid,v.spent_in_round,v.offboarded_in
+			FROM vtxo v JOIN branch p ON v.vtxo_txid=p.oor_spent_txid
+			WHERE p.spent_in_round IS NULL AND p.offboarded_in IS NULL
+		) SELECT vtxo_id FROM branch", &[&raw]).await?;
+		let mut candidates = ids.iter().copied().collect::<BTreeSet<_>>();
+		for row in rows { candidates.insert(row.get::<_, &str>("vtxo_id").parse()?); }
+		self.fallback_claims(&candidates.into_iter().collect::<Vec<_>>()).await
+	}
+
+	/// Aggregate direct and stage-selected input-owner portions onto the
+	/// authenticated coin identity. Keep birth ownership separate from payee.
+	pub(crate) async fn fallback_outcomes(&self, ids: &[VtxoId])
+		-> anyhow::Result<BTreeMap<VtxoId, FallbackOutcome>>
+	{
+		let claims = self.source_fallback_claims(ids).await?;
+		let sources = self.get_existing_server_vtxos_by_id(ids).await?;
+		let owners = self.coin_owner_mailboxes(ids).await?;
+		let mut outcomes = BTreeMap::new();
+		for (id, source) in sources {
+			let Some(owner) = owners.get(&id) else { continue; };
+			let matching = claims.values().filter(|claim|
+				claim.owner_mailbox == *owner && claim.source_vtxo_ids.contains(&id));
+			if let Some(outcome) = fallback_outcome(source.vtxo.amount(), matching)? {
+				outcomes.insert(id, outcome);
+			}
+		}
+		Ok(outcomes)
+	}
+
+	/// A collected receive can have no final coin row. Use its actual grants
+	/// and admitted destination bindings, not the provider's grant ownership.
+	/// The public hash-only response receives an outcome, never these keys.
+	pub(crate) async fn receive_fallback_outcome(&self, sub: &LightningHtlcSubscription)
+		-> anyhow::Result<Option<FallbackOutcome>>
+	{
+		let rows = self.query("SELECT v.vtxo_id,v.amount,c.output_vtxo_id,c.output_vtxo
+			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id AND h.direction='outgoing'
+			JOIN lightning_htlc_subscription s ON s.id=v.lightning_htlc_subscription_id AND s.payment_hash=h.payment_hash
+			LEFT JOIN expiry_lightning_receive_claim c ON c.source_vtxo_id=v.vtxo_id
+				AND c.subscription_id=s.id AND c.payment_hash=s.payment_hash
+			WHERE s.id=$1 AND s.payment_hash=$2 ORDER BY v.vtxo_id",
+			&[&sub.id, &sub.payment_hash.to_string()]).await?;
+		let grants = rows.iter().map(|row| row.get::<_, &str>("vtxo_id").parse())
+			.collect::<Result<BTreeSet<VtxoId>, _>>()?;
+		ensure!(grants == sub.htlc_vtxos.iter().copied().collect(), "receive grant identities differ from subscription");
+		let mut principal = Amount::ZERO;
+		let mut destinations = BTreeMap::new();
+		let mut ids = grants.iter().copied().collect::<Vec<_>>();
+		for row in rows {
+			let source: VtxoId = row.get::<_, &str>("vtxo_id").parse()?;
+			let amount = Amount::from_sat(u64::try_from(row.get::<_, i64>("amount"))?);
+			principal = principal.checked_add(amount).context("receive grant amount overflow")?;
+			let Some(raw) = row.get::<_, Option<&[u8]>>("output_vtxo") else { continue; };
+			let output = ark::Vtxo::<ark::vtxo::Full>::deserialize(raw)?;
+			let output_id: VtxoId = row.get::<_, &str>("output_vtxo_id").parse()?;
+			ensure!(output.id() == output_id
+				&& output.amount() == amount, "receive destination differs from its source");
+			let Some((id, key)) = self.receive_claim_recipient(source).await? else { continue; };
+			ensure!(id == output.id(), "collected receive destination differs");
+			let super::expiry_attribution::Attribution::Owned { mailbox_pk, .. } = self.expiry_owner(key).await? else {
+				bail!("collected receive destination has no admitted mailbox");
+			};
+			destinations.insert(id, mailbox_pk);
+			ids.push(id);
+		}
+		let claims = self.source_fallback_claims(&ids).await?;
+		let matching = claims.values().filter(|claim| destinations.iter().any(|(id, owner)|
+			claim.owner_mailbox == *owner && claim.source_vtxo_ids.contains(id)));
+		fallback_outcome(principal, matching)
+	}
+
 	/// Select the winning economic decision before filtering for customer claims.
 	/// The receipt describes that decision; it does not promote a pending parent
 	/// or replace the wallet's independent canonical-chain confirmation check.
@@ -543,6 +652,36 @@ mod tests {
 	use crate::database::expiry_inventory::BackingVtxoFact;
 	use LightningHtlcSubscriptionStatus::{Canceled, Created, Accepted, HtlcsReady, Settled};
 	use HtlcResolution::{Fulfilled, Revoked};
+	use bitcoin::hashes::Hash;
+
+	#[test]
+	fn source_outcome_requires_complete_canonical_coverage() {
+		let key = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[7;32]).unwrap().public_key();
+		let mut first = FallbackClaim {
+			vtxo_id: ark::test_util::VTXO_VECTORS.board_vtxo.id(), source_vtxo_ids: BTreeSet::new(),
+			allocation_id: 1, owner_mailbox: key, gross: Amount::from_sat(40_000),
+			fee: Amount::from_sat(1_000), payout: Amount::from_sat(39_000), forfeited: Amount::ZERO,
+			transaction_id: None, output_index: Some(0), confirmed_block: None,
+		};
+		let principal = Amount::from_sat(100_000);
+		assert_eq!(fallback_outcome(principal, []).unwrap(), None);
+		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
+		first.confirmed_block = Some(BlockRef { height: BlockHeight::new(1), hash: bitcoin::BlockHash::all_zeros() });
+		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
+		let mut second = FallbackClaim {
+			vtxo_id: first.vtxo_id, source_vtxo_ids: BTreeSet::new(), allocation_id: 2, owner_mailbox: key,
+			gross: Amount::from_sat(60_000), fee: Amount::from_sat(1_000), payout: Amount::ZERO,
+			forfeited: Amount::from_sat(59_000), transaction_id: None, output_index: None, confirmed_block: None,
+		};
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
+		second.confirmed_block = first.confirmed_block;
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Spent));
+		first.payout = Amount::ZERO; first.forfeited = Amount::from_sat(39_000);
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Forfeited));
+		assert!(fallback_outcome(Amount::from_sat(99_999), [&first, &second]).is_err());
+		first.confirmed_block = None;
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
+	}
 
 	#[test]
 	fn receive_timeout_keeps_collected_and_inflight_grants() {

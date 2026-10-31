@@ -511,6 +511,9 @@ message CheckLightningReceiveResponse {
 	LightningReceiveStatus status = 3;
 	// Empty until the status is HTLCS_READY or SETTLED
 	repeated bytes htlc_vtxos = 4;
+	// Aggregate expiry outcome of the actual collected receive destination.
+	// This hash-only query never returns mailbox identities or allocation data.
+	optional VtxoSpendState fallback_spend_state = 1000;
 }
 
 // offboard
