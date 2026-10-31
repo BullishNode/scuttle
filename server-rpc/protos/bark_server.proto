@@ -184,7 +184,7 @@ message GetVtxoRequest {
 
 message GetVtxoResponse {
 	bytes vtxo = 1;
-	bytes owner_mailbox = 1000;
+	reserved 1000;
 }
 
 message GetVtxosByIdsRequest {
@@ -198,8 +198,7 @@ message GetVtxosByIdsResponse {
 	repeated bytes vtxos = 1;
 	// Requested ids the server does not know, each once.
 	repeated bytes missing_vtxo_ids = 2;
-	// Keyed by ID, independent of duplicate request IDs or response order.
-	repeated core.VtxoOwner owners = 1000;
+	reserved 1000;
 }
 
 // Client-relevant spend state for a user-owned VTXO.

@@ -165,13 +165,11 @@ impl rpc::server::ArkService for Server {
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 
-		let (vtxo_state, owners) = self.db.read(async |t| Ok((
-			t.get_server_vtxo_by_id(id).await?, t.coin_owner_mailboxes(&[id]).await?,
-		))).await.to_status()?;
+		let vtxo_state = self.db.read(async |t| t.get_server_vtxo_by_id(id).await)
+			.await.to_status()?;
 
 		let response = protos::GetVtxoResponse {
 			vtxo: vtxo_state.vtxo.serialize(),
-			owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
 		};
 
 		Ok(tonic::Response::new(response))
@@ -234,9 +232,8 @@ impl rpc::server::ArkService for Server {
 
 		// Unknown ids are reported, not an error, so one bad id does not
 		// cost the client the whole batch.
-		let (found, owners) = self.db.read(async |t| Ok((
-			t.get_existing_server_vtxos_by_id(&ids).await?, t.coin_owner_mailboxes(&ids).await?,
-		))).await.to_status()?;
+		let found = self.db.read(async |t| t.get_existing_server_vtxos_by_id(&ids).await)
+			.await.to_status()?;
 
 		let mut missing = Vec::new();
 		for id in &ids {
@@ -250,7 +247,6 @@ impl rpc::server::ArkService for Server {
 				.filter_map(|id| found.get(id).map(|v| v.vtxo.serialize()))
 				.collect(),
 			missing_vtxo_ids: missing.iter().map(|id| id.to_bytes().to_vec()).collect(),
-			owners: super::convert::owner_mailboxes(&owners),
 		}))
 	}
 

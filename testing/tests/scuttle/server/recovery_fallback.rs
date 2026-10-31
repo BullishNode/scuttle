@@ -91,8 +91,8 @@ async fn assert_pending_statuses(
 	for (((coin, key), expected), owner) in coins.iter().zip(keys).zip(expected).zip(owner_mailboxes) {
 		let owner = owner.map(|key| key.serialize().to_vec()).unwrap_or_default();
 		let full = rpc.get_vtxo(protos::GetVtxoRequest { vtxo_id: coin.id().to_bytes().to_vec() }).await.unwrap().into_inner();
-		assert_eq!(full.vtxo, coin.serialize(), "foreign ownership must not hide unilateral-exit data");
-		assert_eq!(full.owner_mailbox, owner);
+		assert_eq!(full, protos::GetVtxoResponse { vtxo: coin.serialize() },
+			"public signed bodies carry no mailbox identity, including foreign coins");
 		let query = protos::VtxoStatusQuery { vtxo_id: coin.id().to_bytes().to_vec(),
 			attestation: VtxoStatusAttestation::new(coin.id(), key).serialize() };
 		let response = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
@@ -114,12 +114,12 @@ async fn assert_pending_statuses(
 	let mut ids = coins.iter().map(|coin| coin.id().to_bytes().to_vec()).collect::<Vec<_>>();
 	ids.push(ids[0].clone());
 	let full = rpc.get_vtxos_by_ids(protos::GetVtxosByIdsRequest { vtxo_ids: ids }).await.unwrap().into_inner();
-	assert_eq!(full.vtxos.len(), coins.len() + 1);
-	assert_eq!(full.owners.len(), owner_mailboxes.iter().flatten().count());
+	assert_eq!(full, protos::GetVtxosByIdsResponse {
+		vtxos: coins.iter().chain([&coins[0]]).map(ProtocolEncoding::serialize).collect(),
+		missing_vtxo_ids: Vec::new(),
+	}, "public batch bodies preserve duplicates without disclosing mailbox identities");
 	for ((coin, expected), owner) in coins.iter().zip(expected).zip(owner_mailboxes) {
 		let owner = owner.map(|key| key.serialize().to_vec()).unwrap_or_default();
-		assert_eq!(full.owners.iter().find(|entry| entry.vtxo_id == coin.id().to_bytes().to_vec())
-			.map(|entry| entry.owner_mailbox.clone()).unwrap_or_default(), owner);
 		assert_eq!(batch.vtxos.iter().find(|entry| entry.vtxo_id == coin.id().to_bytes().to_vec()).map(|entry| entry.spend_state),
 			expected.map(|state| state as i32));
 		assert_eq!(recovered.vtxos.iter().find(|entry| Vtxo::<Full>::deserialize(&entry.vtxo).unwrap().id() == coin.id())
