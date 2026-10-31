@@ -9,6 +9,10 @@
   both processed views before treating an on-chain revocation as terminal.
   Refuse a first claim inside the existing margin of its earliest grant expiry.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Retry failed hold settlements without blocking unrelated durable settlements.
+  Timeout processing reports each invoice failure and continues the pass while
+  keeping the original payment and retry evidence.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
 - Record each Lightning settlement's actual attempt, receive or on-chain source
   with its preimage. Missing or inconsistent provenance holds the affected funds
   instead of authorizing a refund or an operator payout from cached status.

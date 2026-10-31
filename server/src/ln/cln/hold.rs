@@ -256,18 +256,20 @@ impl ClnHoldProcess {
 
 		let tip = self.sync_manager.chain_tip().height;
 		for htlc_subscription in htlc_subscriptions {
-			let Some(reason) = self.cancel_reason(&htlc_subscription, tip).await? else {
-				continue;
-			};
-			let Some(_guard) = self.try_lock_subscription(&htlc_subscription).await? else {
-				continue;
-			};
-			self.cancel_invoice_and_htlc_subscription(
-				&mut hold_client,
-				htlc_subscription.invoice.payment_hash(),
-				&htlc_subscription,
-				reason,
-			).await?;
+			let result = async {
+				let Some(reason) = self.cancel_reason(&htlc_subscription, tip).await? else { return Ok(()); };
+				let Some(_guard) = self.try_lock_subscription(&htlc_subscription).await? else { return Ok(()); };
+				self.cancel_invoice_and_htlc_subscription(
+					&mut hold_client,
+					htlc_subscription.invoice.payment_hash(),
+					&htlc_subscription,
+					reason,
+				).await
+			}.await;
+			if let Err(error) = result {
+				error!(subscription_id = htlc_subscription.id, payment_hash = %htlc_subscription.payment_hash,
+					error = %format!("{error:#}"), "Hold invoice timeout handling failed; will retry independently");
+			}
 		}
 
 		Ok(())

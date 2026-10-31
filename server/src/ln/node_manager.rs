@@ -32,7 +32,7 @@
 //! broadcasts the result without making a backend round-trip.
 
 use std::fmt;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -810,9 +810,8 @@ impl LightningManager {
 	///   never got to. Both can end up settling the same invoice, so
 	///   [`LightningManager::settle_invoice`] tolerates losing that race.
 	///
-	/// - Retry on failure: a settlement that fails is retried on the same
-	///   item every 5 seconds until it succeeds, so one stuck preimage does
-	///   not advance past unsettled work but never abandons it either.
+	/// - Retry on failure: retain the failed durable item for another attempt
+	///   after 5 seconds while continuing to read unrelated settlements.
 	///
 	/// - Backoff: 5s sleep between retries avoids busy-looping when the
 	///   backend or database is persistently unavailable. The preimage is
@@ -832,21 +831,24 @@ async fn run_hold_settler(
 ) {
 	let _worker = srv.rtmgr.spawn_critical("HoldSettler");
 	tokio::pin!(settlement_stream);
+	let mut retry = VecDeque::<(tokio::time::Instant, super::settler::Settlement)>::new();
 
 	loop {
-		let item = tokio::select! {
-			item = settlement_stream.next() => item,
+		let next_retry = retry.front().map(|(at, _)| *at).unwrap_or_else(tokio::time::Instant::now);
+		let settlement = tokio::select! {
+			item = settlement_stream.next() => match item {
+				Some(item) => item,
+				None => break,
+			},
+			_ = tokio::time::sleep_until(next_retry), if !retry.is_empty() =>
+				retry.pop_front().expect("retry was nonempty").1,
 			_ = srv.rtmgr.shutdown_signal() => return,
 		};
 
-		let Some(settlement) = item else { break };
-		let (payment_hash, preimage) = (settlement.hash, settlement.preimage);
-
-		while !try_settle_hold_invoice(&srv, payment_hash, preimage).await {
-			tokio::select! {
-				_ = tokio::time::sleep(Duration::from_secs(5)) => {},
-				_ = srv.rtmgr.shutdown_signal() => return,
-			}
+		if !try_settle_hold_invoice(&srv, settlement.hash, settlement.preimage).await {
+			// The WAL remains authoritative across restart; this queue only
+			// schedules the same item's next attempt in the current process.
+			retry.push_back((tokio::time::Instant::now() + Duration::from_secs(5), settlement));
 		}
 	}
 	error!("Hold settler exited: hold invoices will no longer be settled automatically");
