@@ -1,0 +1,3 @@
+- Add `fallback::payout_script`, the BIP86 output paid for a mailbox key.
+  The server and the wallet use the same function.
+  [#4](https://github.com/BullishNode/scuttle/pull/4)
