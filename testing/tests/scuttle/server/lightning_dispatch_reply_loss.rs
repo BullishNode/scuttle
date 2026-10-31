@@ -125,8 +125,17 @@ async fn recorded_count_zero_request_with_no_delay_room_stays_held() {
 		.expect("the original request's zero-room hold and retained unilateral path must finish");
 }
 
+/// A healthy native node cannot accept a newly initiated request with
+/// exactly zero original routing room, even though its signed source is live.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn initial_zero_delay_refusal_leaves_original_htlc_revocable() {
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(true, false, false, RestartCut::InitialZeroDelay)).await
+		.expect("healthy native zero-room preflight refusal and full signed revocation must finish");
+}
+
 #[derive(Clone, Copy)]
-enum RestartCut { None, QueuedNative, BeforeFirstRpc, PreflightRefusal, NoDelayRoom }
+enum RestartCut { None, QueuedNative, BeforeFirstRpc, PreflightRefusal, NoDelayRoom, InitialZeroDelay }
 
 async fn external_success_during_restart(routed: bool) {
 	external_success_with_fault(routed, false, false, RestartCut::None).await;
@@ -135,9 +144,11 @@ async fn external_success_during_restart(routed: bool) {
 async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadline: bool, restart: RestartCut) {
 	let zero_part_restart = matches!(restart, RestartCut::QueuedNative);
 	let no_delay_room = matches!(restart, RestartCut::NoDelayRoom);
-	let preflight_refusal = matches!(restart, RestartCut::PreflightRefusal);
+	let initial_zero_delay = matches!(restart, RestartCut::InitialZeroDelay);
+	let preflight_refusal = matches!(restart, RestartCut::PreflightRefusal | RestartCut::InitialZeroDelay);
 	let count_zero_restart = matches!(restart, RestartCut::BeforeFirstRpc | RestartCut::NoDelayRoom);
 	let ctx = TestContext::new(if no_delay_room { "scuttle/count_zero_no_delay_room" }
+		else if initial_zero_delay { "scuttle/native_initial_zero_delay_refusal_revocation" }
 		else if preflight_refusal { "scuttle/native_preflight_refusal_revocation" }
 		else if count_zero_restart { "scuttle/count_zero_native_bark_crash_recovery" }
 		else if zero_part_restart { "scuttle/zero_part_native_bark_crash_redrive" }
@@ -284,17 +295,49 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 			if line.contains("payment refused before recording an attempt") { *observed.lock().unwrap() = true; }
 			false
 		});
-		// This changes only the real owned daemon's availability. The proxy
-		// never substitutes an error or a financial/native status.
-		lightning.internal.stop().await.unwrap();
+		let native_identity = if initial_zero_delay {
+			let policy_expiry = grants[0].policy().as_server_htlc_send().unwrap().htlc_expiry;
+			let zero_tip = policy_expiry.saturating_sub(srv.config().htlc_expiry_delta);
+			assert_eq!(zero_tip + srv.config().htlc_expiry_delta, policy_expiry);
+			let height = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+			assert!(zero_tip > height, "the genuinely issued source must initially have positive room");
+			ctx.generate_blocks(zero_tip.checked_blocks_since(height).unwrap()).await;
+			let info = lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner();
+			assert_eq!(info.blockheight, zero_tip.to_u32());
+			assert_eq!(info.id, lightning.internal.id().await);
+			assert_eq!(info.version, "v26.06.6");
+			assert_eq!(info.network, "regtest");
+			let processed = db.read(async |tx| tx.get_highest_block(server::database::BlockTable::Captaind).await).await.unwrap().unwrap();
+			assert_eq!(processed.height, zero_tip);
+			let eligible = db.read(async |tx| tx.get_user_vtxos_by_id(&sources).await).await.unwrap();
+			assert_eq!(eligible.len(), sources.len());
+			for source in eligible {
+				assert!(source.vtxo.expiry_height() > zero_tip, "coin expiry must not mask the initial zero-room guard");
+				source.check_htlc_send_spendable(zero_tip).unwrap();
+			}
+			let ids = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
+			let fences = db.read(async |tx| Ok(tx.query_one("SELECT \
+				(SELECT COUNT(*) FROM expiry_hold WHERE vtxo_id=ANY($1)), \
+				(SELECT COUNT(*) FROM expiry_allocation_input WHERE vtxo_id=ANY($1))", &[&ids]).await?)).await.unwrap();
+			assert_eq!(fences.get::<_,i64>(0), 0);
+			assert_eq!(fences.get::<_,i64>(1), 0);
+			tokio::fs::write(ctx.datadir.join("initial-zero-preflight-cut.json"), serde_json::to_vec_pretty(
+				&serde_json::json!({"payment_hash":hash.to_string(),"sources":ids,"native_tip":info.blockheight,
+					"processed_tip":processed.height.to_u32(),"source_htlc_expiry":policy_expiry.to_u32(),
+					"configured_margin":srv.config().htlc_expiry_delta.to_u32(),"source_coin_expiry":grants[0].expiry_height().to_u32(),
+					"native_version":info.version,"native_network":info.network,"native_node":info.id})
+			).unwrap()).await.unwrap();
+			Some(lightning.internal.native_child().await.unwrap())
+		} else {
+			// This changes only the real owned daemon's availability. The proxy
+			// never substitutes an error or a financial/native status.
+			lightning.internal.stop().await.unwrap();
+			None
+		};
+		// Compare the new initial-zero RPC against the real post-mining cut;
+		// the unavailable-node case keeps its original before-stop snapshot.
+		let before = if initial_zero_delay { super::owner_helpers::source_rows(&db, &sources).await } else { before };
 		let response = rpc.initiate_lightning_payment(request).await;
-		tokio::fs::write(ctx.datadir.join("preflight-public-reply.json"), serde_json::to_vec_pretty(
-			&serde_json::json!({ "accepted":response.is_ok(), "code":response.as_ref().err().map(|e|format!("{:?}",e.code())) })
-		).unwrap()).await.unwrap();
-		assert_eq!(response.expect_err("the real unavailable native endpoint must refuse before attempt").code(), tonic::Code::Internal);
-		tokio::time::timeout(Duration::from_secs(10), async {
-			while !*refused.lock().unwrap() { tokio::time::sleep(Duration::from_millis(20)).await; }
-		}).await.expect("the real RPC log must identify PaymentPreflightRefusal, not an unrelated error");
 		let counts = db.read(async |tx| Ok(tx.query_one("SELECT \
 			(SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$1), \
 			(SELECT COUNT(*) FROM cln_xpay WHERE payment_hash=$1), \
@@ -302,7 +345,31 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 			(SELECT COUNT(*) FROM mailbox WHERE payment_hash=$1), \
 			(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$2)",
 			&[&hash.to_string(), &sources[0].to_string()]).await?)).await.unwrap();
+		// Retain the actual old/fixed result BEFORE requiring refusal. On the
+		// old app this shows the accepted real LPA/request/link at count zero;
+		// it is not relabelled as a preflight refusal or a safe terminal state.
+		let attempt = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap();
+		let requests = db.read(async |tx| server::database::xpay::get_xpays_by_payment_hash(&**tx, hash).await).await.unwrap();
+		let pays = if initial_zero_delay { Some(remote_pays(&lightning.internal, hash).await) } else { None };
+		tokio::fs::write(ctx.datadir.join("preflight-public-reply.json"), serde_json::to_vec_pretty(
+			&serde_json::json!({"accepted":response.is_ok(),"code":response.as_ref().err().map(|e|format!("{:?}",e.code())),
+				"row_counts":(0..5).map(|column|counts.get::<_,i64>(column)).collect::<Vec<_>>(),
+				"attempt":attempt.as_ref().map(|a|serde_json::json!({"id":a.id,"status":a.status.to_string(),"final_amount_msat":a.final_amount_msat})),
+				"requests":requests.iter().map(|r|serde_json::json!({"id":r.id,"label":r.label,"dispatch_count":r.dispatch_count,
+					"status":format!("{:?}",r.status),"htlc_expiry":r.htlc_expiry.map(|h|h.to_u32())})).collect::<Vec<_>>(),
+				"native_pays":pays.as_ref().map(|rows|rows.iter().map(|p|serde_json::json!({"label":p.label,
+					"status":format!("{:?}",p.status()),"created_index":p.created_index,"amount_msat":p.amount_msat.as_ref().map(|a|a.msat),
+					"amount_sent_msat":p.amount_sent_msat.as_ref().map(|a|a.msat),"preimage_present":p.preimage.is_some()})).collect::<Vec<_>>())})
+		).unwrap()).await.unwrap();
+		assert_eq!(response.expect_err(if initial_zero_delay { "the healthy native initial zero-room request must refuse before attempt" }
+			else { "the real unavailable native endpoint must refuse before attempt" }).code(), tonic::Code::Internal);
+		tokio::time::timeout(Duration::from_secs(10), async {
+			while !*refused.lock().unwrap() { tokio::time::sleep(Duration::from_millis(20)).await; }
+		}).await.expect("the real RPC log must identify PaymentPreflightRefusal, not an unrelated error");
 		for column in 0..5 { assert_eq!(counts.get::<_, i64>(column), 0); }
+		assert!(attempt.is_none());
+		assert!(requests.is_empty());
+		if let Some(pays) = pays { assert!(pays.is_empty()); }
 		assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
 		assert_eq!(super::owner_helpers::source_rows(&db, &sources).await, before);
 		let source = &grants[0];
@@ -325,7 +392,11 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 		refund[0].validate(&ctx.bitcoind().await_transaction(refund[0].chain_anchor().txid).await).unwrap();
 		// Normal same-store reopening permits an honest native readback. No
 		// public payment is replayed and no receiver action pays this invoice.
-		lightning.internal.start().await.unwrap();
+		if let Some(identity) = native_identity {
+			assert_eq!(lightning.internal.native_child().await.unwrap(), identity, "healthy native process must not restart");
+		} else {
+			lightning.internal.start().await.unwrap();
+		}
 		assert!(remote_pays(&lightning.internal, hash).await.is_empty());
 		assert!(lightning.internal.grpc_client().await.list_send_pays(cln_rpc::ListsendpaysRequest {
 			payment_hash:Some(hash.to_vec()), ..Default::default()
