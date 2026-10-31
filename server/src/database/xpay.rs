@@ -40,7 +40,7 @@ use crate::database::ln::LightningNodeId;
 const XPAY_COLUMNS: &str = "
 	id, lightning_node_id, payment_amount_msat, max_routing_fee_msat,
 	attempt_expiry, partial_msat, htlc_expiry, label, payment_hash,
-	user_fee_msat, user_agent, signed_invoice, status,
+	user_fee_msat, user_agent, signed_invoice, dispatch_count, status,
 	routing_fee_msat, error_code, created_at, updated_at
 ";
 
@@ -97,6 +97,9 @@ pub struct ClnXpayRecord {
 	/// Exact signed invoice sent in this request. A missing value cannot be
 	/// replaced from a hash, a later invoice or the node's aggregate outcome.
 	pub signed_invoice: Option<String>,
+	/// Monotonic local admissions, committed before their native RPC. NULL is
+	/// unknown history; a committed increment does not prove a call was sent.
+	pub dispatch_count: Option<u64>,
 
 	/// The fee we quoted the user at initiation, which is ours to keep.
 	pub user_fee_msat: Option<u64>,
@@ -111,7 +114,7 @@ pub struct ClnXpayRecord {
 	/// the intended amount.
 	pub routing_fee_msat: Option<i64>,
 	/// On fresh Scuttle calls, Some(205) is written only with a qualified live
-	/// 26.06.6 slow-mode NoRoute receipt in the attempt's error column, in the
+	/// 26.06.6 slow-mode NoRoute receipt for dispatch_count=1 in the attempt's error column, in the
 	/// same source-serialized terminal transaction. Other outcome writers and
 	/// upstream backfill leave it NULL. Neither this column nor status=fail
 	/// alone authorizes a transition or certifies any old/restored row.
@@ -158,6 +161,8 @@ impl TryFrom<Row> for ClnXpayRecord {
 			payment_hash: PaymentHash::from_str(row.get::<_, &str>("payment_hash"))
 				.context("error decoding payment hash from db")?,
 			signed_invoice: row.get("signed_invoice"),
+			dispatch_count: row.get::<_, Option<i64>>("dispatch_count").map(u64::try_from).transpose()
+				.context("negative xpay dispatch count")?,
 			user_fee_msat: row.get::<_, Option<i64>>("user_fee_msat")
 				.map(u64::try_from)
 				.transpose()
@@ -207,9 +212,9 @@ pub async fn create_xpay<T: GenericClient>(
 		INSERT INTO cln_xpay (
 			lightning_node_id, payment_amount_msat, max_routing_fee_msat,
 			attempt_expiry, partial_msat, htlc_expiry, label, payment_hash,
-			user_fee_msat, user_agent, signed_invoice
+			user_fee_msat, user_agent, signed_invoice, dispatch_count
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0)
 		RETURNING {XPAY_COLUMNS}
 	"), &[
 		Type::INT8, Type::INT8, Type::INT8, Type::TIMESTAMPTZ, Type::INT8,
@@ -250,6 +255,18 @@ pub async fn create_xpay<T: GenericClient>(
 	]).await.context("failed to create xpay")?;
 
 	ClnXpayRecord::try_from(row)
+}
+
+/// The caller holds dispatch, source/settlement and attempt locks and has
+/// checked the exact request. A stale or terminal row cannot admit a call.
+pub async fn increment_xpay_dispatch<T: GenericClient>(
+	client: &T, record: &ClnXpayRecord,
+) -> anyhow::Result<Option<ClnXpayRecord>> {
+	let previous = i64::try_from(record.dispatch_count.context("unknown xpay dispatch history")?)?;
+	ensure!(previous < i64::MAX, "xpay dispatch count exhausted");
+	let row = client.query_opt(&format!("UPDATE cln_xpay SET dispatch_count=dispatch_count+1,updated_at=NOW() \
+		WHERE id=$1 AND status='pending' AND dispatch_count=$2 RETURNING {XPAY_COLUMNS}"), &[&record.id, &previous]).await?;
+	row.map(ClnXpayRecord::try_from).transpose()
 }
 
 /// End a pending attempt as a success.

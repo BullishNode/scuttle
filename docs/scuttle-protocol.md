@@ -135,3 +135,31 @@ The initial release uses fresh matched Scuttle stores. It retains upstream
 migration payloads and runners unchanged; it does not upgrade funded registration-
 era Scuttle stores. Unrecognized, partial or incompatible stores are refused
 before writes instead of being silently repaired.
+
+
+## Lightning dispatch continuity
+
+An empty lookup for the attempt's own native label is not a failure receipt.
+The monitor may re-drive the original signed request on its recorded node while
+retaining custody. It uses the original amount, fee cap and retry duration; every
+call freshly bounds `maxdelay` by the original absolute HTLC deadline. The original
+wall timestamp is not reset and does not prove that native routing ended. Intra-Ark
+payments never use this path. A successful payment under another label cannot
+charge the current attempt.
+
+Each native call first commits a monotonic admission count on its existing
+`cln_xpay` row. A count records admission, not proof that the RPC reached CLN.
+Only a qualified first-dispatch NoRoute reply can complete the zero-part failure
+path, with count one rechecked in the terminal transaction. After multiple
+admissions, NoRoute remains unresolved; the attempt follows its actual own native
+records. Missing signed requests, caps or count history remain held and alarmed;
+they are not reconstructed from defaults or copied outcomes.
+
+Automatic recovery assumes continuity of the recorded node's configured endpoint,
+authentication and persistent store, using the pinned CLN build. The node public
+key and `getinfo` response do not prove a store generation. Only one captaind
+dispatcher may use the store at a time; dispatch guards are process-local. A stale or ambiguous
+PostgreSQL/CLN restore is not replay-safe: keep that node disabled until the pair's
+continuity is established. Do not reset the admission count or switch an unresolved
+attempt to a different node. Old Scuttle stores without these fresh request fields
+are refused rather than upgraded or backfilled with invented history.

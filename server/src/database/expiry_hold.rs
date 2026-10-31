@@ -48,6 +48,18 @@ impl Tx<'_> {
 		Ok(())
 	}
 
+	/// Called only by the authenticated terminal attempt writer after it holds
+	/// the source locks. Other ownership/settlement holds remain independent.
+	pub(crate) async fn clear_lightning_dispatch_holds(&self, attempt: i64) -> anyhow::Result<()> {
+		for row in self.query("DELETE FROM expiry_hold h USING lightning_payment_attempt_htlc_vtxo l \
+			WHERE l.lightning_payment_attempt_id=$1 AND l.vtxo_id=h.vtxo_id \
+			AND h.reason IN ('lightning_request_binding_invalid','lightning_dispatch_unqualified', \
+				'lightning_dispatch_admission_failed','lightning_multiple_dispatches_unresolved') RETURNING h.vtxo_id", &[&attempt]).await? {
+			slog!(ExpiryHoldDecision, vtxo_id: row.get::<_, &str>(0).parse::<VtxoId>()?);
+		}
+		Ok(())
+	}
+
 	/// The confirmed prefix replaces this physical parent's pending split.
 	/// It does not resolve a customer's ownership or settlement uncertainty.
 	pub(crate) async fn clear_completed_split_hold(&self, id: VtxoId, txid: bitcoin::Txid) -> anyhow::Result<()> {

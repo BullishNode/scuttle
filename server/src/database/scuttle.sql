@@ -4,6 +4,8 @@ SET LOCAL search_path TO scuttle, public;
 -- The original signed request is required to bind a future same-node resume.
 -- NULL is unqualified evidence, never permission to reconstruct an invoice.
 ALTER TABLE public.cln_xpay ADD COLUMN signed_invoice TEXT;
+-- No default/backfill: only a fresh request writer can initialize zero.
+ALTER TABLE public.cln_xpay ADD COLUMN dispatch_count BIGINT CHECK (dispatch_count >= 0);
 
 CREATE INDEX expiry_vtxo_anchor_point_ix ON vtxo (anchor_point, vtxo_id);
 
