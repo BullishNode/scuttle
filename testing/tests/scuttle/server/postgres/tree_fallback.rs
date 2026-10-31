@@ -402,3 +402,55 @@ async fn dropped_group_leaves_no_cancellation() {
 		&[&participation]).await?.get::<_, i64>(0))).await.unwrap(), 1,
 		"only the final selected decision may cancel the original participation");
 }
+
+#[tokio::test]
+async fn expiry_fence_releases_only_operator_shares_of_conflicted_allocations() {
+	let (_ctx, db) = test_db("expiry_fence_conflicted_operator_share").await;
+	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
+	let id = coin.id();
+	let vtxo_id = id.to_string();
+	db.write(async |tx| tx.execute_vtxo_tree_update(
+		VtxoTreeUpdate::new().insert_spendable_vtxos([coin.clone()])).await).await.unwrap();
+	// The watchman claim and progress paths use this fence.
+	let fenced = async || match db.write(async |tx| tx.lock_unallocated_watchman_inputs(&[id]).await).await {
+		Ok(()) => false,
+		Err(error) => {
+			assert!(error.is::<server::FallbackRefusal>(), "{error:#}");
+			true
+		},
+	};
+	let new_allocation = async |status: &'static str| db.write(async |tx| Ok(tx.query_one(
+		"INSERT INTO expiry_allocation(expiry_height,status) VALUES(100,$1) RETURNING id", &[&status],
+	).await?.get::<_, i64>(0))).await.unwrap();
+	let conflict = async |allocation: i64| db.write(async |tx| Ok(tx.execute(
+		"UPDATE expiry_allocation SET status='conflicted' WHERE id=$1", &[&allocation],
+	).await?)).await.unwrap();
+	assert!(!fenced().await, "an undecided coin is not fenced");
+
+	let entitlement = db.write(async |tx| Ok(tx.query_one(
+		"INSERT INTO expiry_entitlement(vtxo_id,gross_sat) VALUES($1,10000) RETURNING id", &[&vtxo_id],
+	).await?.get::<_, i64>(0))).await.unwrap();
+	assert!(fenced().await, "an entitlement without an allocation stays fenced");
+
+	let operator = new_allocation("pending").await;
+	db.write(async |tx| Ok(tx.execute("INSERT INTO expiry_allocation_coin(allocation_id,entitlement_id,\
+		disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,active,evidence) \
+		VALUES($1,$2,'operator',10000,0,0,0,TRUE,'{}')", &[&operator, &entitlement]).await?)).await.unwrap();
+	assert!(fenced().await, "a live operator decision is fenced");
+	conflict(operator).await;
+	assert!(!fenced().await, "an operator share of a conflicted allocation reserves nothing");
+
+	let spending = new_allocation("pending").await;
+	db.write(async |tx| Ok(tx.execute("INSERT INTO expiry_allocation_input(allocation_id,vtxo_id) VALUES($1,$2)",
+		&[&spending, &vtxo_id]).await?)).await.unwrap();
+	assert!(fenced().await, "the input of a pending allocation is fenced");
+	conflict(spending).await;
+	assert!(!fenced().await, "the input of a conflicted allocation is not");
+
+	let customer = new_allocation("conflicted").await;
+	db.write(async |tx| Ok(tx.execute("INSERT INTO expiry_allocation_coin(allocation_id,entitlement_id,\
+		owner_mailbox,user_pubkey,spk,disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,active,evidence) \
+		VALUES($1,$2,repeat('0',66),'key','script','customer',10000,1000,9000,0,FALSE,'{}')",
+		&[&customer, &entitlement]).await?)).await.unwrap();
+	assert!(fenced().await, "a customer entitlement stays fenced after a conflict");
+}

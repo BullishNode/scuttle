@@ -47,7 +47,7 @@ use crate::database::htlc_vtxo::{self, HtlcDirection};
 use crate::database::tree::VtxoTreeUpdate;
 pub use crate::intman::{CAPTAIND_API_KEY, CAPTAIND_CLI_API_KEY};
 pub use crate::config::Config;
-pub use crate::error::OwnershipRefusal;
+pub use crate::error::{FallbackRefusal, OwnershipRefusal};
 pub use bark_common::{fs_perms, secret};
 
 use std::collections::HashSet;
