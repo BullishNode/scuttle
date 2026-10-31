@@ -86,6 +86,15 @@ enum PayInvoiceRace {
 	Canceled,
 }
 
+/// Unlike a recorded attempt's outcome, this refusal must reach the caller.
+#[derive(Debug, thiserror::Error)]
+#[error("payment refused before recording an attempt: {0:#}")]
+struct PaymentPreflightRefusal(#[source] anyhow::Error);
+
+fn payment_error_reaches_caller(error: &anyhow::Error) -> bool {
+	error.is::<crate::error::FallbackRefusal>() || error.is::<PaymentPreflightRefusal>()
+}
+
 /// Handle for the cln manager process.
 pub struct LightningManager {
 	db: database::Db,
@@ -262,7 +271,7 @@ impl LightningManager {
 			attempt_block_height,
 			retry_for,
 		).await {
-			if e.is::<crate::error::FallbackRefusal>() { return Err(e); }
+			if payment_error_reaches_caller(&e) { return Err(e); }
 			// The attempt is already recorded as failed and the client sees the
 			// failure via CheckLightningPayment. Benign races (someone else paid
 			// or canceled the invoice first) surface as PayInvoiceRace and
@@ -305,20 +314,25 @@ impl LightningManager {
 		retry_for: Duration,
 	) -> anyhow::Result<()> {
 		let payment_hash = invoice.payment_hash();
-		let node = self.active_node().context("no active cln node")?;
-		let tip = node.rpc.clone().getinfo(cln_rpc::GetinfoRequest {}).await
-			.context("failed to get info from rpc")?
-			.into_inner().blockheight;
-
-		debug!("Selected cln node {} for bolt11 payment with payment hash {} and amount {}. \
-			Current block height is {}", node.id, payment_hash, amount, tip,
-		);
+		let node = self.active_node().context("no active cln node").map_err(PaymentPreflightRefusal)?;
 
 		// If a subscription already exists for this payment hash, the payment
 		// routes through the intra-Ark path. Only an attempt that actually
 		// promotes its subscription is linked as that receive's funding.
 		let sub = self.db.read(async |t| t.get_htlc_subscription_by_payment_hash(payment_hash).await).await?;
 		let validation = sub.as_ref().map(|sub| validate_intra_ark_payment(sub, &invoice, amount));
+		// Refuse an unqualified external endpoint before committing an attempt.
+		// Dispatch still rechecks it: endpoint changes after commit stay unknown.
+		let info = if sub.is_none() {
+			node.xpay.qualify_before_attempt().await.map_err(PaymentPreflightRefusal)?
+		} else {
+			node.rpc.clone().getinfo(cln_rpc::GetinfoRequest {}).await
+				.context("failed to get info from rpc")?.into_inner()
+		};
+		let tip = info.blockheight;
+		debug!("Selected cln node {} for bolt11 payment with payment hash {} and amount {}. \
+			Current block height is {}", node.id, payment_hash, amount, tip,
+		);
 
 		// Read here, while we are still on the user's RPC task: every later
 		// status transition of this attempt is emitted by the xpay monitor,
@@ -330,7 +344,8 @@ impl LightningManager {
 		// cln_xpay next to the attempt. An intra-Ark payment never calls xpay
 		// and gets no row. The deadlines are computed here, before anything is
 		// stored, so a payment we cannot make leaves nothing behind.
-		let mut new_xpay = if sub.is_none() {
+		let mut new_xpay = async {
+			if sub.is_some() { return Ok::<_, anyhow::Error>(None); }
 			// A lagging CLN must not enlarge the route's budget beyond the
 			// processed server tip or the height already bound to this attempt.
 			let server_tip = self.db.read(async |t| t.get_highest_block(database::BlockTable::Captaind).await)
@@ -349,7 +364,7 @@ impl LightningManager {
 				.context("retry_for does not fit in a timestamp")?;
 			let htlc_expiry = tip + max_cltv_expiry_delta;
 
-			Some((max_cltv_expiry_delta, NewClnXpay {
+			Ok(Some((max_cltv_expiry_delta, NewClnXpay {
 				lightning_node_id: node.id,
 				payment_amount_msat: amount.to_msat(),
 				max_routing_fee_msat: Some(max_routing_fee.to_msat()),
@@ -358,12 +373,11 @@ impl LightningManager {
 				htlc_expiry: Some(htlc_expiry),
 				label: None,
 				payment_hash,
+				signed_invoice: Some(invoice.to_string()),
 				user_fee_msat: Some(user_fee.to_msat()),
 				user_agent: user_agent.as_deref().map(str::to_string),
-			}))
-		} else {
-			None
-		};
+			})))
+		}.await.map_err(PaymentPreflightRefusal)?;
 
 		let (attempt_id, promoted) = self.db.write(async |t| {
 			// Lock the funding sources before promoting the receive. The attempt
@@ -1312,5 +1326,21 @@ impl LightningManagerProcess {
 				},
 			};
 		}
+	}
+}
+
+#[cfg(test)]
+mod preflight_test {
+	use super::*;
+
+	#[test]
+	fn pre_attempt_refusals_reach_the_client_without_reclassifying_recorded_outcomes() {
+		let refusal: anyhow::Error = PaymentPreflightRefusal(anyhow!("native mode acknowledgement refused")).into();
+		assert!(payment_error_reaches_caller(&refusal));
+		assert!(payment_error_reaches_caller(&refusal.context("before attempt write")));
+		let id = VtxoId::from_slice(&[0; 36]).unwrap();
+		assert!(payment_error_reaches_caller(&crate::error::FallbackRefusal::DecidedForFallback(id).into()));
+		assert!(!payment_error_reaches_caller(&PayInvoiceRace::Canceled.into()));
+		assert!(!payment_error_reaches_caller(&anyhow!("recorded intra-Ark outcome failed")));
 	}
 }

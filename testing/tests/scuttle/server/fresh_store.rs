@@ -92,3 +92,30 @@ async fn registration_shaped_shadow_store_is_refused_without_writes() {
 	assert_eq!(client.query_one("SELECT record FROM scuttle.fallback_record WHERE mailbox_pk='original'", &[])
 		.await.unwrap().get::<_,Vec<u8>>(0), vec![1,2,3]);
 }
+
+/// The new request column belongs only to the fresh initializer. An earlier
+/// Scuttle shape is preserved/refused, never silently altered on reconnect.
+#[tokio::test]
+async fn requestless_scuttle_store_is_refused_without_history_changes() {
+	let mut ctx = TestContext::new_minimal("postgresd/requestless_scuttle_store_refused").await;
+	ctx.init_central_postgres().await;
+	let config = ctx.new_postgres(&ctx.test_name).await;
+	let db = Db::create(&config, bitcoin::Network::Regtest).await.unwrap();
+	drop(db);
+	let client = ctx.postgres_manager().database_client(Some(&config.name)).await;
+	client.batch_execute("ALTER TABLE public.cln_xpay DROP COLUMN signed_invoice").await.unwrap();
+	let history = "SELECT version,name,checksum FROM public.refinery_schema_history ORDER BY version";
+	let before = client.query(history, &[]).await.unwrap().into_iter()
+		.map(|row| (row.get::<_, i32>(0), row.get::<_, String>(1), row.get::<_, String>(2))).collect::<Vec<_>>();
+	let error = match Db::connect(&config, bitcoin::Network::Regtest).await {
+		Ok(_) => panic!("old requestless Scuttle shape must be refused"),
+		Err(error) => error,
+	};
+	assert!(format!("{error:#}").contains("incomplete Scuttle schema"));
+	let after = client.query(history, &[]).await.unwrap().into_iter()
+		.map(|row| (row.get::<_, i32>(0), row.get::<_, String>(1), row.get::<_, String>(2))).collect::<Vec<_>>();
+	assert_eq!(after, before);
+	assert!(!client.query_one("SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE \
+		table_schema='public' AND table_name='cln_xpay' AND column_name='signed_invoice')", &[])
+		.await.unwrap().get::<_, bool>(0), "reopen must not repair the old store");
+}

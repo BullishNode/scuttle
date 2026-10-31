@@ -489,3 +489,64 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 			&[&source.to_string()]).await?.get::<_, String>(0))).await.unwrap(), "settlement_provenance_unknown");
 	}
 }
+
+/// Signed request storage/rollback only; these SQL rows are not native outcomes.
+#[tokio::test]
+async fn original_signed_xpay_invoice_survives_reopen_and_outcome_writes() {
+	let mut ctx = TestContext::new_minimal("postgresd/original_signed_xpay_invoice").await;
+	ctx.init_central_postgres().await;
+	let config = ctx.new_postgres(&ctx.test_name).await;
+	Db::create(&config, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&config, bitcoin::Network::Regtest).await.unwrap();
+	let key = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
+	let (node, _) = db.write(async |tx| tx.register_lightning_node(&key).await).await.unwrap();
+	let invoice = Invoice::from_str(BOLT11_INVOICE).unwrap();
+	invoice.check_signature().unwrap();
+	let new = NewClnXpay {
+		lightning_node_id: node, payment_hash: invoice.payment_hash(), signed_invoice: Some(invoice.to_string()),
+		payment_amount_msat: invoice.amount_msat().unwrap_or(2000), max_routing_fee_msat: Some(1000),
+		attempt_expiry: Local::now() + TimeDelta::seconds(5), partial_msat: None,
+		htlc_expiry: Some(BlockHeight::new(200)), label: Some("original-signed-request".into()),
+		user_fee_msat: Some(1000), user_agent: None,
+	};
+	let rolled_back: anyhow::Result<()> = db.write(async |tx| {
+		let attempt = tx.store_lightning_payment_start(node, &invoice, sat(2), None, &[], None,
+			BlockHeight::new(1), sat(1), None, Duration::from_secs(5), Some(sat(1))).await?;
+		let mut original = new.clone(); original.label = Some(attempt.to_string());
+		let row = xpay::create_xpay(&**tx, &original).await?;
+		assert_eq!(row.original_invoice()?, invoice);
+		anyhow::bail!("roll back the original signed xpay request")
+	}).await;
+	assert!(format!("{:#}", rolled_back.unwrap_err()).contains("roll back the original signed xpay request"));
+	assert!(db.read(async |tx| xpay::get_xpays_by_payment_hash(&**tx, new.payment_hash).await).await.unwrap().is_empty());
+	assert!(db.read(async |tx| tx.get_open_lightning_payment_attempt_by_payment_hash(new.payment_hash).await).await.unwrap().is_none());
+	let row = db.write(async |tx| {
+		let attempt = tx.store_lightning_payment_start(node, &invoice, sat(2), None, &[], None,
+			BlockHeight::new(1), sat(1), None, Duration::from_secs(5), Some(sat(1))).await?;
+		let mut original = new.clone(); original.label = Some(attempt.to_string());
+		xpay::create_xpay(&**tx, &original).await
+	}).await.unwrap();
+	drop(db);
+	let db = Db::connect(&config, bitcoin::Network::Regtest).await.unwrap();
+	let restored = db.read(async |tx| xpay::get_xpay_by_id(&**tx, row.id).await).await.unwrap().unwrap();
+	assert_eq!(restored, row);
+	assert_eq!(restored.signed_invoice.as_deref(), Some(BOLT11_INVOICE));
+	assert_eq!(restored.original_invoice().unwrap(), invoice);
+	let original_attempt = db.read(async |tx| tx.get_open_lightning_payment_attempt_by_payment_hash(new.payment_hash).await).await.unwrap().unwrap();
+	assert_eq!(restored.label, Some(original_attempt.id.to_string()));
+	assert_eq!(restored.payment_amount_msat, original_attempt.amount_msat);
+	for change in 0..3 {
+		let mut unqualified = restored.clone();
+		match change {
+			0 => unqualified.signed_invoice = None,
+			1 => unqualified.signed_invoice = Some("not a signed invoice".into()),
+			2 => unqualified.payment_hash = Preimage::random().compute_payment_hash(),
+			_ => unreachable!(),
+		}
+		assert!(unqualified.original_invoice().is_err());
+		assert_eq!(unqualified.status, ClnXpayStatus::Pending, "bad request evidence never supplies a terminal outcome");
+	}
+	let ended = db.write(async |tx| xpay::mark_xpay_fail(&**tx, row.id, None).await).await.unwrap().unwrap();
+	assert_eq!(ended.signed_invoice, restored.signed_invoice);
+	assert_eq!(ended.original_invoice().unwrap(), invoice);
+}
