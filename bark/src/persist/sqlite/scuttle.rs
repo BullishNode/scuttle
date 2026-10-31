@@ -28,8 +28,10 @@ pub(super) fn is_fresh(conn: &Connection) -> anyhow::Result<bool> {
 		[], |row| row.get(0),
 	)?;
 	ensure!(tables == 2, "incomplete Scuttle wallet schema; use a fresh store");
+	// Scuttle tables are created right after upstream migration 42. Later
+	// upstream migrations apply to an existing Scuttle wallet as usual.
 	let version: i64 = conn.query_row("SELECT MAX(value) FROM migrations", [], |row| row.get(0))?;
-	ensure!(version == 42, "unrecognized wallet migration history; use a fresh Scuttle store");
+	ensure!(version >= 42, "unrecognized wallet migration history; use a fresh Scuttle store");
 	Ok(false)
 }
 

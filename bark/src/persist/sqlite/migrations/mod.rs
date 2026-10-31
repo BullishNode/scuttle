@@ -330,6 +330,19 @@ mod test {
 	}
 
 	#[test]
+	fn scuttle_wallet_reopens_after_a_later_upstream_migration() {
+		let mut conn = Connection::open_in_memory().unwrap();
+		let ctx = MigrationContext::new();
+		ctx.do_all_migrations(&mut conn).unwrap();
+		// What an upstream migration added after this release records.
+		conn.execute("INSERT INTO migrations (value) VALUES (43)", []).unwrap();
+		ctx.do_all_migrations(&mut conn).unwrap();
+		ctx.do_all_migrations(&mut conn).unwrap();
+		assert_current_version(&conn, 43).unwrap();
+		assert!(table_exists(&conn, "bark_mailbox_identity").unwrap());
+	}
+
+	#[test]
 	fn old_fork_wallet_is_refused_before_migration_writes() {
 		let mut conn = Connection::open_in_memory().unwrap();
 		conn.execute_batch("CREATE TABLE migrations (value INTEGER NOT NULL);
