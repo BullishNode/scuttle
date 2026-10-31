@@ -459,11 +459,6 @@ impl Lightningd {
 		Daemon::wrap(inner)
 	}
 
-	/// Kill and reap this node without letting it persist a graceful shutdown.
-	pub async fn crash_stop(&self) -> anyhow::Result<()> {
-		self.stop_with_signal(nix::sys::signal::Signal::SIGKILL).await
-	}
-
 	/// Kill only the unique installed xpay child of this owned native node.
 	#[cfg(target_os = "linux")]
 	pub async fn kill_owned_xpay(&self) -> anyhow::Result<crate::daemon::NativeProcessIdentity> {

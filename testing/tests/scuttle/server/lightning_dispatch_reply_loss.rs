@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, ensure};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
@@ -75,7 +77,7 @@ async fn recovery_records_its_native_routing_fee() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn coded_xpay_error_retains_its_own_pending_payment() {
-	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, true, false)).await
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, true, false, false)).await
 		.expect("the native plugin fault and original settlement tail must finish");
 }
 
@@ -84,16 +86,24 @@ async fn coded_xpay_error_retains_its_own_pending_payment() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn timed_out_rpc_that_later_completes_settles() {
-	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, false, true)).await
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, false, true, false)).await
 		.expect("the genuine deadline, Pending custody and late completion must finish");
 }
 
-async fn external_success_during_restart(routed: bool) {
-	external_success_with_fault(routed, false, false).await;
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn zero_part_native_call_survives_bark_crash_and_redrive() {
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(true, false, false, true)).await
+		.expect("the genuine queued native commands, task loss and original settlement tail must finish");
 }
 
-async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadline: bool) {
-	let ctx = TestContext::new(if rpc_deadline { "scuttle/timed_out_rpc_that_later_completes_settles" }
+async fn external_success_during_restart(routed: bool) {
+	external_success_with_fault(routed, false, false, false).await;
+}
+
+async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadline: bool, zero_part_restart: bool) {
+	let ctx = TestContext::new(if zero_part_restart { "scuttle/zero_part_native_bark_crash_redrive" }
+		else if rpc_deadline { "scuttle/timed_out_rpc_that_later_completes_settles" }
 		else if plugin_fault { "scuttle/coded_xpay_error_own_pending" }
 		else if routed { "server/recovery_records_its_native_routing_fee" }
 		else { "server/recovery_binds_restarted_payment_success_to_source" }).await;
@@ -211,11 +221,38 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 		min_final_cltv_expiry: Some(18), expiry: Some(3600), routing_hints: vec![],
 	}).await.unwrap().into_inner().bolt11;
 	lightning.sync().await;
+	#[cfg(target_os = "linux")]
+	let queued = if zero_part_restart {
+		match queue_native_routing(&lightning.internal, receiving_node).await {
+			Ok(queue) => Some(queue),
+			Err(error) => {
+				askrene_threads(&lightning.internal, 4).await.unwrap();
+				panic!("native queue setup failed: {error:#}");
+			},
+		}
+	} else { None };
 	let mut xpay_returned = (plugin_fault || rpc_deadline).then(|| srv.subscribe_log::<XpayRpcReturned>());
 	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 100_000, htlc_vtxo_ids: vec![sources[0].to_bytes().to_vec()],
-		mailbox_id: (routed || plugin_fault || rpc_deadline).then(|| mailbox.mailbox().serialize()), retry_for_secs: Some(5),
+		mailbox_id: (routed || plugin_fault || rpc_deadline || zero_part_restart).then(|| mailbox.mailbox().serialize()), retry_for_secs: Some(5),
 	}).await.unwrap();
+	#[cfg(target_os = "linux")]
+	if let Some(queue) = queued {
+		let result = observe_queued_redrive(&srv, &lightning.internal, hash, &sources, &queue).await;
+		// Restore this fresh owned node even when the target observation fails.
+		let restored = askrene_threads(&lightning.internal, 4).await;
+		let record = match &result {
+			Ok(record) => record.clone(),
+			Err(error) => {
+				let error = format!("{error:#}");
+				serde_json::json!({"disposition": if error.contains("MISSED_TARGET") { "MISSED_TARGET" } else { "FAILED" },
+					"error":error, "native_observations": queue.logs.lock().unwrap().clone()})
+			},
+		};
+		tokio::fs::write(ctx.datadir.join("zero-part-native-recovery.json"), serde_json::to_vec_pretty(&record).unwrap()).await.unwrap();
+		restored.unwrap(); result.unwrap();
+		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 0).await;
+	}
 	receiving_node.wait_for_hold_invoice_accepted(hash).await;
 	drop(client);
 	drop(wallet);
@@ -626,6 +663,197 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 	if plugin_fault {
 		assert_eq!(fault_target, Some(true), "MISSED_TARGET or inconsistent native window: see own-pending-window.json");
 	}
+}
+
+/// Observe only the native IDs and public routing events for this isolated
+/// invoice. A second local admission or an empty lookup is not survival proof.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Default, serde::Serialize)]
+struct QueuedNativeLogs {
+	payments: BTreeSet<u64>,
+	queued: BTreeSet<String>,
+	continuing: BTreeSet<u64>,
+	lines: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+struct QueuedNativeRouting {
+	logs: Arc<Mutex<QueuedNativeLogs>>,
+	probe: cln_rpc::GetroutesRequest,
+	identity: ark_testing::daemon::NativeProcessIdentity,
+}
+
+#[cfg(target_os = "linux")]
+async fn askrene_threads(node: &Lightningd, threads: u32) -> anyhow::Result<()> {
+	let config = node.grpc_client().await.set_config(cln_rpc::SetconfigRequest {
+		config: "askrene-max-threads".into(), val: Some(threads.to_string()), transient: Some(true),
+	}).await?.into_inner().config.context("native setconfig acknowledgement missing")?;
+	ensure!(config.config == "askrene-max-threads" && config.dynamic
+		&& config.value_int == Some(i64::from(threads)), "native Askrene thread setting was not acknowledged");
+	Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn queue_native_routing(node: &Lightningd, recipient: &Lightningd) -> anyhow::Result<QueuedNativeRouting> {
+	askrene_threads(node, 4).await?;
+	let source = node.id().await;
+	let destination = recipient.id().await;
+	let probe = cln_rpc::GetroutesRequest {
+		source: source.clone(), destination: destination.clone(),
+		amount_msat: Some(cln_rpc::Amount { msat: 100_000_000 }),
+		layers: vec!["auto.localchans".into(), "auto.sourcefree".into()],
+		maxfee_msat: Some(cln_rpc::Amount { msat: 1_000_000 }),
+		final_cltv: 18, maxdelay: Some(40), maxparts: Some(1),
+	};
+	let routes = node.grpc_client().await.get_routes(probe.clone()).await?.into_inner();
+	ensure!(!routes.routes.is_empty(), "the nonmonetary queue-release route must work before the fault");
+	let identity = node.native_child().await?;
+	let logs = Arc::new(Mutex::new(QueuedNativeLogs::default()));
+	let observed = logs.clone();
+	let endpoints = format!("{} to {}", source.to_lower_hex_string(), destination.to_lower_hex_string());
+	node.add_stdout_handler(move |line: &str| {
+		let mut logs = observed.lock().unwrap();
+		let mut matched = false;
+		if let Some((prefix, route)) = line.split_once(": getroutes from ") {
+			if prefix.contains("xpay:") && route == endpoints {
+				if let Some(id) = prefix.split_whitespace().last().and_then(|id| id.parse::<u64>().ok()) {
+					logs.payments.insert(id); matched = true;
+				}
+			}
+		}
+		if let Some((prefix, state)) = line.split_once(": getroutes_done: ") {
+			if prefix.contains("xpay:") {
+				if let Some(id) = prefix.split_whitespace().last().and_then(|id| id.parse::<u64>().ok()) {
+					// "ignoring" means its original command already ended; it
+					// cannot establish the unresolved-A concurrency target.
+					if state == "continuing" { logs.continuing.insert(id); }
+					matched = true;
+				}
+			}
+		}
+		if let Some((prefix, _)) = line.split_once(": Too many running at once (0 vs 0): waiting") {
+			// Askrene logs both its own command and a forwarded notification.
+			// Count only its native command ID, never the Xpay notification.
+			if let Some((_, command)) = prefix.rsplit_once("askrene: ") {
+				logs.queued.insert(command.to_owned()); matched = true;
+			}
+		}
+		if matched { logs.lines.push(line.to_owned()); }
+		false
+	});
+	askrene_threads(node, 0).await?;
+	Ok(QueuedNativeRouting { logs, probe, identity })
+}
+
+#[cfg(target_os = "linux")]
+async fn observe_queued_redrive(
+	srv: &Captaind, node: &Lightningd, hash: PaymentHash, sources: &[VtxoId], queue: &QueuedNativeRouting,
+) -> anyhow::Result<serde_json::Value> {
+	tokio::time::timeout(Duration::from_secs(10), async {
+		loop {
+			{
+				let logs = queue.logs.lock().unwrap();
+				if logs.payments.len() == 1 && !logs.queued.is_empty() { break; }
+			}
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}).await.context("MISSED_TARGET: original native call A was not observed queued")?;
+	let original_logs = queue.logs.lock().unwrap().clone();
+	let original_id = *original_logs.payments.first().context("native A ID missing")?;
+	ensure!(original_logs.continuing.is_empty(), "MISSED_TARGET: A already left the native queue");
+	let db = Db::connect(&srv.config().postgres, Network::Regtest).await?;
+	let original = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await?
+		.context("original economic attempt missing")?;
+	ensure!(!original.status.is_final() && original.error.is_none() && original.final_amount_msat.is_none(),
+		"the initial queued call must retain its original unsettled attempt");
+	let label = original.id.to_string();
+	let mut records = db.read(async |tx| server::database::xpay::get_xpays_by_payment_hash(&**tx, hash).await).await?;
+	ensure!(records.len() == 1, "one public intent must have one original request");
+	let record = records.pop().unwrap();
+	ensure!(record.dispatch_count == Some(1) && record.label.as_deref() == Some(label.as_str())
+		&& record.lightning_node_id == original.lightning_node_id && record.signed_invoice.is_some(),
+		"MISSED_TARGET: the first native call is not the single original request admission");
+	let source_rows = super::owner_helpers::source_rows(&db, sources).await;
+	let native_channels = normal_channels(node).await?;
+	let before = node.native_child().await?;
+	ensure!(before == queue.identity, "the original native node changed before the crash");
+	// Native parts, not an authored local row, define this zero-part cut.
+	ensure!(remote_pays(node, hash).await.is_empty(), "MISSED_TARGET: A already has a native pay record");
+	ensure!(node.grpc_client().await.list_send_pays(cln_rpc::ListsendpaysRequest {
+		payment_hash: Some(hash.to_vec()), ..Default::default()
+	}).await?.into_inner().payments.is_empty(), "MISSED_TARGET: A already has native parts");
+	assert_one_source_dispatch(&db, hash, sources, original.id, &label, false, sat(1_000)).await;
+	let cap_before = srv.native_child().await?;
+	srv.crash_stop().await?;
+	ensure!(node.native_child().await? == before, "Bark task loss restarted the native node");
+	srv.start().await?;
+	let cap_after = srv.native_child().await?;
+	ensure!(cap_after != cap_before, "Bark did not start a new owned child");
+	let after = tokio::time::timeout(Duration::from_secs(40), async {
+		loop {
+			let mut rows = db.read(async |tx| server::database::xpay::get_xpays_by_payment_hash(&**tx, hash).await).await?;
+			ensure!(rows.len() == 1, "restart created another request row");
+			let row = rows.pop().unwrap();
+			let observed = queue.logs.lock().unwrap().clone();
+			if row.dispatch_count.is_some_and(|count| count >= 2)
+				&& observed.payments.len() >= 2 && observed.queued.len() >= 2 { break Ok::<_, anyhow::Error>(row); }
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}).await.context("MISSED_TARGET: automatic B was not observed queued after Bark task loss")??;
+	let mut unchanged = after.clone();
+	unchanged.dispatch_count = record.dispatch_count;
+	unchanged.updated_at = record.updated_at;
+	ensure!(unchanged == record, "re-drive changed the original signed invoice, node, label, fee or deadline binding");
+	ensure!(queue.logs.lock().unwrap().continuing.is_empty(), "MISSED_TARGET: native routing completed before release");
+	ensure!(node.native_child().await? == before && normal_channels(node).await? == native_channels,
+		"native process/store/channel continuity was lost");
+	ensure!(remote_pays(node, hash).await.is_empty(), "MISSED_TARGET: queued A/B acquired a native pay record");
+	ensure!(node.grpc_client().await.list_send_pays(cln_rpc::ListsendpaysRequest {
+		payment_hash: Some(hash.to_vec()), ..Default::default()
+	}).await?.into_inner().payments.is_empty(), "MISSED_TARGET: queued A/B acquired native parts");
+	let current = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await?.context("attempt lost")?;
+	ensure!(current.id == original.id && !current.status.is_final() && current.final_amount_msat.is_none()
+		&& current.error.is_none() && current.lightning_node_id == original.lightning_node_id
+		&& current.amount_msat == original.amount_msat && current.user_fee == original.user_fee
+		&& current.max_routing_fee == original.max_routing_fee && current.retry_for == original.retry_for
+		&& current.created_at == original.created_at && current.block_height == original.block_height,
+		"zero native records cannot release or settle the original attempt");
+	ensure!(super::owner_helpers::source_rows(&db, sources).await == source_rows, "queued custody changed across task loss");
+	assert_one_source_dispatch(&db, hash, sources, original.id, &label, false, sat(1_000)).await;
+	ensure!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await?.is_none(), "unpaid attempt gained a preimage");
+	let ids = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
+	let counts = db.read(async |tx| Ok(tx.query_one("SELECT \
+		(SELECT COUNT(*) FROM mailbox WHERE payment_hash=$1), \
+		(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($2))",
+		&[&hash.to_string(), &ids]).await?)).await?;
+	ensure!(counts.get::<_, i64>(0) == 0 && counts.get::<_, i64>(1) == 0,
+		"queued attempts cannot emit terminal mail or allocate a refund");
+	let queued = queue.logs.lock().unwrap().clone();
+	let second_id = *queued.payments.iter().find(|id| **id != original_id).context("distinct native B ID missing")?;
+	// Setting one alone does not wake idle waiters. Completing this SAME
+	// previously successful nonmonetary route query wakes the native FIFO.
+	askrene_threads(node, 1).await?;
+	let routes = tokio::time::timeout(Duration::from_secs(10), node.grpc_client().await.get_routes(queue.probe.clone()))
+		.await.context("native queue wake query timed out")??.into_inner();
+	ensure!(!routes.routes.is_empty(), "native queue wake query failed its original route contract");
+	tokio::time::timeout(Duration::from_secs(20), async {
+		loop {
+			{
+				let observed = queue.logs.lock().unwrap();
+				if observed.continuing.contains(&original_id) && observed.continuing.contains(&second_id) { break; }
+			}
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}).await.context("MISSED_TARGET: A did not survive as an active native command after Bark restart/release")?;
+	ensure!(node.native_child().await? == before, "native node changed during queue release");
+	Ok(serde_json::json!({ "disposition":"QUEUED_A_SURVIVED_AND_B_REDRIVEN",
+		"payment_hash":hash.to_string(), "sources":ids, "attempt":original.id, "label":label,
+		"native_a":original_id, "native_b":second_id, "dispatch_count_before":record.dispatch_count,
+		"dispatch_count_after":after.dispatch_count, "native_process":before,
+		"crashed_captaind":cap_before, "restarted_captaind":cap_after,
+		"native_observations":queue.logs.lock().unwrap().clone(),
+		"scope":"zero-part cut and live original A callback; final money assertions follow in the original fixture",
+		"not_proved":"a genuine B205 while A remains zero-part" }))
 }
 
 #[cfg(target_os = "linux")]
