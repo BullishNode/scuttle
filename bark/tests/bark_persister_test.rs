@@ -81,6 +81,7 @@ impl BarkPersister for Dummy {
 			exit_depth: 0,
 			exit_tx_weight: bitcoin::Weight::ZERO,
 			registered: false,
+			fallback_status: None,
 		}))
 	}
 
@@ -91,6 +92,7 @@ impl BarkPersister for Dummy {
 			exit_depth: 0,
 			exit_tx_weight: bitcoin::Weight::ZERO,
 			registered: false,
+			fallback_status: None,
 		}]))
 	}
 
@@ -103,6 +105,7 @@ impl BarkPersister for Dummy {
 			exit_depth: 0,
 			exit_tx_weight: bitcoin::Weight::ZERO,
 			registered: false,
+			fallback_status: None,
 		}]))
 	}
 
@@ -280,6 +283,7 @@ impl BarkPersister for Dummy {
 			exit_depth: 0,
 			exit_tx_weight: bitcoin::Weight::ZERO,
 			registered: false,
+			fallback_status: None,
 		}]).pop().unwrap())
 	}
 

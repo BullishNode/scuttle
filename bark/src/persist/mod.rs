@@ -694,6 +694,15 @@ pub trait BarkPersister: Send + Sync + 'static {
 		allowed_old_states: &[VtxoStateKind],
 	) -> anyhow::Result<WalletVtxo>;
 
+	/// Persist authenticated fallback status before changing spendability.
+	/// Keep the marker on the existing coin through terminal/reorg checks;
+	/// no ordinary cleanup may clear it or release its commitment.
+	async fn set_vtxo_fallback_status(&self, _id: VtxoId, _status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		bail!("this persister does not support durable fallback outcomes")
+	}
+
 	/// Release `holder`'s lock on the given vtxo, transitioning it to
 	/// [VtxoState::Spendable]. `holder` must match the value passed at
 	/// lock time (including `None` for locks taken without a holder).

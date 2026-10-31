@@ -389,6 +389,11 @@ async fn get_check_vtxo_state<S: StorageAdaptor>(
 		.context("vtxo not found")?;
 
 	let current_state = vtxo.current_state().context("vtxo has no state")?;
+	if let Some(status) = vtxo.fallback_status {
+		ensure!(current_state == new_state || *new_state == VtxoState::Exited
+			|| (status != crate::vtxo::FallbackStatus::Pending && *new_state == VtxoState::Spent),
+			"ordinary state change cannot release a fallback commitment");
+	}
 	let transition = if current_state == new_state {
 		StateTransition::AlreadyApplied
 	} else if allowed_states.contains(&current_state.kind()) {
@@ -427,7 +432,7 @@ async fn update_vtxo_state_checked<S: StorageAdaptor>(
 		adaptor.put(updated_record).await?;
 	}
 
-	Ok(wallet_vtxo_from_full(&serde_vtxo.vtxo, new_state, serde_vtxo.registered))
+	Ok(wallet_vtxo_from_full(&serde_vtxo.vtxo, new_state, serde_vtxo.registered, serde_vtxo.fallback_status))
 }
 
 pub struct StorageAdaptorWrapper<S: StorageAdaptor> {
@@ -706,6 +711,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 				vtxo: (*vtxo).clone(),
 				states: vec![(*state).clone()],
 				registered: false,
+				fallback_status: None,
 			};
 
 			let sk = sort::vtxo_sort_key(
@@ -741,7 +747,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 				let state = serde_vtxo.current_state()
 					.context("vtxo has no state")?.clone();
 				Ok(Some(wallet_vtxo_from_full(
-					&serde_vtxo.vtxo, state, serde_vtxo.registered,
+					&serde_vtxo.vtxo, state, serde_vtxo.registered, serde_vtxo.fallback_status,
 				)))
 			},
 			None => Ok(None),
@@ -757,7 +763,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			let state = serde_vtxo.current_state()
 				.context("vtxo has no state")?.clone();
 			out.push(wallet_vtxo_from_full(
-				&serde_vtxo.vtxo, state, serde_vtxo.registered,
+				&serde_vtxo.vtxo, state, serde_vtxo.registered, serde_vtxo.fallback_status,
 			));
 		}
 		Ok(out)
@@ -776,7 +782,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 					.cloned()
 					.context("vtxo has no state")?;
 				Ok(wallet_vtxo_from_full(
-					&serde_vtxo.vtxo, state, serde_vtxo.registered,
+					&serde_vtxo.vtxo, state, serde_vtxo.registered, serde_vtxo.fallback_status,
 				))
 			})
 			.collect()
@@ -805,7 +811,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 					.context("vtxo has no current state")?.clone();
 				debug_assert_eq!(current_state.kind(), *state);
 				records.push(wallet_vtxo_from_full(
-					&serde_vtxo.vtxo, current_state, serde_vtxo.registered,
+					&serde_vtxo.vtxo, current_state, serde_vtxo.registered, serde_vtxo.fallback_status,
 				));
 			}
 		}
@@ -838,7 +844,10 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	}
 
 	async fn remove_vtxo(&self, id: VtxoId) -> anyhow::Result<Option<Vtxo<Full>>> {
-		match self.inner.write().await.delete(partition::VTXO, &id.to_bytes()).await? {
+		let mut lock = self.inner.write().await;
+		ensure!(get_vtxo(&*lock, id).await?.is_none_or(|coin| coin.fallback_status.is_none()),
+			"fallback identity must be retained for status rechecks");
+		match lock.delete(partition::VTXO, &id.to_bytes()).await? {
 			Some(record) => Ok(Some(record.to_data::<SerdeVtxo>()?.vtxo)),
 			None => Ok(None),
 		}
@@ -861,6 +870,21 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		update_vtxo_state_checked(&mut *lock, vtxo_id, new_state, allowed_old_states).await
 	}
 
+	async fn set_vtxo_fallback_status(&self, id: VtxoId, status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		let mut lock = self.inner.write().await;
+		let mut coin = get_vtxo(&*lock, id).await?.context("fallback source is not stored")?;
+		let state = status.state_for(coin.current_state().context("fallback source has no state")?);
+		if coin.fallback_status != Some(status) || coin.current_state() != Some(&state) {
+			coin.fallback_status = Some(status);
+			if coin.current_state() != Some(&state) { coin.states.push(state.clone()); }
+			let sk = sort::vtxo_sort_key(state.kind(), coin.vtxo.expiry_height().to_u32(), coin.vtxo.amount());
+			lock.put(Record::from_data(partition::VTXO, &id.to_bytes(), Some(sk), &coin)?).await?;
+		}
+		Ok(coin.to_wallet_vtxo()?)
+	}
+
 	async fn release_vtxo_lock(
 		&self,
 		vtxo_id: VtxoId,
@@ -870,6 +894,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		let Some(mut serde_vtxo) = get_vtxo(&*lock, vtxo_id).await? else {
 			return Ok(());
 		};
+		if serde_vtxo.fallback_status.is_some() { return Ok(()); }
 		let expected = VtxoState::Locked { holder: holder.cloned() };
 		let current_state = serde_vtxo.current_state()
 			.context("vtxo has no state")?;
@@ -896,6 +921,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	) -> anyhow::Result<bool> {
 		let mut lock = self.inner.write().await;
 		let Some(coin) = get_vtxo(&*lock, vtxo_id).await? else { return Ok(false); };
+		if coin.fallback_status == Some(crate::vtxo::FallbackStatus::Pending) { return Ok(false); }
 		if coin.current_state() == Some(&VtxoState::Spent) { return Ok(true); }
 		let expected = VtxoState::Locked { holder: holder.cloned() };
 		if coin.current_state() != Some(&expected) { return Ok(false); }

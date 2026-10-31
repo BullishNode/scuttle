@@ -298,6 +298,16 @@ impl BarkPersister for SqliteClient {
 
 
 
+	async fn set_vtxo_fallback_status(&self, id: VtxoId, status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		let coin = query::set_vtxo_fallback_status(&tx, id, status)?;
+		tx.commit()?;
+		Ok(coin)
+	}
+
 	async fn get_fallback_receipts(&self) -> anyhow::Result<Vec<crate::FallbackReceipt>> {
 		let conn = self.connect()?;
 		let mut stmt = conn.prepare("SELECT receipt FROM bark_fallback_receipt ORDER BY vtxo_id")?;

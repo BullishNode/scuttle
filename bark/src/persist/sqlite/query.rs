@@ -424,7 +424,8 @@ pub fn get_pending_round_state_ids(
 /// Columns the `vtxo_view`-based listings always select, in the order
 /// [`row_to_wallet_vtxo`] expects them.
 const VTXO_VIEW_COLUMNS: &str =
-	"raw_bare, exit_depth, exit_tx_weight, state, registered";
+	"raw_bare, exit_depth, exit_tx_weight, state, registered,
+	(SELECT fallback_status FROM bark_vtxo b WHERE b.id=vtxo_view.id) AS fallback_status";
 
 pub fn get_wallet_vtxo_by_id(
 	conn: &Connection,
@@ -581,6 +582,8 @@ pub fn delete_vtxo(
 	tx: &rusqlite::Transaction,
 	id: VtxoId
 ) -> anyhow::Result<Option<Vtxo<Full>>> {
+	ensure!(get_wallet_vtxo_by_id(tx, id)?.is_none_or(|coin| coin.fallback_status.is_none()),
+		"fallback identity must be retained for status rechecks");
 	// Delete all vtxo-states
 	let query = "DELETE FROM bark_vtxo_state WHERE vtxo_id = ?1";
 	tx.execute(query, [id.to_string()])?;
@@ -647,6 +650,9 @@ pub fn update_vtxo_state_checked(
 		WHERE
 			vtxo_id = :vtxo_id AND
 			state_kind IN (SELECT atom FROM json_each(:old_states)) AND
+			EXISTS(SELECT 1 FROM bark_vtxo b WHERE b.id=:vtxo_id AND
+				(b.fallback_status IS NULL OR :state_kind='Exited'
+				 OR (b.fallback_status!='pending' AND :state_kind='Spent'))) AND
 			state != :state";
 
 	let new_state_blob = serde_json::to_vec(&new_state)?;
@@ -692,6 +698,7 @@ pub fn release_vtxo_lock(
 		SELECT :vtxo_id, :spendable_kind, :spendable FROM most_recent_vtxo_state
 		WHERE
 			vtxo_id = :vtxo_id AND
+			EXISTS(SELECT 1 FROM bark_vtxo b WHERE b.id=:vtxo_id AND b.fallback_status IS NULL) AND
 			state = :expected_state";
 
 	let expected = VtxoState::Locked { holder: holder.cloned() };
@@ -710,13 +717,27 @@ pub fn release_vtxo_lock(
 	Ok(())
 }
 
+pub fn set_vtxo_fallback_status(
+	tx: &Transaction, id: VtxoId, status: crate::vtxo::FallbackStatus,
+) -> anyhow::Result<WalletVtxo> {
+	let coin = get_wallet_vtxo_by_id(tx, id)?.context("fallback source is not stored")?;
+	let state = status.state_for(&coin.state);
+	tx.execute("UPDATE bark_vtxo SET fallback_status=?2 WHERE id=?1 AND fallback_status IS NOT ?2",
+		params![id.to_string(), status.as_str()])?;
+	tx.execute("INSERT INTO bark_vtxo_state(vtxo_id,state_kind,state)
+		SELECT ?1,?2,?3 FROM most_recent_vtxo_state WHERE vtxo_id=?1 AND state!=?3",
+		params![id.to_string(), state.kind().as_str(), serde_json::to_vec(&state)?])?;
+	get_wallet_vtxo_by_id(tx, id)?.context("fallback source disappeared")
+}
+
 /// Holder-scoped retirement, with no intermediate Spendable state.
 pub fn retire_vtxo_lock(
 	conn: &Connection, vtxo_id: VtxoId, holder: Option<&VtxoLockHolder>,
 ) -> anyhow::Result<bool> {
 	let changed = conn.execute("INSERT INTO bark_vtxo_state (vtxo_id,state_kind,state) \
 		SELECT :id,:kind,:next FROM most_recent_vtxo_state \
-		WHERE vtxo_id=:id AND state=:expected", named_params! {
+		WHERE vtxo_id=:id AND state=:expected AND EXISTS(SELECT 1 FROM bark_vtxo b
+			WHERE b.id=:id AND (b.fallback_status IS NULL OR b.fallback_status!='pending'))", named_params! {
 		":id": vtxo_id.to_string(),
 		":kind": VtxoStateKind::Spent.as_str(),
 		":next": serde_json::to_vec(&VtxoState::Spent)?,

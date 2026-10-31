@@ -4,7 +4,7 @@ mod signing;
 mod state;
 
 pub use self::selection::{FilterVtxos, RefreshStrategy, VtxoFilter};
-pub use self::state::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
+pub use self::state::{FallbackStatus, VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
 use std::time::Duration;
 

@@ -35,7 +35,7 @@ use crate::persist::models::{SerdeRoundState, StoredExit, StoredRoundState, Unlo
 use crate::lock_manager::LockManager;
 use crate::lock_manager::memory::MemoryLockManager;
 use crate::round::{RoundFlowState, RoundParticipation, RoundState};
-use crate::vtxo::{VtxoState, VtxoStateKind, WalletVtxo};
+use crate::vtxo::{FallbackStatus, VtxoState, VtxoStateKind, WalletVtxo};
 use crate::WalletProperties;
 
 // ---------------------------------------------------------------------------
@@ -87,6 +87,7 @@ macro_rules! bark_persister_tests {
 			test_store_existing_vtxo_preserves_holder_discharge_and_registration,
 			test_steal_lock_to_spent,
 			test_retire_vtxo_lock,
+			test_fallback_status_keeps_commitment_and_exit_state,
 			test_steal_lock,
 
 			test_create_and_get_movement,
@@ -597,6 +598,39 @@ pub async fn test_store_vtxos_idempotent(db: &impl BarkPersister) {
 	assert_eq!(stored.state, VtxoState::Spendable, "the state survives a repeated store");
 	assert_eq!(db.get_all_vtxos().await.expect("get_all_vtxos").len(), 1,
 		"a repeated store must not insert a second row");
+}
+
+pub async fn test_fallback_status_keeps_commitment_and_exit_state(db: &impl BarkPersister) {
+	let coin = &VTXO_VECTORS.board_vtxo;
+	let exited = &VTXO_VECTORS.round1_vtxo;
+	let holder = Some(MovementId::new(42).into());
+	let locked = VtxoState::Locked { holder: holder.clone() };
+	db.store_vtxos(&[(coin, &locked), (exited, &VtxoState::Exited)]).await.unwrap();
+	let pending = db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Pending).await.unwrap();
+	assert_eq!(pending.state, locked, "a pending decision preserves its original holder");
+	assert_eq!(pending.fallback_status, Some(FallbackStatus::Pending));
+	db.release_vtxo_lock(coin.id(), holder.as_ref()).await.unwrap();
+	assert!(!db.retire_vtxo_lock(coin.id(), holder.as_ref()).await.unwrap());
+	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap(), pending);
+	for state in [VtxoState::Spendable, VtxoState::Spent] {
+		assert!(db.update_vtxo_state_checked(coin.id(), state, VtxoStateKind::ALL).await.is_err());
+	}
+	assert!(db.remove_vtxo(coin.id()).await.is_err());
+	db.store_vtxos(&[(coin, &VtxoState::Spendable)]).await.unwrap();
+	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap(), pending);
+	let terminal = db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Spent).await.unwrap();
+	assert_eq!(terminal.state, VtxoState::Spent);
+	assert_eq!(db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Spent).await.unwrap(), terminal);
+	assert_eq!(db.get_vtxos_by_state(&[VtxoStateKind::Spent]).await.unwrap(), vec![terminal]);
+	let reorg = db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Pending).await.unwrap();
+	assert_eq!(reorg.state, VtxoState::Locked { holder: None });
+	assert_eq!(reorg.fallback_status, Some(FallbackStatus::Pending));
+	assert_eq!(db.get_full_vtxo(coin.id()).await.unwrap().unwrap().serialize(), coin.serialize());
+	for status in [FallbackStatus::Pending, FallbackStatus::Forfeited] {
+		let preserved = db.set_vtxo_fallback_status(exited.id(), status).await.unwrap();
+		assert_eq!(preserved.state, VtxoState::Exited, "an exposed exit keeps its ordinary observation lifecycle");
+		assert_eq!(preserved.fallback_status, Some(status));
+	}
 }
 
 /// Insert retries cannot erase an owned lock, remove a recovery registration,
