@@ -17,6 +17,7 @@ use bitcoin::bip32;
 use bitcoin::secp256k1::Keypair;
 use tracing::{error, info};
 use bitcoind_async_client::traits::Reader;
+use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
 
 use crate::bitcoin_blocklist::BitcoinAddressBlocklist;
 use crate::EPHEMERAL_KEY_PATH;
@@ -73,7 +74,7 @@ impl Daemon {
 		fs::create_dir_all(&cfg.data_dir).context("can't create dir")?;
 		fs_perms::harden(&cfg.data_dir, 0o700)?;
 
-		let db = database::Db::create(&cfg.postgres).await?;
+		let db = database::Db::create(&cfg.postgres, cfg.network).await?;
 
 		// Initiate key material.
 		let seed = {
@@ -120,7 +121,7 @@ impl Daemon {
 		info!("Starting server at {}", cfg.data_dir.display());
 
 		info!("Connecting to db at {}:{}", cfg.postgres.host, cfg.postgres.port);
-		let db = database::Db::connect(&cfg.postgres)
+		let db = database::Db::connect(&cfg.postgres, cfg.network)
 			.await
 			.context("failed to connect to db")?;
 
@@ -132,6 +133,7 @@ impl Daemon {
 				network, cfg.network,
 			);
 		}
+		bitcoind.require_txindex().await?;
 
 		let deep_tip = bcd::deep_tip(&bitcoind).await
 			.context("failed to query node for deep tip")?;
@@ -183,7 +185,6 @@ impl Daemon {
 		let listeners: Vec<Box<dyn ChainEventListener>> = vec![
 			Box::new(watchman_wallet.clone()),
 			Box::new(frontier.clone()),
-			Box::new(database::expiry_chain::ExpiryChainListener::start(db.clone(), BlockTable::Watchmand).await?),
 		];
 
 		let sync_manager = SyncManager::start(

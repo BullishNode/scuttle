@@ -335,7 +335,7 @@ async fn delegated_refresh_from_legacy_hashlock_round() {
 
 	// Make sure the round was actually conducted with the legacy clauses,
 	// otherwise this test silently degrades into a regular refresh test
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let round = db.read(async |t| {
 		let id = t.get_last_round_id().await?.expect("no round in db");
 		Ok(t.get_round(id).await?.expect("round not in db"))

@@ -38,6 +38,6 @@ pub const PROTOCOL_VERSION_BOARD_FUNDING_TX: u64 = 4;
 /// participations from clients below this version with an upgrade error.
 pub const PROTOCOL_VERSION_HASHLOCK_CLAUSES: u64 = 5;
 
-/// Version that carries coin-key signatures linking customer outputs to a
-/// registered fallback mailbox. The signed address delivery type is 0x02.
-pub const PROTOCOL_VERSION_OWNER_PROOF: u64 = 6;
+/// Scuttle's fixed fork wire epoch. Upstream and older fork clients must not
+/// interpret joint-owner fields, scoped status or fork spend states as upstream.
+pub const PROTOCOL_VERSION_SCUTTLE: u64 = 1000;

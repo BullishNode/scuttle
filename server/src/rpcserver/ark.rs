@@ -1,5 +1,6 @@
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -7,7 +8,9 @@ use std::sync::atomic;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ark::attestations::DelegatedRoundParticipationAttestation;
+use ark::attestations::ForfeitNoncesAttestation;
 use ark::attestations::OffboardRequestAttestation;
+use ark::attestations::RoundParticipationStatusAttestation;
 use ark::attestations::VtxoStatusAttestation;
 use ark::rounds::RoundAttemptAttestation;
 use bitcoin::consensus::serialize;
@@ -18,7 +21,6 @@ use bitcoin::secp256k1::{rand, PublicKey};
 use tokio::sync::oneshot;
 use futures::StreamExt;
 use tokio_stream::Stream;
-use tonic::codec::CompressionEncoding;
 use tower_http::cors::CorsLayer;
 use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
 use tracing::info;
@@ -35,8 +37,9 @@ use ark::tree::signed::{LeafVtxoCosignRequest, UnlockHash, UnlockPreimage};
 use ark::vtxo::Full;
 use ark::vtxo::policy::check_block_height;
 use bitcoin_ext::{BlockDelta, BlockHeight};
-use server_rpc::{self as rpc, protos, RequestExt, TryFromBytes};
+use server_rpc::{self as rpc, protos, TryFromBytes};
 use crate::database::SpendState;
+use crate::database::expiry_payout::FallbackOutcome;
 use crate::owner_proof::OwnerLinks;
 
 use crate::database::rounds::StoredRoundOutput;
@@ -78,6 +81,17 @@ fn client_spend_state(spend_state: SpendState, fallback_pending: bool) -> Option
 		| SpendState::RoundForfeit
 		| SpendState::OffboardForfeit
 		| SpendState::OffboardConnector => None,
+	}
+}
+
+fn fallback_spend_state(state: protos::VtxoSpendState,
+	outcome: Option<&FallbackOutcome>) -> protos::VtxoSpendState
+{
+	match outcome {
+		Some(FallbackOutcome::Forfeited) => protos::VtxoSpendState::FallbackForfeited,
+		Some(FallbackOutcome::Spent) => protos::VtxoSpendState::Spent,
+		Some(FallbackOutcome::Pending) => protos::VtxoSpendState::FallbackPending,
+		None => state,
 	}
 }
 
@@ -135,6 +149,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::OffboardFeeRateResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&_req)?;
 		let feerate = self.offboard_feerate();
 		Ok(tonic::Response::new(protos::OffboardFeeRateResponse {
 			sat_vkb: feerate.to_sat_per_kwu() * 4,
@@ -146,12 +161,13 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxoRequest>,
 	) -> Result<tonic::Response<protos::GetVtxoResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 
-		let vtxo_state = self.db.read(async |t| t.get_server_vtxo_by_id(id).await).await
-			.to_status()?;
+		let vtxo_state = self.db.read(async |t| t.get_server_vtxo_by_id(id).await)
+			.await.to_status()?;
 
 		let response = protos::GetVtxoResponse {
 			vtxo: vtxo_state.vtxo.serialize(),
@@ -165,16 +181,18 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxoStatusRequest>,
 	) -> Result<tonic::Response<protos::GetVtxoStatusResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 		let attestation = VtxoStatusAttestation::from_bytes(&req.attestation)?;
 
-		let (vtxo_state, fallback) = self.db.read(async |t| {
+		let (vtxo_state, fallback, owners, claims, outcomes) = self.db.read(async |t| {
 			let state = t.get_server_vtxo_by_id(id).await?;
 			let keys = state.vtxo.policy().user_pubkey().map(|key| (id, key)).into_iter().collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
-			Ok((state, fallback))
+			Ok((state, fallback, t.coin_owner_mailboxes(&[id]).await?, t.fallback_claims(&[id]).await?,
+				t.fallback_outcomes(&[id]).await?))
 		}).await.to_status()?;
 
 		let spend_state = vtxo_state.spend_state;
@@ -193,7 +211,9 @@ impl rpc::server::ArkService for Server {
 		};
 
 		Ok(tonic::Response::new(protos::GetVtxoStatusResponse {
-			spend_state: spend_state as i32,
+			spend_state: fallback_spend_state(spend_state, outcomes.get(&id)) as i32,
+			owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
+			fallback_claim: claims.get(&id).filter(|_| fallback.contains(&id)).map(Into::into),
 		}))
 	}
 
@@ -202,6 +222,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxosByIdsRequest>,
 	) -> Result<tonic::Response<protos::GetVtxosByIdsResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxo_ids.len() > rpc::MAX_NB_VTXO_IDS {
@@ -213,8 +234,8 @@ impl rpc::server::ArkService for Server {
 
 		// Unknown ids are reported, not an error, so one bad id does not
 		// cost the client the whole batch.
-		let found = self.db.read(async |t| t.get_existing_server_vtxos_by_id(&ids).await).await
-			.to_status()?;
+		let found = self.db.read(async |t| t.get_existing_server_vtxos_by_id(&ids).await)
+			.await.to_status()?;
 
 		let mut missing = Vec::new();
 		for id in &ids {
@@ -236,6 +257,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxosStatusByIdsRequest>,
 	) -> Result<tonic::Response<protos::GetVtxosStatusByIdsResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxos.len() > rpc::MAX_NB_VTXO_IDS {
@@ -250,12 +272,13 @@ impl rpc::server::ArkService for Server {
 			.collect::<Result<Vec<_>, tonic::Status>>()?;
 
 		let ids = queries.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-		let (states, fallback) = self.db.read(async |t| {
+		let (states, fallback, owners, claims, outcomes) = self.db.read(async |t| {
 			let states = t.get_existing_server_vtxos_by_id(&ids).await?;
 			let keys = states.iter().filter_map(|(id, state)| state.vtxo.policy().user_pubkey().map(|key| (*id, key)))
 				.collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
-			Ok((states, fallback))
+			Ok((states, fallback, t.coin_owner_mailboxes(&ids).await?, t.fallback_claims(&ids).await?,
+				t.fallback_outcomes(&ids).await?))
 		}).await.to_status()?;
 
 		// An id without a client-visible user vtxo is reported as missing,
@@ -284,7 +307,9 @@ impl rpc::server::ArkService for Server {
 
 			vtxos.push(protos::VtxoStatus {
 				vtxo_id: id.to_bytes().to_vec(),
-				spend_state: *spend_state as i32,
+				spend_state: fallback_spend_state(*spend_state, outcomes.get(&id)) as i32,
+				owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
+				fallback_claim: claims.get(&id).filter(|_| fallback.contains(&id)).map(Into::into),
 			});
 		}
 
@@ -300,6 +325,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RecoverVtxosByXpubRequest>,
 	) -> Result<tonic::Response<protos::RecoverVtxosByXpubResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if self.config.recovery_xpub_nb_keys == 0 {
@@ -324,10 +350,12 @@ impl rpc::server::ArkService for Server {
 			macros::badarg!("start_index {} is not a non-hardened child index", req.start_index);
 		}
 
-		let _queued = self.xpub_recovery_queue.try_acquire()
+		let queued = self.xpub_recovery_queue.try_acquire()
 			.map_err(|_| tonic::Status::resource_exhausted("too many xpub recoveries in progress, try again later"))?;
 		let _permit = self.xpub_recovery_permits.acquire().await
 			.context("xpub recovery semaphore closed")?;
+		// Once we start the recovery for this request, we can release the queue slot.
+		drop(queued);
 
 		let cursor_vtxo_id = req.cursor_vtxo_id.as_ref()
 			.map(|id| VtxoId::from_slice(id)).transpose()
@@ -344,13 +372,19 @@ impl rpc::server::ArkService for Server {
 		// server-internal state is left out, as GetVtxoStatus reports it as
 		// not found.
 		let keys = res.vtxos.iter().map(|v| (v.vtxo.id(), v.vtxo.user_pubkey())).collect::<Vec<_>>();
-		let fallback = self.db.read(async |t| t.fallback_customer_vtxos(&keys).await).await.to_status()?;
+		let ids = keys.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+		let (fallback, owners, claims, outcomes) = self.db.read(async |t| Ok((
+			t.fallback_customer_vtxos(&keys).await?, t.coin_owner_mailboxes(&ids).await?, t.fallback_claims(&ids).await?,
+			t.fallback_outcomes(&ids).await?,
+		))).await.to_status()?;
 		let vtxos = res.vtxos.into_iter().filter_map(|v| {
 			Some(protos::RecoveredVtxo {
-				spend_state: client_spend_state(v.spend_state,
-					fallback.contains(&v.vtxo.id()))? as i32,
+				spend_state: fallback_spend_state(client_spend_state(v.spend_state,
+					fallback.contains(&v.vtxo.id()))?, outcomes.get(&v.vtxo.id())) as i32,
 				vtxo: v.vtxo.serialize(),
 				derivation_index: v.derivation_index,
+				owner_mailbox: owners.get(&v.vtxo.id()).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
+				fallback_claim: claims.get(&v.vtxo.id()).filter(|_| fallback.contains(&v.vtxo.id())).map(Into::into),
 			})
 		}).collect();
 
@@ -360,20 +394,6 @@ impl rpc::server::ArkService for Server {
 			have_more: res.have_more,
 			cursor_vtxo_id: res.cursor_vtxo_id.map(|id| id.to_bytes().to_vec()),
 		}))
-	}
-
-	#[tracing::instrument(skip(self, req))]
-	async fn set_fallback(
-		&self, req: tonic::Request<protos::SetFallbackRequest>,
-	) -> Result<tonic::Response<protos::SetFallbackResponse>, tonic::Status> {
-		let req = req.into_inner();
-		let mailbox = PublicKey::from_bytes(&req.mailbox_pk)?;
-		let record = ark::fallback::FallbackRegistration::deserialize(&req.record)
-			.badarg("invalid fallback record")?;
-		record.verify(self.config.network, mailbox).badarg("invalid fallback record")?;
-		let stored = self.db.write(async |tx| tx.set_fallback(mailbox, &record, self.config.network).await)
-			.await.to_status()?;
-		Ok(tonic::Response::new(protos::SetFallbackResponse { record: stored.serialize() }))
 	}
 
 	// boarding
@@ -386,8 +406,11 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::BoardCosignRequest>,
 	) -> Result<tonic::Response<protos::BoardCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
+		if req.retired_owner_proof.is_some() {
+			return Err(tonic::Status::invalid_argument("retired owner proof field"));
+		}
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_BOARD_FUNDING_TX
 			&& self.config.require_board_funding_tx
@@ -425,6 +448,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::BoardVtxoRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let vtxo = <Vtxo<Full>>::deserialize(&req.board_vtxo[..])
@@ -442,6 +466,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RegisterVtxoTransactionsRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxos.is_empty() {
@@ -470,6 +495,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RegisterVtxoTransactionsRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxos.is_empty() {
@@ -497,10 +523,14 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ArkoorPackageCosignRequest>,
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
+		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
+			macros::badarg!("too many parts in cosign request");
+		}
 		let owner_links = OwnerLinks::from_parts(&req.parts).to_status()?;
 		let request = ArkoorPackageCosignRequest::try_from(req)
-			.context("Failed to parse request")?;
+			.badarg("invalid cosign request")?;
 
 		let response = self.cosign_oor(request, &owner_links).await.to_status()?;
 		Ok(tonic::Response::new(response.into()))
@@ -513,7 +543,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::LightningPayHtlcCosignRequest>,
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -521,9 +551,12 @@ impl rpc::server::ArkService for Server {
 				in order to be able to send Lightning payments.");
 		}
 
+		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
+			macros::badarg!("too many parts in cosign request");
+		}
 		let owner_links = OwnerLinks::from_parts(&req.parts).to_status()?;
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req.clone())
-			.context("Failed to parse request")?;
+			.badarg("invalid cosign request")?;
 
 		let resp = self.request_lightning_pay_htlc_cosign(cosign_requests, &owner_links)
 			.await.context("error making payment")?;
@@ -536,7 +569,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::InitiateLightningPaymentRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -571,6 +604,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CheckLightningPaymentRequest>,
 	) -> Result<tonic::Response<protos::LightningPaymentStatus>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
@@ -585,10 +619,14 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ArkoorPackageCosignRequest>
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
+		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
+			macros::badarg!("too many parts in cosign request");
+		}
 		let owner_links = OwnerLinks::from_parts(&req.parts).to_status()?;
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req)
-			.context("Failed to parse request")?;
+			.badarg("invalid cosign request")?;
 
 		let cosign_resp = self.revoke_lightning_pay_htlcs(cosign_requests, &owner_links).await
 			.to_status()?;
@@ -601,6 +639,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::FetchBolt12InvoiceRequest>,
 	) -> Result<tonic::Response<protos::FetchBolt12InvoiceResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let offer = match Offer::try_from(req.offer.to_vec()) {
@@ -629,7 +668,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::StartLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::StartLightningReceiveResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -651,6 +690,7 @@ impl rpc::server::ArkService for Server {
 			BlockDelta::try_from(req.min_cltv_delta).badarg("invalid min_cltv_delta")?,
 			mailbox_id,
 			req.description,
+			req.expiry_secs.map(Duration::from_secs),
 			req.claim_destination,
 		).await.to_status()?;
 
@@ -662,12 +702,17 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CheckLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::CheckLightningReceiveResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
 
 		let sub = self.check_lightning_receive(payment_hash, req.wait).await.to_status()?;
-		Ok(tonic::Response::new(sub.into()))
+		let outcome = self.db.read(async |t| t.receive_fallback_outcome(&sub).await).await.to_status()?;
+		let mut response: protos::CheckLightningReceiveResponse = sub.into();
+		response.fallback_spend_state = outcome.as_ref()
+			.map(|outcome| fallback_spend_state(protos::VtxoSpendState::Unspecified, Some(outcome)) as i32);
+		Ok(tonic::Response::new(response))
 	}
 
 	#[tracing::instrument(skip(self, req))]
@@ -675,8 +720,15 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::PrepareLightningReceiveClaimRequest>
 	) -> Result<tonic::Response<protos::PrepareLightningReceiveClaimResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
+		// For token filters. Like the integration API, this trusts the
+		// proxy chain to set `X-Forwarded-For`, see `RemoteAddrService`.
+		let client_address = req.extensions().get::<SocketAddr>().cloned()
+			.or_else(|| req.remote_addr());
 		let req = req.into_inner();
+		if req.retired_owner_proof.is_some() {
+			return Err(tonic::Status::invalid_argument("retired owner proof field"));
+		}
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
 			macros::badarg!("Your client version is too old, you need to update \
@@ -692,6 +744,7 @@ impl rpc::server::ArkService for Server {
 
 		let (sub, htlcs) = self.prepare_lightning_claim(
 			payment_hash, user_pubkey, htlc_recv_expiry, req.lightning_receive_anti_dos, &owner_links,
+			client_address,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(protos::PrepareLightningReceiveClaimResponse {
@@ -705,7 +758,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ClaimLightningReceiveRequest>
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
@@ -732,6 +785,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CancelLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
@@ -748,6 +802,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::NextRoundTimeResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&_req)?;
 		Ok(tonic::Response::new(protos::NextRoundTimeResponse {
 			timestamp: self.rounds.next_round_time.read()
 				.duration_since(UNIX_EPOCH).expect("we set this value beyond unix epoch")
@@ -767,6 +822,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<Self::SubscribeRoundsStream>, tonic::Status> {
+		super::validate_scuttle_pver(&_req)?;
 		let mgr = self.rtmgr.clone();
 		let stream = self.rounds.events()
 			.map(|e| Ok(e.as_ref().into()))
@@ -779,6 +835,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::RoundEvent>, tonic::Status> {
+		super::validate_scuttle_pver(&_req)?;
 		if let Some(event) = self.rounds.last_event() {
 			Ok(tonic::Response::new(event.as_ref().into()))
 		} else {
@@ -794,7 +851,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::SubmitPaymentRequest>,
 	) -> Result<tonic::Response<protos::SubmitPaymentResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -808,7 +865,7 @@ impl rpc::server::ArkService for Server {
 			Ok(SelfSignedInput { vtxo_id, attestation })
 		}).collect::<Result<_, tonic::Status>>()?;
 
-		let notification_mailbox = req.unblinded_mailbox_id.as_ref()
+		req.unblinded_mailbox_id.as_ref()
 			.map(|b| MailboxIdentifier::deserialize(b)).transpose().badarg("invalid unblinded mailbox id")?;
 		let mut owner_links = OwnerLinks::default();
 		let mut vtxo_requests = Vec::with_capacity(req.vtxo_requests.len());
@@ -834,7 +891,6 @@ impl rpc::server::ArkService for Server {
 			inputs,
 			vtxo_requests,
 			owner_links,
-			notification_mailbox,
 			unlock_preimage: Secret::new(unlock_preimage),
 			user_agent_name: crate::telemetry::current_user_agent_name(),
 		};
@@ -855,7 +911,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::VtxoSignaturesRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -887,7 +943,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RoundParticipationRequest>,
 	) -> Result<tonic::Response<protos::RoundParticipationResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -907,6 +963,10 @@ impl rpc::server::ArkService for Server {
 		let unblinded_mailbox_id = req.unblinded_mailbox_id
 			.map(|b| MailboxIdentifier::deserialize(&b[..]))
 			.transpose().badarg("invalid unblinded mailbox id")?;
+		// its status could never be queried, so the wallet couldn't progress it
+		if self.config.round_status_attestation_required && unblinded_mailbox_id.is_none() {
+			macros::badarg!("delegated round participations need an unblinded mailbox id");
+		}
 
 		let mut owner_links = OwnerLinks::default();
 		let mut outputs = Vec::with_capacity(req.vtxo_requests.len());
@@ -932,14 +992,27 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RoundParticipationStatusRequest>,
 	) -> Result<tonic::Response<protos::RoundParticipationStatusResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let unlock_hash = UnlockHash::from_bytes(&req.unlock_hash)?;
+		let required = self.config.round_status_attestation_required;
+		let attestation = (required && !req.attestation.is_empty())
+			.then(|| RoundParticipationStatusAttestation::from_bytes(&req.attestation))
+			.transpose()?;
 		let part = self.db.read(async |t| {
+			let part = t.get_round_participation_by_unlock_hash(unlock_hash).await?;
+			// Authenticate before exposing a cancellation tombstone.
+			if required && !part.as_ref().is_some_and(|p| attestation.is_some_and(|a|
+				p.outputs.iter().filter_map(|o| o.unblinded_mailbox_id)
+					.any(|id| a.verify(unlock_hash, id).is_ok())
+			)) {
+				return Ok(None);
+			}
 			if t.query_opt("SELECT participation_id FROM expiry_cancelled_participation WHERE unlock_hash=$1", &[&unlock_hash.to_string()]).await?.is_some() {
 				return Err(crate::error::RoundCancelledBeforeForfeit(unlock_hash).into());
 			}
-			t.get_round_participation_by_unlock_hash(unlock_hash).await
+			Ok(part)
 		}).await.to_status()?.not_found([unlock_hash], "round participation not found")?;
 		let input_vtxo_ids = part.inputs.iter().map(|i| i.vtxo_id.to_bytes().to_vec()).collect();
 
@@ -999,7 +1072,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::LeafVtxoCosignRequest>,
 	) -> Result<tonic::Response<protos::LeafVtxoCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -1021,7 +1094,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ForfeitNoncesRequest>,
 	) -> Result<tonic::Response<protos::ForfeitNoncesResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -1036,8 +1109,12 @@ impl rpc::server::ArkService for Server {
 		let unlock_hash = UnlockHash::from_bytes(req.unlock_hash)?;
 		let vtxos = req.vtxo_ids.iter().map(|v| VtxoId::from_bytes(v))
 			.collect::<Result<Vec<_>, _>>()?;
+		let attestations = req.attestations.iter()
+			.map(|a| ForfeitNoncesAttestation::from_bytes(a))
+			.collect::<Result<Vec<_>, _>>()?;
 
-		let res = self.generate_forfeit_nonces(unlock_hash, &vtxos).await.to_status()?;
+		let res = self.generate_forfeit_nonces(unlock_hash, &vtxos, &attestations).await
+			.to_status()?;
 		Ok(tonic::Response::new(protos::ForfeitNoncesResponse {
 			public_nonces: res.into_iter().map(|n| n.serialize().to_vec()).collect(),
 		}))
@@ -1048,7 +1125,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ForfeitVtxosRequest>,
 	) -> Result<tonic::Response<protos::ForfeitVtxosResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -1072,7 +1149,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::PrepareOffboardRequest>,
 	) -> Result<tonic::Response<protos::PrepareOffboardResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let request = req.offboard.badarg("missing offboard field")?.try_into()
@@ -1112,6 +1189,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::FinishOffboardRequest>,
 	) -> Result<tonic::Response<protos::FinishOffboardResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let offboard_txid = Txid::from_bytes(req.offboard_txid)?;
@@ -1142,18 +1220,9 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 
 	let (_, health_server) = tonic_health::server::health_reporter();
 
-	// send_compressed compresses responses only for clients that advertise
-	// grpc-accept-encoding, so clients that don't are unaffected. This is
-	// where nearly all the savings are. accept_compressed is kept for
-	// forward-compat: no current client compresses its requests, but
-	// supporting it now means a future client that does needs no server change.
 	let routes = tonic::service::Routes::default()
-		.add_service(rpc::server::ArkServiceServer::from_arc(srv.clone())
-			.accept_compressed(CompressionEncoding::Zstd)
-			.send_compressed(CompressionEncoding::Zstd))
-		.add_service(rpc::server::MailboxServiceServer::from_arc(srv.clone())
-			.accept_compressed(CompressionEncoding::Zstd)
-			.send_compressed(CompressionEncoding::Zstd))
+		.add_service(rpc::server::ArkServiceServer::from_arc(srv.clone()))
+		.add_service(rpc::server::MailboxServiceServer::from_arc(srv.clone()))
 		.add_service(health_server);
 
 	tonic::transport::Server::builder()
@@ -1166,6 +1235,7 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 		.layer(tonic_web::GrpcWebLayer::new())
 		.layer(OtelGrpcLayer::default())
 		.layer(middleware::TelemetryMetricsLayer)
+		.layer(middleware::RemoteAddrLayer)
 		.add_routes(routes)
 		.serve_with_shutdown(addr, srv.rtmgr.shutdown_signal()).await?;
 
@@ -1177,6 +1247,15 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	#[test]
+	fn fallback_status_distinguishes_pending_payment_and_no_output() {
+		let spent = protos::VtxoSpendState::Spent;
+		assert_eq!(fallback_spend_state(spent, Some(&FallbackOutcome::Pending)), protos::VtxoSpendState::FallbackPending);
+		assert_eq!(fallback_spend_state(spent, Some(&FallbackOutcome::Spent)), spent);
+		assert_eq!(fallback_spend_state(spent, Some(&FallbackOutcome::Forfeited)), protos::VtxoSpendState::FallbackForfeited);
+		assert_eq!(fallback_spend_state(protos::VtxoSpendState::Spendable, None), protos::VtxoSpendState::Spendable);
+	}
 
 	#[test]
 	fn client_spend_state_collapses_server_internal_states() {

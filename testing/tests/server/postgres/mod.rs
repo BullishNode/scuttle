@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use bitcoin::secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey};
 use bitcoin::Transaction;
-use chrono::Local;
+use chrono::{Local, TimeDelta};
 
 use ark::{ServerVtxo, VtxoId, VtxoPolicy, VtxoRequest};
 use ark::offboard::OffboardForfeitResult;
 use ark::integration::{TokenStatus, TokenType};
-use ark::lightning::{AsPaymentHash, Invoice, Preimage};
+use ark::lightning::{AsPaymentHash, Invoice, PaymentHash, Preimage};
 use ark::mailbox::{MailboxIdentifier, MailboxType};
 use ark::rounds::RoundId;
 use ark::test_util::VTXO_VECTORS;
@@ -25,10 +25,13 @@ use cln_rpc::listsendpays_request::ListsendpaysIndex;
 
 use server::OwnershipRefusal;
 use server::database::{BlockTable, Db, MailboxPayload};
+use server::database::data_migrations::backfill_cln_hold;
+use server::database::hold::{self, ClnHoldStatus, NewClnHold};
 use server::database::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
 use server::database::tree::VtxoTreeUpdate;
 use server::database::ln::LightningHtlcSubscriptionStatus;
 use server::database::vtxopool::PoolVtxo;
+use server::database::xpay::{self, ClnXpayOutcome, ClnXpayStatus, NewClnXpay};
 use server::filters;
 use server::filters::Filters;
 use server::ln::LightningFailureKind;
@@ -45,8 +48,8 @@ async fn upsert_vtxo() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Create a few dummy vtxo's
@@ -54,12 +57,12 @@ async fn upsert_vtxo() {
 	let vtxo2 = ServerVtxo::from(VTXO_VECTORS.round1_vtxo.clone());
 	let vtxo3 = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());
 
-	db.write(async |t| t.upsert_vtxos([vtxo1.clone(), vtxo2.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.expect("Query succeeded");
+	db.write(async |t| t.upsert_vtxos([vtxo1.clone(), vtxo2.clone()]).await).await.expect("Query succeeded");
 	db.read(async |t| t.get_user_vtxos_by_id(&[vtxo1.id(), vtxo2.id()]).await).await.expect("Query succeeded");
 	db.read(async |t| t.get_user_vtxos_by_id(&[vtxo3.id()]).await).await.expect_err("Query Failed because 3 isn't in the db yet");
 
 	// It shouldn't complain if vtxo2 is already present
-	db.write(async |t| t.upsert_vtxos([vtxo2.into(), vtxo3.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.expect("Query succeeded");
+	db.write(async |t| t.upsert_vtxos([vtxo2.into(), vtxo3.clone()]).await).await.expect("Query succeeded");
 }
 
 
@@ -69,8 +72,8 @@ async fn lightning_invoice() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 
 	let dummy_public_key = PublicKey::from_str("038f47dcd43ba6d97fc9ed2e3bba09b175a45fac55f0683e8cf771e8ced4572354")
 		.expect("Failed to create dummy pubkey");
@@ -95,8 +98,8 @@ async fn integration() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 
 	let integration_second = db.write(async |t| t.store_integration("second").await).await.unwrap();
 	assert_ne!(integration_second.id, 0);
@@ -220,8 +223,8 @@ async fn block_database_crud() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 
 	// Construct some mock block refs
 	let hash1 = bitcoin::BlockHash::from_str("0000000000000000000670ab57e8c1a4637b22d1d56e4c2837d08ec9a61e7777").unwrap();
@@ -289,8 +292,8 @@ async fn get_virtual_transaction_not_found() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 
 	// Create a txid without inserting it
 	let tx = Transaction {
@@ -313,8 +316,8 @@ async fn get_first_unsigned_virtual_transaction() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Create 3 transactions with different txids
@@ -352,7 +355,7 @@ async fn get_first_unsigned_virtual_transaction() {
 	let update = VtxoTreeUpdate::new()
 		.upsert_signed_tx([tx1.clone(), tx3.clone()])
 		.upsert_unsigned_tx([txid2]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.unwrap();
 
 	// Test case 1: [tx1, tx2, tx3] -> Some(tx2)
 	let result = db.read(async |t| t.get_first_unsigned_virtual_transaction(&[txid1, txid2, txid3]).await).await.unwrap();
@@ -381,15 +384,15 @@ async fn upsert_vtxos_with_txid() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Create vtxos using VTXO_VECTORS
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
 
 	// Upsert vtxos
-	db.write(async |t| t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.expect("Failed to upsert vtxo");
+	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.expect("Failed to upsert vtxo");
 
 	// Retrieve vtxos and verify they exist
 	let vtxos = db.read(async |t| t.get_user_vtxos_by_id(&[vtxo.id()]).await).await.expect("Failed to get vtxo");
@@ -415,8 +418,8 @@ async fn block_table_independence() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 
 	// Create test blocks with different hashes at the same height
 	let hash_captaind = bitcoin::BlockHash::from_str("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f").unwrap();
@@ -483,14 +486,14 @@ async fn ban_vtxo() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Insert a vtxo
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
 	let vtxo_id = vtxo.id();
-	db.write(async |t| t.upsert_vtxos(&[vtxo], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.expect("upsert succeeded");
+	db.write(async |t| t.upsert_vtxos(&[vtxo]).await).await.expect("upsert succeeded");
 
 	// Initially no vtxos are banned
 	let banned = db.read(async |t| t.list_banned_vtxos(BlockHeight::new(100)).await).await.expect("list succeeded");
@@ -539,8 +542,8 @@ async fn pending_sweeps() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 
 	// Initially empty
 	let sweeps = db.read(async |t| t.fetch_pending_sweeps().await).await.unwrap();
@@ -604,16 +607,16 @@ async fn postgres_offboards() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	// Register the vtxo's transactions in the virtual transaction tree
 	let signed_txs: Vec<_> = vtxo.transactions().map(|item| item.tx).collect();
-	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_signed_tx(signed_txs), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_signed_tx(signed_txs)).await).await.unwrap();
 
 	// Initially no uncommitted offboards
 	let uncommitted = db.read(async |t| t.get_uncommitted_offboards().await).await.unwrap();
@@ -663,8 +666,8 @@ async fn nursery_txs() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 
 	let tx = Transaction {
 		version: bitcoin::transaction::Version::non_standard(42),
@@ -741,8 +744,8 @@ async fn ephemeral_tweaks() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 
 	let pubkey = PublicKey::from_str(
 		"038f47dcd43ba6d97fc9ed2e3bba09b175a45fac55f0683e8cf771e8ced4572354"
@@ -777,8 +780,8 @@ async fn vtxo_mailbox() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -789,18 +792,18 @@ async fn vtxo_mailbox() {
 	db.write(async |t| t.upsert_vtxos(&[
 		ServerVtxo::from(vtxo1.clone()),
 		ServerVtxo::from(vtxo2.clone()),
-	], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	]).await).await.unwrap();
 
 	// Empty mailbox returns nothing
-	let result = db.read(async |t| t.get_mailbox_entries(mailbox_id.clone(), 0, 10, bitcoin::Network::Regtest).await).await.unwrap();
+	let result = db.read(async |t| t.get_mailbox_entries(mailbox_id.clone(), 0, 10).await).await.unwrap();
 	assert!(result.is_empty());
 
 	// Store vtxo1 in mailbox (gets checkpoint 1)
-	let cp1 = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id.clone(), &[vtxo1.clone()], bitcoin::Network::Regtest).await).await.unwrap()
+	let cp1 = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id.clone(), &[vtxo1.clone()]).await).await.unwrap()
 		.expect("should return a checkpoint");
 
 	// Fetch from checkpoint 0 – should return vtxo1
-	let batches = db.read(async |t| t.get_mailbox_entries(mailbox_id.clone(), 0, 10, bitcoin::Network::Regtest).await).await.unwrap();
+	let batches = db.read(async |t| t.get_mailbox_entries(mailbox_id.clone(), 0, 10).await).await.unwrap();
 	assert_eq!(batches.len(), 1);
 	assert_eq!(batches[0].checkpoint, cp1);
 	let vtxos = match &batches[0].payload {
@@ -811,12 +814,12 @@ async fn vtxo_mailbox() {
 	assert_eq!(vtxos[0].id(), vtxo1.id());
 
 	// Store vtxo2 in mailbox (gets checkpoint 2, ≥ cp1)
-	let cp2 = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id.clone(), &[vtxo2.clone()], bitcoin::Network::Regtest).await).await.unwrap()
+	let cp2 = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id.clone(), &[vtxo2.clone()]).await).await.unwrap()
 		.expect("should return a checkpoint");
 	assert!(cp2 > cp1, "checkpoints should be monotonically increasing");
 
 	// Fetch from checkpoint cp1 – should only return vtxo2 (beyond cp1)
-	let batches = db.read(async |t| t.get_mailbox_entries(mailbox_id.clone(), cp1, 10, bitcoin::Network::Regtest).await).await.unwrap();
+	let batches = db.read(async |t| t.get_mailbox_entries(mailbox_id.clone(), cp1, 10).await).await.unwrap();
 	assert_eq!(batches.len(), 1);
 	assert_eq!(batches[0].checkpoint, cp2);
 	let vtxos2 = match &batches[0].payload {
@@ -832,14 +835,14 @@ async fn store_vtxos_in_mailbox_empty() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
 
 	// Storing an empty slice returns None (no checkpoint allocated)
-	let result = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id, &[], bitcoin::Network::Regtest).await).await.unwrap();
+	let result = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id, &[]).await).await.unwrap();
 	assert!(result.is_none(), "empty vtxo list should return None");
 }
 
@@ -849,8 +852,8 @@ async fn store_vtxos_in_mailbox_duplicate() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -860,23 +863,23 @@ async fn store_vtxos_in_mailbox_duplicate() {
 	db.write(async |t| t.upsert_vtxos(&[
 		ServerVtxo::from(vtxo1.clone()),
 		ServerVtxo::from(vtxo2.clone()),
-	], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	]).await).await.unwrap();
 
 	// First post stores vtxo1 and returns a checkpoint.
-	let cp1 = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id.clone(), &[vtxo1.clone()], bitcoin::Network::Regtest).await).await.unwrap()
+	let cp1 = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id.clone(), &[vtxo1.clone()]).await).await.unwrap()
 		.expect("should return a checkpoint");
 
 	// Re-posting the same vtxo is ignored, not rejected: no error and no checkpoint.
-	let dup = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id.clone(), &[vtxo1.clone()], bitcoin::Network::Regtest).await).await.unwrap();
+	let dup = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id.clone(), &[vtxo1.clone()]).await).await.unwrap();
 	assert!(dup.is_none(), "duplicate vtxo should be ignored and return None");
 
 	// A batch mixing a duplicate and a new vtxo still stores the new one.
-	let cp2 = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id.clone(), &[vtxo1.clone(), vtxo2.clone()], bitcoin::Network::Regtest).await).await.unwrap()
+	let cp2 = db.write(async |t| t.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox_id.clone(), &[vtxo1.clone(), vtxo2.clone()]).await).await.unwrap()
 		.expect("should return a checkpoint for the new vtxo");
 	assert!(cp2 > cp1, "checkpoints should be monotonically increasing");
 
 	// The mailbox holds exactly one copy of each vtxo.
-	let batches = db.read(async |t| t.get_mailbox_entries(mailbox_id.clone(), 0, 10, bitcoin::Network::Regtest).await).await.unwrap();
+	let batches = db.read(async |t| t.get_mailbox_entries(mailbox_id.clone(), 0, 10).await).await.unwrap();
 	let stored: Vec<_> = batches.iter().flat_map(|b| match &b.payload {
 		MailboxPayload::Arkoor { vtxos } => vtxos.iter().map(|v| v.id()).collect::<Vec<_>>(),
 		other => panic!("expected Arkoor payload, got {:?}", other),
@@ -892,8 +895,8 @@ async fn store_vtxo_ids_in_mailbox_duplicate() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -903,24 +906,24 @@ async fn store_vtxo_ids_in_mailbox_duplicate() {
 	db.write(async |t| t.upsert_vtxos(&[
 		ServerVtxo::from(vtxo1.clone()),
 		ServerVtxo::from(vtxo2.clone()),
-	], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	]).await).await.unwrap();
 
 	// First post stores vtxo1's ID and returns a checkpoint.
-	let cp1 = db.write(async |t| t.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox_id.clone(), &[vtxo1.id()], bitcoin::Network::Regtest).await).await.unwrap()
+	let cp1 = db.write(async |t| t.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox_id.clone(), &[vtxo1.id()]).await).await.unwrap()
 		.expect("should return a checkpoint");
 
 	// Re-posting the same ID is ignored, not rejected: no error and no checkpoint.
-	let dup = db.write(async |t| t.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox_id.clone(), &[vtxo1.id()], bitcoin::Network::Regtest).await).await.unwrap();
+	let dup = db.write(async |t| t.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox_id.clone(), &[vtxo1.id()]).await).await.unwrap();
 	assert!(dup.is_none(), "duplicate vtxo ID should be ignored and return None");
 
 	// A batch mixing a duplicate and a new ID still stores the new one.
-	let cp2 = db.write(async |t| t.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox_id.clone(), &[vtxo1.id(), vtxo2.id()], bitcoin::Network::Regtest).await).await.unwrap()
+	let cp2 = db.write(async |t| t.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox_id.clone(), &[vtxo1.id(), vtxo2.id()]).await).await.unwrap()
 		.expect("should return a checkpoint for the new vtxo ID");
 	assert!(cp2 > cp1, "checkpoints should be monotonically increasing");
 
 	// The mailbox holds exactly one copy of each ID.
 	// NB get_mailbox_entries only returns arkoor payloads, so read messages.
-	let batches = db.read(async |t| t.get_mailbox_messages(mailbox_id.clone(), 0, 10, bitcoin::Network::Regtest).await).await.unwrap();
+	let batches = db.read(async |t| t.get_mailbox_messages(mailbox_id.clone(), 0, 10).await).await.unwrap();
 	let stored: Vec<_> = batches.iter().flat_map(|b| match &b.payload {
 		MailboxPayload::RecoveryVtxoIds { vtxo_ids } => vtxo_ids.clone(),
 		other => panic!("expected RecoveryVtxoIds payload, got {:?}", other),
@@ -938,8 +941,8 @@ async fn mailbox_page_returns_whole_batch() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -949,13 +952,13 @@ async fn mailbox_page_returns_whole_batch() {
 	db.write(async |t| t.upsert_vtxos(&[
 		ServerVtxo::from(vtxo1.clone()),
 		ServerVtxo::from(vtxo2.clone()),
-	], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	]).await).await.unwrap();
 
-	db.write(async |t| t.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox_id.clone(), &[vtxo1.id(), vtxo2.id()], bitcoin::Network::Regtest).await).await.unwrap()
+	db.write(async |t| t.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox_id.clone(), &[vtxo1.id(), vtxo2.id()]).await).await.unwrap()
 		.expect("should return a checkpoint");
 
 	// A page at limit 1 carries the whole two-id batch.
-	let page = db.read(async |t| t.get_mailbox_messages(mailbox_id.clone(), 0, 1, bitcoin::Network::Regtest).await).await.unwrap();
+	let page = db.read(async |t| t.get_mailbox_messages(mailbox_id.clone(), 0, 1).await).await.unwrap();
 	assert_eq!(page.len(), 1);
 	let ids = match &page[0].payload {
 		MailboxPayload::RecoveryVtxoIds { vtxo_ids } => vtxo_ids.clone(),
@@ -974,8 +977,8 @@ async fn vtxo_pool() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo1 = PoolVtxo::new(VTXO_VECTORS.board_vtxo.clone());
@@ -985,7 +988,7 @@ async fn vtxo_pool() {
 	db.write(async |t| t.upsert_vtxos(&[
 		ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone()),
 		ServerVtxo::from(VTXO_VECTORS.round1_vtxo.clone()),
-	], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	]).await).await.unwrap();
 
 	// Load from empty pool
 	let pool: Vec<_> = db.load_vtxopool().await.unwrap().try_collect().await.unwrap();
@@ -1018,17 +1021,17 @@ async fn watchman_frontier() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Store the vtxo row that the frontier columns hang off of
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	// Also store the funding virtual transaction that watchman queries for
 	let funding_txid = vtxo.point().txid;
-	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_unsigned_funding_tx(funding_txid), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_unsigned_funding_tx(funding_txid)).await).await.unwrap();
 
 	// Frontier starts empty
 	let frontier = db.read(async |t| t.get_frontier().await).await.unwrap();
@@ -1075,12 +1078,12 @@ async fn watchman_reorg() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 	db.write(async |t| t.add_vtxo_to_frontier(vtxo.id()).await).await.unwrap();
 	db.write(async |t| t.register_vtxo_confirmation(vtxo.id(), BlockHeight::new(100)).await).await.unwrap();
 
@@ -1101,12 +1104,12 @@ async fn watchman_get_vtxos_by_txid() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let vtxo_txid = vtxo.point().txid;
 	let vtxos = db.read(async |t| t.get_vtxos_by_txid(vtxo_txid).await).await.unwrap();
@@ -1131,8 +1134,8 @@ async fn watchman_unfrontiered_funding_txids() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// No vtxos → no unfrontiered txids
@@ -1141,9 +1144,9 @@ async fn watchman_unfrontiered_funding_txids() {
 
 	// Insert vtxo + its funding virtual_transaction (is_funding = true)
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 	let funding_txid = vtxo.point().txid;
-	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_unsigned_funding_tx(funding_txid), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new().upsert_unsigned_funding_tx(funding_txid)).await).await.unwrap();
 
 	// Now funding_txid is unfrontiered
 	let unfrontiered = db.read(async |t| t.get_unfrontiered_funding_txids().await).await.unwrap();
@@ -1161,8 +1164,8 @@ async fn round_queries_empty() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let tx = Transaction {
@@ -1187,13 +1190,13 @@ async fn round_participation() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Insert a vtxo to use as an input
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let unlock_preimage: UnlockPreimage = [1u8; 32];
 
@@ -1244,6 +1247,14 @@ async fn round_participation() {
 	let pending = db.read(async |t| t.get_all_pending_round_participations(BlockHeight::new(100)).await).await.unwrap();
 	assert_eq!(pending.len(), 1, "due once the scheduled height is reached");
 	assert_eq!(pending[0].scheduled_height, Some(BlockHeight::new(100)));
+
+	// a height that doesn't fit the column is refused, not stored wrapped negative
+	let too_high: UnlockPreimage = [3u8; 32];
+	let err = db.write(async |t| t.try_store_round_participation(BlockHeight::new(0), too_high, &[vtxo.id()], std::iter::once(&output), Some(BlockHeight::new(u32::MAX))).await).await.unwrap_err();
+	assert!(format!("{:#}", err).contains("out of range"), "{:#}", err);
+	let pending = db.read(async |t| t.get_all_pending_round_participations(BlockHeight::new(100)).await).await.unwrap();
+	assert_eq!(pending.len(), 1, "the refused request changed nothing");
+	assert_eq!(pending[0].scheduled_height, Some(BlockHeight::new(100)));
 }
 
 #[tokio::test]
@@ -1252,12 +1263,12 @@ async fn round_participation_supersedes_on_same_input() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let output = StoredRoundOutput {
 		vtxo_request: VtxoRequest {
@@ -1298,12 +1309,12 @@ async fn round_participation_forfeited_at() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let unlock_preimage: UnlockPreimage = [2u8; 32];
 	let unlock_hash = UnlockHash::hash(&unlock_preimage);
@@ -1360,8 +1371,8 @@ async fn set_forfeit_transactions_is_idempotent() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// We will create a few vtxos, all pubkey policy: htlc vtxos are
@@ -1374,7 +1385,7 @@ async fn set_forfeit_transactions_is_idempotent() {
 
 	let input_vtxo_ids = input_vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
 
-	db.write(async |t| t.upsert_vtxos(input_vtxos.clone(), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(input_vtxos.clone()).await).await.unwrap();
 
 
 	// We will create a round participation that spends all three vtxos.
@@ -1502,12 +1513,12 @@ async fn set_forfeit_transactions_rejects_non_round_spent_vtxo() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let unlock_preimage: UnlockPreimage = [9u8; 32];
 	let unlock_hash = UnlockHash::hash(&unlock_preimage);
@@ -1565,12 +1576,12 @@ async fn round_participation_same_vtxo_multiple_pending() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	let preimage1: UnlockPreimage = [1u8; 32];
 	let preimage2: UnlockPreimage = [2u8; 32];
@@ -1601,24 +1612,6 @@ const DUMMY_PUBKEY: &str = "038f47dcd43ba6d97fc9ed2e3bba09b175a45fac55f0683e8cf7
 const BOLT11_INVOICE: &str = "lnbcrt11p59rr6msp534kz2tahyrxl0rndcjrt8qpqvd0dynxxwfd28ea74rxjuj0tphfspp5nc0gf6vamuphaf4j49qzjvz2rg3del5907vdhncn686cj5yykvfsdqqcqzzs9qyysgqgalnpu3selnlgw8n66qmdpuqdjpqak900ru52v572742wk4mags8a8nec2unls57r5j95kkxxp4lr6wy9048uzgsvdhrz7dh498va2cq4t6qh8";
 
 // Insert an existing upstream attempt for the database transition tests.
-async fn legacy_payment_attempt(db: &Db, node_id: i64, invoice: &Invoice, sources: &[VtxoId]) {
-	let principal = i64::try_from(invoice.amount_msat().expect("fixed invoice fixture")).unwrap();
-	let hash = invoice.payment_hash().to_string();
-	let ids = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
-	db.write(async |t| {
-		let id = t.query_one("INSERT INTO lightning_payment_attempt( \
-			lightning_node_id,payment_hash,amount_msat,sender_mailbox_id,status,block_height, \
-			user_fee_sat,user_agent,retry_for_secs,created_at,updated_at,lightning_htlc_subscription_id) \
-			VALUES($1,$2,$3,NULL,'requested',1,1,'bark',60,NOW(),NOW(),NULL) RETURNING id",
-			&[&node_id, &hash, &principal]).await?.get::<_, i64>(0);
-		if !ids.is_empty() {
-			t.execute("INSERT INTO lightning_payment_attempt_htlc_vtxo(lightning_payment_attempt_id,vtxo_id) \
-				SELECT $1,unnest($2::TEXT[])", &[&id, &ids]).await?;
-		}
-
-		Ok(())
-	}).await.unwrap();
-}
 
 #[tokio::test]
 async fn lightning_payment_attempt_lifecycle() {
@@ -1628,8 +1621,8 @@ async fn lightning_payment_attempt_lifecycle() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -1679,38 +1672,6 @@ async fn lightning_payment_attempt_lifecycle() {
 
 }
 
-#[tokio::test]
-async fn legacy_lightning_payment_attempt_lifecycle() {
-	use server::database::ln::LightningPaymentStatus;
-
-	let mut ctx = TestContext::new_minimal("postgresd/legacy_lightning_payment_attempt").await;
-	ctx.init_central_postgres().await;
-	let config = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&config).await.unwrap();
-	let db = Db::connect(&config).await.unwrap();
-	super::register_vector_owners(&db).await;
-	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
-	let (node, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
-	let invoice = Invoice::Bolt11(Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap());
-	legacy_payment_attempt(&db, node, &invoice, &[]).await;
-	let requested = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(invoice.payment_hash()).await)
-		.await.unwrap().unwrap();
-	assert_eq!(requested.final_amount_msat, None);
-	assert!(db.write(async |t| t.update_lightning_payment_attempt_status(
-		&requested, LightningPaymentStatus::Submitted, None,
-	).await).await.unwrap().is_some());
-	let submitted = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(invoice.payment_hash()).await)
-		.await.unwrap().unwrap();
-	assert_eq!(submitted.status, LightningPaymentStatus::Submitted);
-	assert!(db.write(async |t| t.update_lightning_payment_attempt_status(
-		&submitted, LightningPaymentStatus::Succeeded, None,
-	).await).await.unwrap().is_some());
-	assert!(db.read(async |t| t.get_open_lightning_payment_attempts(node).await).await.unwrap().is_empty());
-	let history = db.read(async |t| Ok(t.query("SELECT status::TEXT FROM lightning_payment_attempt_history \
-		WHERE id=$1 ORDER BY history_created_at", &[&requested.id]).await?.into_iter()
-		.map(|row| row.get::<_, String>(0)).collect::<Vec<_>>())).await.unwrap();
-	assert_eq!(history, vec!["requested", "submitted"]);
-}
 
 #[tokio::test]
 async fn lightning_payment_attempt_with_error() {
@@ -1720,8 +1681,8 @@ async fn lightning_payment_attempt_with_error() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -1749,42 +1710,6 @@ async fn lightning_payment_attempt_with_error() {
 	assert!(open.is_empty());
 }
 
-#[tokio::test]
-async fn legacy_lightning_payment_attempt_result_update() {
-	use server::database::ln::LightningPaymentStatus;
-
-	let mut ctx = TestContext::new_minimal("postgresd/legacy_lightning_payment_attempt_result").await;
-	ctx.init_central_postgres().await;
-	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
-
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
-	super::register_vector_owners(&db).await;
-
-	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
-	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
-
-	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
-	let invoice = Invoice::Bolt11(bolt11.clone());
-
-	legacy_payment_attempt(&db, node_id, &invoice, &[]).await;
-
-	let attempt = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(
-		(&bolt11).into()
-	).await).await.unwrap().expect("attempt present");
-	assert!(attempt.final_amount_msat.is_none());
-
-	let updated_at = db.write(async |t| t.update_lightning_payment_attempt_result(
-		&attempt, LightningPaymentStatus::Succeeded, None, Some(9999),
-	).await).await.unwrap();
-	assert!(updated_at.is_some(), "update should return new updated_at");
-
-	// Verify changes persisted
-	let attempt2 = db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(
-		(&bolt11).into()
-	).await).await.unwrap().expect("attempt still present");
-	assert_eq!(attempt2.final_amount_msat, Some(9999));
-}
 
 /// xpay can give up while parts are still pending. Its error is stored then,
 /// without changing the status, and must survive the later update that marks
@@ -1797,8 +1722,8 @@ async fn lightning_payment_attempt_error_survives_until_failed() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -1843,118 +1768,6 @@ async fn lightning_payment_attempt_error_survives_until_failed() {
 	assert_eq!(failed.error.as_deref(), Some(error));
 }
 
-/// A legacy success result clears its stored error.
-#[tokio::test]
-async fn legacy_lightning_payment_attempt_error_cleared_on_success() {
-	use server::database::ln::LightningPaymentStatus;
-
-	let mut ctx = TestContext::new_minimal("postgresd/legacy_lightning_payment_attempt_error_cleared").await;
-	ctx.init_central_postgres().await;
-	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
-
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
-	super::register_vector_owners(&db).await;
-
-	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
-	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
-
-	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
-	let invoice = Invoice::Bolt11(bolt11.clone());
-
-	legacy_payment_attempt(&db, node_id, &invoice, &[]).await;
-
-	let read = async || db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(
-		(&bolt11).into()
-	).await).await.unwrap().expect("attempt present");
-
-	let attempt = read().await;
-	db.write(async |t| t.update_lightning_payment_attempt_status(
-		&attempt, LightningPaymentStatus::Submitted, None,
-	).await).await.unwrap();
-
-	let submitted = read().await;
-	db.write(async |t| t.set_lightning_payment_attempt_error(&submitted, "routing failed").await)
-		.await.unwrap().expect("error update applies");
-
-	let pending = read().await;
-	assert_eq!(pending.error.as_deref(), Some("routing failed"));
-
-	db.write(async |t| t.update_lightning_payment_attempt_result(
-		&pending, LightningPaymentStatus::Succeeded, None, Some(1_000_000),
-	).await).await.unwrap().expect("update applies");
-
-	let succeeded = read().await;
-	assert_eq!(succeeded.status, LightningPaymentStatus::Succeeded);
-	assert_eq!(succeeded.error, None);
-}
-
-/// An existing successful attempt consumes only its linked signed HTLC sources.
-#[tokio::test]
-async fn successful_attempt_consumes_its_linked_htlc_send() {
-	use server::database::ln::LightningPaymentStatus;
-
-	let mut ctx = TestContext::new_minimal("postgresd/successful_attempt_consumes_linked_source").await;
-	ctx.init_central_postgres().await;
-	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
-
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
-	super::register_vector_owners(&db).await;
-
-	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
-	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
-
-	// A signed spendable HTLC-send source linked to its existing attempt.
-	let vtxo = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());
-	let htlc = VTXO_VECTORS.arkoor_htlc_out_vtxo.policy().as_server_htlc_send().unwrap();
-	let hash = htlc.payment_hash;
-	db.write(async |t| {
-		t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await?;
-		htlc_vtxo::create_htlc_vtxos(t, &[(vtxo.id(), hash, htlc.htlc_expiry)], HtlcDirection::Incoming).await
-	}).await.unwrap();
-	let secp = Secp256k1::new();
-	let invoice_key = SecretKey::from_slice(&[41; 32]).unwrap();
-	let bolt11 = InvoiceBuilder::new(Currency::Regtest)
-		.description("source-matching coarse-status negative".into())
-		.payment_hash(hash.to_sha256_hash())
-		.payment_secret(PaymentSecret([42; 32]))
-		.current_timestamp().min_final_cltv_expiry_delta(18)
-		.amount_milli_satoshis(vtxo.amount().to_sat() * 1_000)
-		.build_signed(|message| secp.sign_ecdsa_recoverable(message, &invoice_key)).unwrap();
-	let invoice = Invoice::Bolt11(bolt11.clone());
-	assert_eq!(invoice.payment_hash(), hash, "negative must bind the actual signed source hash");
-	let source = db.read(async |tx| Ok(tx.query_one("SELECT h.direction::TEXT,h.payment_hash \
-		FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE v.vtxo_id=$1", &[&vtxo.id().to_string()]).await?))
-		.await.unwrap();
-	assert_eq!(source.get::<_, &str>("direction"), "incoming");
-	assert_eq!(source.get::<_, &str>("payment_hash"), hash.to_string());
-
-	// Open attempt linked to the HTLC-send vtxo.
-	legacy_payment_attempt(&db, node_id, &invoice, &[vtxo.id()]).await;
-
-	let attempt = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(
-		(&bolt11).into()
-	).await).await.unwrap().expect("open attempt present");
-
-	// Persist the upstream attempt outcome before consuming its source.
-	db.write(async |t| t.update_lightning_payment_attempt_result(
-		&attempt, LightningPaymentStatus::Succeeded, None, None,
-	).await).await.unwrap().expect("attempt should have transitioned to Succeeded");
-
-	assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
-
-	db.write(async |t| t.mark_htlc_send_vtxos_ln_spent(attempt.id).await).await.unwrap();
-
-	// The existing source link identifies the coin consumed by this success.
-	let db_client = ctx.postgres_manager().database_client(Some(&ctx.test_name)).await;
-	let row = db_client.query_one(
-		"SELECT spend_state::text AS spend_state FROM vtxo WHERE vtxo_id = $1",
-		&[&vtxo.id().to_string()],
-	).await.unwrap();
-	let spend_state: String = row.get("spend_state");
-	assert_eq!(spend_state, "ln-spent", "the successful attempt consumes its linked source");
-}
 
 /// `store_lightning_payment_start` must persist `block_height`, `user_fee`
 /// and `user_agent`. If these break, the lightning-send fee counter stops
@@ -1965,8 +1778,8 @@ async fn lightning_payment_attempt_stores_protocol_fee() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -1976,7 +1789,7 @@ async fn lightning_payment_attempt_stores_protocol_fee() {
 	let invoice = Invoice::Bolt11(bolt11.clone());
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.unwrap();
 
 	let expected_block_height = BlockHeight::new(850_000);
 	let expected_user_fee = sat(1_234);
@@ -2014,14 +1827,421 @@ async fn lightning_payment_attempt_stores_protocol_fee() {
 	assert_eq!(latest.retry_for, Some(expected_retry_for));
 }
 
+/// A new attempt on a payment hash, as `start_payment` stores it.
+fn new_cln_xpay(node_id: i64, payment_hash: PaymentHash) -> NewClnXpay {
+	NewClnXpay {
+		lightning_node_id: node_id,
+		payment_amount_msat: 2000,
+		max_routing_fee_msat: Some(100),
+		attempt_expiry: Local::now() + TimeDelta::seconds(60),
+		partial_msat: None,
+		htlc_expiry: Some(BlockHeight::new(900)),
+		label: None,
+		payment_hash,
+		signed_invoice: None,
+		user_fee_msat: Some(1000),
+		user_agent: None,
+	}
+}
+
+#[tokio::test]
+async fn cln_xpay_success_ends_the_attempt() {
+	let mut ctx = TestContext::new_minimal("postgresd/cln_xpay_success").await;
+	ctx.init_central_postgres().await;
+	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+
+	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
+	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
+
+	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
+	let new = new_cln_xpay(node_id, PaymentHash::from(&bolt11));
+
+	let attempt = db.write(async |t| xpay::create_xpay(&**t, &new).await).await.unwrap();
+	assert_eq!(attempt.status, ClnXpayStatus::Pending);
+
+	let pending = db.read(async |t| xpay::get_pending_xpays(&**t, node_id).await).await.unwrap();
+	assert_eq!(pending.len(), 1);
+	assert_eq!(pending[0].payment_amount_msat, 2000);
+
+	let ended = db.write(async |t| xpay::mark_xpay_success(&**t, attempt.id, Some(7)).await)
+		.await.unwrap().expect("the attempt was still pending");
+	assert_eq!(ended.status, ClnXpayStatus::Success);
+	assert_eq!(ended.routing_fee_msat, Some(7));
+
+	let pending = db.read(async |t| xpay::get_pending_xpays(&**t, node_id).await).await.unwrap();
+	assert!(pending.is_empty(), "an ended attempt is no longer pending");
+}
+
+/// Two writers can race for the one outcome the attempt can have; the loser
+/// gets `None` back.
+#[tokio::test]
+async fn cln_xpay_ends_only_once() {
+	let mut ctx = TestContext::new_minimal("postgresd/cln_xpay_ends_once").await;
+	ctx.init_central_postgres().await;
+	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+
+	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
+	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
+
+	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
+	let new = new_cln_xpay(node_id, PaymentHash::from(&bolt11));
+
+	let attempt = db.write(async |t| xpay::create_xpay(&**t, &new).await).await.unwrap();
+	db.write(async |t| xpay::mark_xpay_fail(&**t, attempt.id, Some(203)).await)
+		.await.unwrap().expect("the attempt was still pending");
+
+	let second = db.write(async |t| xpay::mark_xpay_success(&**t, attempt.id, Some(7)).await)
+		.await.unwrap();
+	assert!(second.is_none(), "an attempt that has ended cannot end again");
+
+	let stored = db.read(async |t| xpay::get_xpay_by_id(&**t, attempt.id).await)
+		.await.unwrap().expect("the attempt is stored");
+	assert_eq!(stored.status, ClnXpayStatus::Fail);
+	assert_eq!(stored.error_code, Some(203));
+}
+
+/// One payment hash carries at most one unconcluded attempt.
+#[tokio::test]
+async fn one_pending_xpay_per_payment_hash() {
+	let mut ctx = TestContext::new_minimal("postgresd/one_pending_xpay").await;
+	ctx.init_central_postgres().await;
+	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+
+	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
+	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
+
+	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
+	let new = new_cln_xpay(node_id, PaymentHash::from(&bolt11));
+
+	let attempt = db.write(async |t| xpay::create_xpay(&**t, &new).await).await.unwrap();
+	db.write(async |t| xpay::create_xpay(&**t, &new).await).await
+		.expect_err("a second pending attempt on the same hash is refused");
+
+	db.write(async |t| xpay::mark_xpay_fail(&**t, attempt.id, None).await)
+		.await.unwrap().expect("the attempt was still pending");
+	db.write(async |t| xpay::create_xpay(&**t, &new).await).await
+		.expect("the payment can be attempted again once the first attempt ended");
+}
+
+/// The payment handler only knows the payment hash of the attempt it ends, and
+/// the pending attempt on a hash is unique, so the hash is enough to end it.
+#[tokio::test]
+async fn end_pending_xpay_by_payment_hash() {
+	let mut ctx = TestContext::new_minimal("postgresd/end_pending_xpay_by_hash").await;
+	ctx.init_central_postgres().await;
+	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+
+	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
+	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
+
+	let payment_hash = Preimage::random().compute_payment_hash();
+
+	// Nothing pending yet: the payment predates the table or already ended.
+	let none = db.write(async |t| xpay::end_pending_xpay_by_payment_hash(
+		&**t, payment_hash, ClnXpayOutcome::Fail { error_code: None },
+	).await).await.unwrap();
+	assert!(none.is_none());
+
+	let new = new_cln_xpay(node_id, payment_hash);
+	let attempt = db.write(async |t| xpay::create_xpay(&**t, &new).await).await.unwrap();
+
+	let ended = db.write(async |t| xpay::end_pending_xpay_by_payment_hash(
+		&**t, payment_hash, ClnXpayOutcome::Success { routing_fee_msat: Some(-5) },
+	).await).await.unwrap().expect("the attempt was pending");
+	assert_eq!(ended.id, attempt.id);
+	assert_eq!(ended.status, ClnXpayStatus::Success);
+	assert_eq!(ended.routing_fee_msat, Some(-5), "a subsidized payment keeps its sign");
+
+	let again = db.write(async |t| xpay::end_pending_xpay_by_payment_hash(
+		&**t, payment_hash, ClnXpayOutcome::Fail { error_code: None },
+	).await).await.unwrap();
+	assert!(again.is_none(), "an ended attempt is not pending any more");
+
+	let all = db.read(async |t| xpay::get_xpays_by_payment_hash(&**t, payment_hash).await)
+		.await.unwrap();
+	assert_eq!(all.len(), 1);
+	assert_eq!(all[0].status, ClnXpayStatus::Success);
+}
+
+/// The initiating client is stored on the attempt so that a reader off the
+/// initiating RPC task can still tell which client made the payment.
+#[tokio::test]
+async fn cln_xpay_stores_the_user_agent() {
+	let mut ctx = TestContext::new_minimal("postgresd/cln_xpay_user_agent").await;
+	ctx.init_central_postgres().await;
+	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+
+	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
+	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
+
+	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
+	let mut new = new_cln_xpay(node_id, PaymentHash::from(&bolt11));
+	new.user_agent = Some("bark-wasm/0.7.1".into());
+
+	let attempt = db.write(async |t| xpay::create_xpay(&**t, &new).await).await.unwrap();
+	assert_eq!(attempt.user_agent.as_deref(), Some("bark-wasm/0.7.1"));
+
+	let stored = db.read(async |t| xpay::get_xpay_by_id(&**t, attempt.id).await)
+		.await.unwrap().expect("the attempt is stored");
+	assert_eq!(stored.user_agent.as_deref(), Some("bark-wasm/0.7.1"));
+}
+
+/// A hold invoice as `generate_invoice` stores it.
+fn new_cln_hold(node_id: i64, payment_hash: PaymentHash) -> NewClnHold {
+	NewClnHold {
+		lightning_node_id: node_id,
+		invoice: BOLT11_INVOICE.into(),
+		payment_hash,
+		requested_amount_msat: 3000,
+		min_final_cltv_delta: BlockDelta::new(40),
+		expires_at: Local::now() + TimeDelta::hours(1),
+	}
+}
+
+/// The plugin's states, as we mirror them: unpaid, then accepted, then paid,
+/// which is final. A paid invoice records what was held, not what was asked.
+#[tokio::test]
+async fn cln_hold_lifecycle() {
+	let mut ctx = TestContext::new_minimal("postgresd/cln_hold_lifecycle").await;
+	ctx.init_central_postgres().await;
+	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+
+	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
+	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
+
+	let payment_hash = Preimage::random().compute_payment_hash();
+	let hold = db.write(async |t| hold::create_hold(&**t, &new_cln_hold(node_id, payment_hash)).await)
+		.await.unwrap();
+	assert_eq!(hold.status, ClnHoldStatus::Unpaid);
+	assert_eq!(hold.min_final_cltv_delta, BlockDelta::new(40));
+
+	let open = db.read(async |t| hold::get_open_hold_by_payment_hash(&**t, node_id, payment_hash).await)
+		.await.unwrap().expect("the invoice is open");
+	assert_eq!(open.id, hold.id);
+
+	// The node holds HTLCs: the row carries their sum and deadline.
+	let accepted = db.write(async |t|
+		hold::mark_hold_accepted(&**t, hold.id, 3500, BlockHeight::new(200)).await
+	).await.unwrap().expect("the invoice was unpaid");
+	assert_eq!(accepted.status, ClnHoldStatus::Accepted);
+	assert_eq!(accepted.accepted_amount_msat, Some(3500));
+	assert_eq!(accepted.lowest_incoming_htlc_expiry, Some(BlockHeight::new(200)));
+	assert!(accepted.accepted_at.is_some());
+
+	let again = db.write(async |t|
+		hold::mark_hold_accepted(&**t, hold.id, 3500, BlockHeight::new(200)).await
+	).await.unwrap();
+	assert!(again.is_none(), "an accepted invoice is not accepted twice");
+
+	let paid = db.write(async |t| hold::mark_hold_settled(&**t, hold.id, 3000).await)
+		.await.unwrap().expect("the invoice was open");
+	assert_eq!(paid.status, ClnHoldStatus::Paid);
+	assert_eq!(paid.paid_amount_msat, Some(3500), "the payer overpaid");
+	assert!(paid.paid_at.is_some());
+	assert_eq!(paid.lowest_incoming_htlc_expiry, Some(BlockHeight::new(200)),
+		"a paid invoice keeps the deadline it was settled against");
+
+	let cancelled = db.write(async |t| hold::mark_hold_cancelled(&**t, hold.id).await)
+		.await.unwrap();
+	assert!(cancelled.is_none(), "a paid invoice cannot be cancelled");
+
+	let open = db.read(async |t| hold::get_open_holds(&**t, node_id).await).await.unwrap();
+	assert!(open.is_empty(), "a paid invoice is not open");
+	let open = db.read(async |t| hold::get_open_hold_by_payment_hash(&**t, node_id, payment_hash).await)
+		.await.unwrap();
+	assert!(open.is_none());
+
+	// Settled without our having seen it accepted: the invoice amount stands in.
+	let payment_hash = Preimage::random().compute_payment_hash();
+	let hold = db.write(async |t| hold::create_hold(&**t, &new_cln_hold(node_id, payment_hash)).await)
+		.await.unwrap();
+	let paid = db.write(async |t| hold::mark_hold_settled(&**t, hold.id, 3000).await)
+		.await.unwrap().expect("the invoice was open");
+	assert_eq!(paid.paid_amount_msat, Some(3000));
+}
+
+/// Cancelling is final: the writers racing to end an invoice get the row once.
+#[tokio::test]
+async fn cln_hold_cancel_recorded_once() {
+	let mut ctx = TestContext::new_minimal("postgresd/cln_hold_cancel_once").await;
+	ctx.init_central_postgres().await;
+	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+
+	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
+	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
+
+	let payment_hash = Preimage::random().compute_payment_hash();
+	let hold = db.write(async |t| hold::create_hold(&**t, &new_cln_hold(node_id, payment_hash)).await)
+		.await.unwrap();
+
+	let cancelled = db.write(async |t| hold::mark_hold_cancelled(&**t, hold.id).await)
+		.await.unwrap().expect("the invoice was open");
+	assert_eq!(cancelled.status, ClnHoldStatus::Cancelled);
+	assert!(cancelled.cancelled_at.is_some());
+
+	let again = db.write(async |t| hold::mark_hold_cancelled(&**t, hold.id).await)
+		.await.unwrap();
+	assert!(again.is_none(), "a cancelled invoice is not cancelled twice");
+	let settled = db.write(async |t| hold::mark_hold_settled(&**t, hold.id, 3000).await)
+		.await.unwrap();
+	assert!(settled.is_none(), "a cancelled invoice cannot be settled");
+
+	let all = db.read(async |t| hold::get_holds_by_payment_hash(&**t, payment_hash).await)
+		.await.unwrap();
+	assert_eq!(all.len(), 1);
+	assert_eq!(all[0].status, ClnHoldStatus::Cancelled);
+}
+
+/// Insert a legacy subscription row directly, as an upgraded server finds them.
+async fn seed_htlc_subscription(
+	db: &Db,
+	node_id: i64,
+	payment_hash: PaymentHash,
+	status: &str,
+	lowest_incoming_htlc_expiry: Option<i64>,
+) -> i64 {
+	db.write(async |t| {
+		let row = t.query_one("
+			INSERT INTO lightning_htlc_subscription (
+				lightning_node_id, status, lowest_incoming_htlc_expiry, accepted_at,
+				payment_hash, invoice, final_amount_msat, created_at, updated_at
+			) VALUES (
+				$1, $2::text::lightning_htlc_subscription_status, $3,
+				CASE WHEN $3::bigint IS NULL THEN NULL ELSE NOW() END,
+				$4, $5, 3000, NOW(), NOW()
+			)
+			RETURNING id
+		", &[
+			&node_id, &status, &lowest_incoming_htlc_expiry,
+			&payment_hash.to_string(), &BOLT11_INVOICE,
+		]).await?;
+		Ok(row.get::<_, i64>("id"))
+	}).await.unwrap()
+}
+
+/// The backfill decodes each subscription's invoice and writes the plugin's
+/// view of it, once.
+#[tokio::test]
+async fn backfill_cln_hold_from_htlc_subscriptions() {
+	let mut ctx = TestContext::new_minimal("postgresd/backfill_cln_hold").await;
+	ctx.init_central_postgres().await;
+	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+
+	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
+	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
+
+	let created = Preimage::random().compute_payment_hash();
+	let accepted = Preimage::random().compute_payment_hash();
+	let settled = Preimage::random().compute_payment_hash();
+	let canceled = Preimage::random().compute_payment_hash();
+	let intra_ark = Preimage::random().compute_payment_hash();
+	let failed_intra_ark = Preimage::random().compute_payment_hash();
+
+	seed_htlc_subscription(&db, node_id, created, "created", None).await;
+	seed_htlc_subscription(&db, node_id, accepted, "accepted", Some(200)).await;
+	seed_htlc_subscription(&db, node_id, settled, "settled", Some(210)).await;
+	seed_htlc_subscription(&db, node_id, canceled, "canceled", Some(220)).await;
+	let intra_ark_sub = seed_htlc_subscription(&db, node_id, intra_ark, "htlcs-ready", Some(230)).await;
+	let failed_intra_ark_sub = seed_htlc_subscription(
+		&db, node_id, failed_intra_ark, "settled", Some(240),
+	).await;
+
+	// The attempt linked to the subscription is what makes it intra-Ark.
+	db.write(async |t| {
+		t.execute("
+			INSERT INTO lightning_payment_attempt (
+				lightning_node_id, amount_msat, status, payment_hash,
+				lightning_htlc_subscription_id, created_at, updated_at
+			) VALUES ($1, 3000, 'requested', $2, $3, NOW(), NOW())
+		", &[&node_id, &intra_ark.to_string(), &intra_ark_sub]).await?;
+		// An intra-Ark attempt that failed never canceled the hold invoice,
+		// which went on to be paid over lightning.
+		t.execute("
+			INSERT INTO lightning_payment_attempt (
+				lightning_node_id, amount_msat, status, payment_hash,
+				lightning_htlc_subscription_id, created_at, updated_at
+			) VALUES ($1, 3000, 'failed', $2, $3, NOW(), NOW())
+		", &[&node_id, &failed_intra_ark.to_string(), &failed_intra_ark_sub]).await?;
+		Ok(())
+	}).await.unwrap();
+
+	let inserted = backfill_cln_hold::run(&db).await.unwrap();
+	assert_eq!(inserted, 6);
+
+	let status_of = async |payment_hash: PaymentHash| {
+		let holds = db.read(async |t| hold::get_holds_by_payment_hash(&**t, payment_hash).await)
+			.await.unwrap();
+		assert_eq!(holds.len(), 1, "one row per subscription");
+		holds.into_iter().next().unwrap()
+	};
+
+	let row = status_of(created).await;
+	assert_eq!(row.status, ClnHoldStatus::Unpaid);
+	assert_eq!(row.lightning_node_id, node_id);
+	assert_eq!(row.requested_amount_msat, 3000);
+	assert_eq!(row.invoice, BOLT11_INVOICE);
+	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
+	assert_eq!(row.min_final_cltv_delta.to_u32() as u64, bolt11.min_final_cltv_expiry_delta());
+
+	let row = status_of(accepted).await;
+	assert_eq!(row.status, ClnHoldStatus::Accepted);
+	assert_eq!(row.accepted_amount_msat, Some(3000), "the held sum is at least the invoice");
+	assert_eq!(row.lowest_incoming_htlc_expiry, Some(BlockHeight::new(200)));
+	assert!(row.accepted_at.is_some());
+
+	let row = status_of(settled).await;
+	assert_eq!(row.status, ClnHoldStatus::Paid);
+	assert_eq!(row.paid_amount_msat, Some(3000));
+	assert!(row.paid_at.is_some());
+
+	let row = status_of(canceled).await;
+	assert_eq!(row.status, ClnHoldStatus::Cancelled);
+	assert!(row.cancelled_at.is_some());
+
+	// Accepting an intra-Ark payment canceled the hold invoice on the node.
+	let row = status_of(intra_ark).await;
+	assert_eq!(row.status, ClnHoldStatus::Cancelled);
+	assert_eq!(row.lowest_incoming_htlc_expiry, Some(BlockHeight::new(230)));
+
+	let row = status_of(failed_intra_ark).await;
+	assert_eq!(row.status, ClnHoldStatus::Paid);
+
+	let inserted = backfill_cln_hold::run(&db).await.unwrap();
+	assert_eq!(inserted, 0, "a second run finds nothing to port");
+}
+
 #[tokio::test]
 async fn lightning_generated_invoice_and_htlc_subscription() {
 	let mut ctx = TestContext::new_minimal("postgresd/lightning_generated_invoice").await;
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -2058,7 +2278,7 @@ async fn lightning_generated_invoice_and_htlc_subscription() {
 
 	// Insert a vtxo and attach it to the subscription (htlcs-ready transition)
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
 
 	db.write(async |t| t.update_lightning_htlc_subscription_with_htlcs(sub_id, [vtxo.id()]).await).await.unwrap();
 
@@ -2114,8 +2334,8 @@ async fn get_integration_token_config() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 
 	let integration = db.write(async |t| t.store_integration("test_integration").await).await.unwrap();
 
@@ -2143,8 +2363,8 @@ async fn wallet_changeset() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 
 	// Empty aggregate changeset
 	let cs = db.read(async |t| t.read_aggregate_changeset(WalletKind::Rounds).await).await.unwrap();
@@ -2173,8 +2393,8 @@ async fn round_participation_mailbox() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -2183,15 +2403,15 @@ async fn round_participation_mailbox() {
 	let hash2 = sha256::Hash::hash(b"unlock-hash-2");
 
 	// Empty mailbox returns nothing
-	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, 0, 10, bitcoin::Network::Regtest).await).await.unwrap();
+	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, 0, 10).await).await.unwrap();
 	assert!(messages.is_empty());
 
 	// Store hash1
-	let cp1 = db.write(async |t| t.store_round_participation_in_mailbox(mailbox_id, hash1, bitcoin::Network::Regtest).await).await
+	let cp1 = db.write(async |t| t.store_round_participation_in_mailbox(mailbox_id, hash1).await).await
 		.unwrap().expect("should return a checkpoint");
 
 	// Fetch from checkpoint 0 – should return hash1
-	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, 0, 10, bitcoin::Network::Regtest).await).await.unwrap();
+	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, 0, 10).await).await.unwrap();
 	assert_eq!(messages.len(), 1);
 	assert_eq!(messages[0].checkpoint, cp1);
 	let unlock_hash = match messages[0].payload {
@@ -2201,12 +2421,12 @@ async fn round_participation_mailbox() {
 	assert_eq!(unlock_hash, hash1);
 
 	// Store hash2
-	let cp2 = db.write(async |t| t.store_round_participation_in_mailbox(mailbox_id, hash2, bitcoin::Network::Regtest).await).await
+	let cp2 = db.write(async |t| t.store_round_participation_in_mailbox(mailbox_id, hash2).await).await
 		.unwrap().expect("should return a checkpoint");
 	assert!(cp2 > cp1, "checkpoints should be monotonically increasing");
 
 	// Fetch from cp1 – should only return hash2
-	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, cp1, 10, bitcoin::Network::Regtest).await).await.unwrap();
+	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, cp1, 10).await).await.unwrap();
 	assert_eq!(messages.len(), 1);
 	assert_eq!(messages[0].checkpoint, cp2);
 	let unlock_hash = match messages[0].payload {
@@ -2222,8 +2442,8 @@ async fn lightning_receive_notification_mailbox_duplicate() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -2236,18 +2456,16 @@ async fn lightning_receive_notification_mailbox_duplicate() {
 	// First insert returns a checkpoint.
 	let cp1 = db.write(async |t| t.store_lightning_receive_notification(
 		mailbox_id, &payment_hash_str, amount,
-		bitcoin::Network::Regtest,
 	).await).await.unwrap().expect("first insert should return a checkpoint");
 
 	// Re-posting the same payment hash is ignored, not rejected.
 	let dup = db.write(async |t| t.store_lightning_receive_notification(
 		mailbox_id, &payment_hash_str, amount,
-		bitcoin::Network::Regtest,
 	).await).await.unwrap();
 	assert!(dup.is_none(), "duplicate insert should return None");
 
 	// The mailbox holds exactly one notification, carrying its own amount.
-	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, 0, 10, bitcoin::Network::Regtest).await).await.unwrap();
+	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, 0, 10).await).await.unwrap();
 	assert_eq!(messages.len(), 1);
 	assert_eq!(messages[0].checkpoint, cp1);
 	match messages[0].payload {
@@ -2265,8 +2483,8 @@ async fn lightning_send_finished_mailbox_notification() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -2275,10 +2493,9 @@ async fn lightning_send_finished_mailbox_notification() {
 	// Store a failed payment notification (no preimage, with a reason)
 	let cp1 = db.write(async |t| t.store_lightning_send_finished(
 		mailbox_id, payment_hash, None, Some(LightningFailureKind::FeeTooLow),
-		bitcoin::Network::Regtest,
 	).await).await.unwrap().expect("first insert should succeed");
 
-	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, 0, 10, bitcoin::Network::Regtest).await).await.unwrap();
+	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, 0, 10).await).await.unwrap();
 	assert_eq!(messages.len(), 1);
 	assert_eq!(messages[0].checkpoint, cp1);
 	match &messages[0].payload {
@@ -2294,7 +2511,6 @@ async fn lightning_send_finished_mailbox_notification() {
 	// Duplicate insert for the same payment hash should be a no-op
 	let dup = db.write(async |t| t.store_lightning_send_finished(
 		mailbox_id, payment_hash, None, Some(LightningFailureKind::FeeTooLow),
-		bitcoin::Network::Regtest,
 	).await).await.unwrap();
 	assert!(dup.is_none(), "duplicate insert should return None");
 
@@ -2303,11 +2519,10 @@ async fn lightning_send_finished_mailbox_notification() {
 	let success_hash: ark::lightning::PaymentHash = test_preimage.compute_payment_hash();
 	let cp2 = db.write(async |t| t.store_lightning_send_finished(
 		mailbox_id, success_hash, Some(test_preimage), None,
-		bitcoin::Network::Regtest,
 	).await).await.unwrap().expect("first insert should succeed");
 	assert!(cp2 > cp1, "checkpoints should be monotonically increasing");
 
-	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, cp1, 10, bitcoin::Network::Regtest).await).await.unwrap();
+	let messages = db.read(async |t| t.get_mailbox_messages(mailbox_id, cp1, 10).await).await.unwrap();
 	assert_eq!(messages.len(), 1);
 	match &messages[0].payload {
 		MailboxPayload::LightningSendFinished { payment_hash: ph, preimage, failure } => {
@@ -2326,12 +2541,12 @@ async fn htlc_vtxo_chain_resolution_cleared_above_fork_height() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.unwrap();
 
 	let payment_hash = Preimage::random().compute_payment_hash();
 	db.write(async |t| htlc_vtxo::create_htlc_vtxos(
@@ -2363,12 +2578,12 @@ async fn htlc_vtxo_chain_resolution_kept_at_fork_height() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([vtxo.clone()], Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await).await.unwrap();
+	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.unwrap();
 
 	let payment_hash = Preimage::random().compute_payment_hash();
 	db.write(async |t| htlc_vtxo::create_htlc_vtxos(
@@ -2386,197 +2601,4 @@ async fn htlc_vtxo_chain_resolution_kept_at_fork_height() {
 		.unwrap().expect("htlc vtxo present");
 	assert_eq!(stored.htlc.chain_resolution, Some(HtlcResolution::Revoked));
 	assert_eq!(stored.htlc.chain_resolution_height, Some(BlockHeight::new(120)));
-}
-
-/// Exercise the claim guard's real subscription/source joins for both encodings.
-/// These are database authorization fixtures, not native collection proofs.
-#[tokio::test]
-async fn watchman_receive_claim_uses_upstream_facts_for_both_encodings() {
-	let mut ctx = TestContext::new_minimal("postgresd/watchman_receive_claim_upstream_facts").await;
-	ctx.init_central_postgres().await;
-	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg).await.unwrap();
-	let db = Db::connect(&cfg).await.unwrap();
-	super::register_vector_owners(&db).await;
-	let key = VTXO_VECTORS.board_vtxo.user_pubkey();
-	let (node, _) = db.write(async |t| t.register_lightning_node(&key).await).await.unwrap();
-	let secp = Secp256k1::new();
-	let invoice_key = SecretKey::from_slice(&[41; 32]).unwrap();
-	let base = &VTXO_VECTORS.board_vtxo;
-
-	for legacy in [false, true] {
-		let preimage = Preimage::random();
-		let hash = preimage.compute_payment_hash();
-		let expiry = base.expiry_height().saturating_sub(BlockDelta::new(200));
-		let policy = if legacy {
-			VtxoPolicy::ServerHtlcRecv_v0(ServerHtlcRecv_v0_VtxoPolicy {
-				user_pubkey: key, payment_hash: hash, htlc_expiry: expiry,
-				htlc_expiry_delta: BlockDelta::new(40),
-			})
-		} else { VtxoPolicy::new_server_htlc_recv(key, hash, expiry, BlockDelta::new(40)) };
-		let point = bitcoin::OutPoint::new(base.point().txid, u32::from(legacy));
-		let source = ServerVtxo::new(point, policy.into(), base.amount(), base.expiry_height(),
-			base.server_pubkey(), base.exit_delta(), point);
-		let invoice = InvoiceBuilder::new(Currency::Regtest)
-			.description("receive claim authorization".into()).payment_hash(hash.to_sha256_hash())
-			.payment_secret(PaymentSecret([42; 32])).current_timestamp()
-			.min_final_cltv_expiry_delta(18).amount_milli_satoshis(source.amount().to_sat() * 1_000)
-			.build_signed(|message| secp.sign_ecdsa_recoverable(message, &invoice_key)).unwrap();
-		db.write(async |t| {
-			t.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_bare_vtxos([source.clone()]), Some((bitcoin::Network::Regtest, super::test_server_mailbox_key()))).await?;
-			htlc_vtxo::create_htlc_vtxos(t, &[(source.id(), hash, expiry)], HtlcDirection::Outgoing).await?;
-			t.register_vtxo_confirmation(source.id(), BlockHeight::new(100)).await?;
-			t.store_generated_lightning_receive(node, &invoice, source.amount().to_sat() * 1_000, None, None).await
-		}).await.unwrap();
-		let subscription = db.read(async |t| t.get_htlc_subscription_by_payment_hash(hash).await)
-			.await.unwrap().unwrap().id;
-		let missing = db.write(async |t| t.lock_watchman_claim_inputs(&[source.clone()]).await).await.unwrap_err();
-		assert!(format!("{missing:#}").contains("receive claim source has no subscription"), "{missing:#}");
-		db.write(async |t| t.store_lightning_htlc_subscription_status(subscription,
-			LightningHtlcSubscriptionStatus::Accepted, Some(expiry), None).await).await.unwrap();
-		db.write(async |t| t.update_lightning_htlc_subscription_with_htlcs(subscription, [source.id()]).await)
-			.await.unwrap();
-
-		for known in [false, true] {
-			if known { db.write(async |t| t.store_htlc_settlement(preimage).await).await.unwrap(); }
-			for (status, offchain, chain, allowed) in [
-				(LightningHtlcSubscriptionStatus::Created, None, None, false),
-				(LightningHtlcSubscriptionStatus::Accepted, None, None, false),
-				(LightningHtlcSubscriptionStatus::HtlcsReady, None, None, !known),
-				(LightningHtlcSubscriptionStatus::Settled, None, None, false),
-				(LightningHtlcSubscriptionStatus::Canceled, None, None, true),
-				(LightningHtlcSubscriptionStatus::Canceled, Some(HtlcResolution::Revoked), None, true),
-				(LightningHtlcSubscriptionStatus::Canceled, Some(HtlcResolution::Fulfilled), None, false),
-				(LightningHtlcSubscriptionStatus::Canceled, None, Some(HtlcResolution::Fulfilled), false),
-			] {
-				db.write(async |t| {
-					t.execute("UPDATE lightning_htlc_subscription SET status=$2,updated_at=NOW() WHERE id=$1",
-						&[&subscription, &status]).await?;
-					t.execute("UPDATE htlc_vtxo SET offchain_resolution=$2::TEXT::htlc_resolution,chain_resolution=$3::TEXT::htlc_resolution, \
-						chain_resolution_height=CASE WHEN $3::TEXT IS NULL THEN NULL ELSE 100 END \
-						WHERE id=(SELECT id FROM vtxo WHERE vtxo_id=$1)",
-						&[&source.id().to_string(), &offchain.map(|r| r.as_str()), &chain.map(|r| r.as_str())]).await?;
-					Ok(())
-				}).await.unwrap();
-				let result = db.write(async |t| t.lock_watchman_claim_inputs(&[source.clone()]).await).await;
-				assert_eq!(result.is_ok(), allowed,
-					"legacy={legacy} known={known} status={status} offchain={offchain:?} chain={chain:?}: {result:?}");
-				if !allowed {
-					let error = result.unwrap_err();
-					assert!(format!("{error:#}").contains("receive grant may have been collected"), "{error:#}");
-				}
-			}
-		}
-	}
-}
-
-#[tokio::test]
-async fn mailbox_registration_guards_every_writer_reader_and_empty_batch() {
-	let mut ctx = TestContext::new_minimal("postgresd/mailbox_registration_guards").await;
-	ctx.init_central_postgres().await;
-	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg).await.unwrap();
-	let db = Db::connect(&cfg).await.unwrap();
-	super::register_vector_owners(&db).await;
-	let network = bitcoin::Network::Regtest;
-	let mailbox_key = Keypair::from_seckey_slice(&ark::SECP, &[249; 32]).unwrap();
-	let mailbox = MailboxIdentifier::from_pubkey(mailbox_key.public_key());
-	let coin = VTXO_VECTORS.board_vtxo.clone();
-	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(coin.clone())],
-		Some((network, super::test_server_mailbox_key()))).await).await.unwrap();
-	let hash = Preimage::random().compute_payment_hash();
-	let unlock = UnlockHash::hash(b"guarded mailbox round");
-	let checkpoint_before = db.read(async |tx| {
-		let row = tx.query_one("SELECT last_time, last_counter, max_time FROM checkpoint_state WHERE type_id=1", &[]).await?;
-		Ok((row.get::<_, i64>(0), row.get::<_, i32>(1), row.get::<_, i64>(2)))
-	}).await.unwrap();
-	for kind in 0..7 {
-		let error = db.write(async |tx| match kind {
-			0 => tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[coin.clone()], network).await,
-			1 => tx.store_round_participation_in_mailbox(mailbox, unlock, network).await,
-			2 => tx.store_lightning_receive_notification(mailbox, &hash.to_string(), coin.amount(), network).await,
-			3 => tx.store_lightning_send_finished(mailbox, hash, None, Some(LightningFailureKind::FeeTooLow), network).await,
-			4 => tx.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox, &[coin.id()], network).await,
-			5 => tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[], network).await,
-			6 => tx.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox, &[], network).await,
-			_ => unreachable!(),
-		}).await.unwrap_err();
-		assert!(error.is::<OwnershipRefusal>(), "writer {kind}: {error:#}");
-	}
-	assert!(db.read(async |tx| tx.get_mailbox_entries(mailbox, 0, 0, network).await)
-		.await.unwrap_err().is::<OwnershipRefusal>());
-	assert!(db.read(async |tx| tx.get_mailbox_messages(mailbox, 0, 0, network).await)
-		.await.unwrap_err().is::<OwnershipRefusal>());
-	let checkpoint_after = db.read(async |tx| {
-		let row = tx.query_one("SELECT last_time, last_counter, max_time FROM checkpoint_state WHERE type_id=1", &[]).await?;
-		Ok((row.get::<_, i64>(0), row.get::<_, i32>(1), row.get::<_, i64>(2)))
-	}).await.unwrap();
-	assert_eq!(checkpoint_after, checkpoint_before, "refusals cannot consume checkpoints");
-	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM mailbox", &[]).await?.get::<_, i64>(0))).await.unwrap(), 0);
-
-	super::register_test_owners(&db, super::test_server_mailbox_key(), &mailbox_key, &[]).await;
-	for kind in 0..5 {
-		let checkpoint = db.write(async |tx| match kind {
-			0 => tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[coin.clone()], network).await,
-			1 => tx.store_round_participation_in_mailbox(mailbox, unlock, network).await,
-			2 => tx.store_lightning_receive_notification(mailbox, &hash.to_string(), coin.amount(), network).await,
-			3 => tx.store_lightning_send_finished(mailbox, hash, None, Some(LightningFailureKind::FeeTooLow), network).await,
-			4 => tx.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox, &[coin.id()], network).await,
-			_ => unreachable!(),
-		}).await.unwrap();
-		assert!(checkpoint.is_some(), "registered writer {kind} must work");
-	}
-	let entries = db.read(async |tx| tx.get_mailbox_messages(mailbox, 0, 100, network).await).await.unwrap();
-	assert_eq!(entries.len(), 5);
-	assert_eq!(db.read(async |tx| tx.get_mailbox_entries(mailbox, 0, 100, network).await).await.unwrap().len(), 1);
-	assert!(db.write(async |tx| tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[], network).await).await.unwrap().is_none());
-	assert!(db.write(async |tx| tx.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox, &[], network).await).await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn malformed_notification_registration_remains_a_typed_round_refusal() {
-	let mut ctx = TestContext::new_minimal("postgresd/malformed_notification_registration").await;
-	ctx.init_central_postgres().await;
-	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg).await.unwrap();
-	let db = Db::connect(&cfg).await.unwrap();
-	let key = Keypair::from_seckey_slice(&ark::SECP, &[247; 32]).unwrap();
-	let mailbox = MailboxIdentifier::from_pubkey(key.public_key());
-	let network = bitcoin::Network::Regtest;
-	super::register_test_owners(&db, super::test_server_mailbox_key(), &key, &[]).await;
-	let canonical = db.read(async |tx| {
-		let row = tx.query_one("SELECT spk, mailbox_sig FROM fallback_record WHERE mailbox_pk=$1",
-			&[&key.public_key().to_string()]).await?;
-		Ok((row.get::<_, String>(0), row.get::<_, String>(1)))
-	}).await.unwrap();
-	for (spk, signature) in [
-		("not-hex".to_owned(), canonical.1.clone()),
-		(canonical.0.clone(), "not-a-signature".to_owned()),
-	] {
-		db.write(async |tx| {
-			tx.execute("UPDATE fallback_record SET spk=$2, mailbox_sig=$3 WHERE mailbox_pk=$1",
-				&[&key.public_key().to_string(), &spk, &signature]).await?;
-			Ok(())
-		}).await.unwrap();
-		let decoded = db.read(async |tx| tx.get_fallback(key.public_key()).await).await.unwrap_err();
-		assert!(matches!(decoded.downcast_ref::<OwnershipRefusal>(),
-			Some(OwnershipRefusal::UnregisteredMailbox(actual)) if *actual == key.public_key()));
-		let predicate = db.read(async |tx| tx.require_registered_mailbox(mailbox, network).await).await.unwrap_err();
-		assert!(predicate.is::<OwnershipRefusal>());
-		let round_write = db.write(async |tx| tx.store_round_participation_in_mailbox(
-			mailbox, UnlockHash::hash(b"malformed notification registration"), network,
-		).await).await.unwrap_err().context("round persistence");
-		// persist_round uses this typed predicate for both propagation from
-		// best-effort delivery and Recoverable classification, through context.
-		assert!(round_write.is::<OwnershipRefusal>(), "{round_write:#}");
-		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM mailbox", &[]).await?.get::<_, i64>(0))).await.unwrap(), 0);
-	}
-	// A query failure stays a database failure; it is not relabelled as a
-	// bad registration by the two decoding maps.
-	let sql_error = db.write(async |tx| {
-		tx.batch_execute("ALTER TABLE fallback_record RENAME TO unavailable_fallback_record").await?;
-		tx.get_fallback(key.public_key()).await
-	}).await.unwrap_err();
-	assert!(!sql_error.is::<OwnershipRefusal>(), "{sql_error:#}");
-	assert!(sql_error.is::<tokio_postgres::Error>(), "{sql_error:#}");
 }

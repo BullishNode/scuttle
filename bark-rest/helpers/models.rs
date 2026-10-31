@@ -16,7 +16,7 @@ mod tests {
 	use serde_json::json;
 
 	#[test]
-	fn generated_errors_preserve_refusal_codes_before_generic_bad_requests() {
+	fn generated_errors_preserve_refusal_codes() {
 		macro_rules! check {
 			($error:ident) => {
 				for code in ["decided_for_fallback", "future_refusal"] {

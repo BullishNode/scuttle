@@ -7,6 +7,7 @@ use bitcoin_ext::bdk::{KEYCHAIN, WalletExt};
 use bitcoin_ext::BlockRef;
 
 use crate::sync::{ChainEventListener, BlockData, RawMempool};
+use crate::database::Tx;
 use crate::telemetry;
 use crate::utils::InstrumentedLock;
 use crate::wallet::PersistedWallet;
@@ -153,7 +154,7 @@ impl ChainEventListener for InstrumentedLock<PersistedWallet> {
 	}
 
 	#[tracing::instrument(skip_all, fields(wallet = self.name(), height = _reorg_to.height.to_u32()))]
-	async fn on_reorg(&self, _reorg_to: BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, _tx: &Tx<'_>, _reorg_to: BlockRef) -> anyhow::Result<()> {
 		// No action needed on reorg notification.
 		//
 		// BDK handles reorgs for us

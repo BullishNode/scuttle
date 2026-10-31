@@ -5,6 +5,7 @@ use anyhow::Context;
 use bitcoin::secp256k1::Keypair;
 
 use ark::{musig, VtxoId};
+use ark::attestations::ForfeitNoncesAttestation;
 use ark::forfeit::HashLockedForfeitBundle;
 use ark::tree::signed::{UnlockHash, UnlockPreimage};
 
@@ -43,7 +44,26 @@ impl Server {
 		&self,
 		unlock_hash: UnlockHash,
 		vtxos: &[VtxoId],
+		attestations: &[ForfeitNoncesAttestation],
 	) -> anyhow::Result<Vec<musig::PublicNonce>> {
+		// check ownership before anything that depends on the participation,
+		// so only the owner learns whether the inputs belong to this hash
+		if attestations.is_empty() {
+			if self.config.forfeit_attestation_required {
+				return badarg!("forfeit nonce requests need an attestation for each vtxo");
+			}
+		} else {
+			if attestations.len() != vtxos.len() {
+				return badarg!("expected {} attestations, got {}", vtxos.len(), attestations.len());
+			}
+			let states = self.db.read(async |t| t.get_user_vtxos_by_id(vtxos).await).await?;
+			for (state, attestation) in states.iter().zip(attestations) {
+				if attestation.verify(unlock_hash, &state.vtxo).is_err() {
+					return badarg!("invalid attestation for vtxo {}", state.vtxo_id);
+				}
+			}
+		}
+
 		// only generate nonces for the inputs of the round participation with
 		// the given unlock hash, so that this endpoint can't be used to burn
 		// CPU on unbounded nonce generation
@@ -121,6 +141,19 @@ impl Server {
 
 		let unlock_hash = unlock_hash.badarg("zero forfeit bundles provided")?;
 
+		// nonces are only handed out against the participation, so without
+		// them nothing below may tell the caller anything about it
+		{
+			let nonces = self.forfeit_nonces.lock();
+			for id in &vtxo_ids {
+				let generated = nonces.get(id).and_then(|n| n.as_ref())
+					.is_some_and(|n| n.unlock_hash == unlock_hash);
+				if !generated {
+					return badarg!("no forfeit nonces generated for vtxo {}", id);
+				}
+			}
+		}
+
 		// fetch all input vtxos and round participation in a single transaction
 		let (vtxos, part) = self.db.read(async |t| {
 			let vtxos = t.get_user_vtxos_by_id(&vtxo_ids).await?;
@@ -144,7 +177,7 @@ impl Server {
 			}
 		}
 		if !input_set.is_empty() {
-			return badarg!("missing input vtxos: {:?}", input_set);
+			return badarg!("missing input vtxos");
 		}
 
 		// an input that exited onchain can be taken by its owner through the
@@ -225,7 +258,7 @@ impl Server {
 				.insert_unspent_vtxos(ff_vtxos, SpendState::RoundForfeit)
 				.mark_vtxos_round_forfeited(input_forfeit_pairs)
 				.mark_vtxos_claimed(output_vtxo_ids);
-			t.execute_vtxo_tree_update(update, None).await
+			t.execute_vtxo_tree_update(update).await
 				.context("failed to execute vtxo tree update")?;
 			t.mark_participation_forfeited(unlock_hash).await
 				.context("failed to mark participation as forfeited")?;

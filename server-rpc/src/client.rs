@@ -35,7 +35,6 @@ use std::time::Duration;
 use bitcoin::{FeeRate, Network};
 use log::warn;
 use tokio::sync::RwLock;
-use tonic::codec::CompressionEncoding;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::metadata::errors::InvalidMetadataValue;
 use tonic::service::interceptor::{InterceptedService, Interceptor};
@@ -486,18 +485,12 @@ impl ServerConnection {
 		let pver = check_handshake(handshake)?;
 		interceptor.pver = Some(pver);
 
-		// Advertise zstd so capable servers compress their responses; the
-		// savings are mostly on the response path. We only accept_compressed,
-		// never send_compressed: gRPC can't negotiate request-body compression,
-		// so the client leaves its own requests uncompressed.
 		let mut client = ArkServiceClient::with_interceptor(transport.clone(), interceptor.clone())
-			.accept_compressed(CompressionEncoding::Zstd)
 			.max_decoding_message_size(64 * 1024 * 1024); // 64MB limit
 
 		let info = client.ark_info(network).await?;
 
 		let mailbox_client = mailbox::MailboxServiceClient::with_interceptor(transport, interceptor)
-			.accept_compressed(CompressionEncoding::Zstd)
 			.max_decoding_message_size(64 * 1024 * 1024); // 64MB limit
 
 		let info = Arc::new(RwLock::new(ServerInfo::new(pver, info)));
@@ -592,7 +585,34 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 
 #[cfg(test)]
 mod tests {
-	use super::{CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
+	use super::{check_handshake, ConnectError, CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
+	use crate::{protos, pver};
+
+	#[test]
+	fn scuttle_client_requires_exact_fork_protocol() {
+		for maximum in [pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES, pver::PROTOCOL_VERSION_SCUTTLE - 1] {
+			let old = protos::HandshakeResponse {
+				min_protocol_version: pver::PROTOCOL_VERSION_PPM_FEE_TOTAL,
+				max_protocol_version: maximum,
+				..Default::default()
+			};
+			assert!(matches!(check_handshake(old), Err(ConnectError::ProtocolVersionMismatchServerTooOld {
+				client_min: pver::PROTOCOL_VERSION_SCUTTLE, server_max,
+			}) if server_max == maximum));
+		}
+		let capable = protos::HandshakeResponse {
+			min_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE,
+			max_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE,
+			..Default::default()
+		};
+		assert_eq!(check_handshake(capable).unwrap(), pver::PROTOCOL_VERSION_SCUTTLE);
+		let future = protos::HandshakeResponse {
+			min_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE + 1,
+			max_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE + 1,
+			..Default::default()
+		};
+		assert!(matches!(check_handshake(future), Err(ConnectError::ProtocolVersionMismatchClientTooOld { .. })));
+	}
 
 	#[test]
 	fn no_transport_backend_error_mentions_feature_selection() {

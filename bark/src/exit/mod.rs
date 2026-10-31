@@ -162,6 +162,13 @@ use crate::psbtext::PsbtInputExt;
 use crate::subsystem::{ExitMovement, Subsystem};
 use crate::vtxo::VtxoStateKind;
 
+/// A receipt prevents new publication only while the exit is still abortable.
+/// It does not cancel, discard, or reinterpret an already exposed exit.
+pub(crate) fn fallback_blocks_abortable_exit(state: &ExitState, id: VtxoId, receipts: &[crate::FallbackReceipt]) -> bool {
+	(state.is_cancelable() || matches!(state, ExitState::Canceled(_)))
+		&& receipts.iter().any(|receipt| receipt.affects(id))
+}
+
 /// What is known about the CPFP child of a pending exit transaction.
 pub(crate) enum ChildState {
 	/// No package for the transaction is in the mempool.
@@ -216,6 +223,9 @@ impl ExitInner {
 		if vtxos.is_empty() {
 			return Ok(());
 		}
+		let claims = self.persister.get_fallback_receipts().await?;
+		ensure!(!vtxos.iter().any(|coin| claims.iter().any(|claim| claim.affects(coin.borrow().id()))),
+			"a committed fallback source cannot be exited");
 		let tip = self.chain_source.tip().await?;
 		let params = Params::new(self.chain_source.network());
 		for vtxo in vtxos {
@@ -300,7 +310,18 @@ impl ExitInner {
 			}
 		}
 		self.exit_vtxos = exit_vtxos;
-		self.tx_manager.sync().await?;
+		let receipts = self.persister.get_fallback_receipts().await?;
+		let mut blocked = HashSet::new();
+		let mut allowed = HashSet::new();
+		for exit in &self.exit_vtxos {
+			let target = if fallback_blocks_abortable_exit(exit.state(), exit.id(), &receipts) {
+				&mut blocked
+			} else { &mut allowed };
+			if let Some(txids) = exit.txids() { target.extend(txids.iter().copied()); }
+		}
+		// A shared ancestor can still be needed by a different, unfenced exit.
+		blocked.retain(|txid| !allowed.contains(txid));
+		self.tx_manager.sync(&blocked).await?;
 		Ok(())
 	}
 
@@ -731,6 +752,7 @@ impl Exit {
 		&self,
 		wallet: &Wallet,
 	) -> anyhow::Result<Option<Vec<ExitProgressStatus>>> {
+		let _receipt_guard = wallet.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
 		let mut guard = self.inner.write().await;
 		guard.refresh_tx_state().await?;
 		let mut exit_vtxos = std::mem::take(&mut guard.exit_vtxos);
@@ -796,7 +818,14 @@ impl Exit {
 		ev: &ExitVtxo,
 		state_changed: bool,
 	) {
-		if ev.state().warrants_exited_vtxo() {
+		let paid_fallback = match wallet.inner.db.get_fallback_receipts().await {
+			Ok(receipts) => receipts.iter().any(|receipt| receipt.affects(ev.id()) && receipt.retired_block.is_some()),
+			Err(error) => {
+				error!("Could not check fallback retirement for exit {}: {error:#}", ev.id());
+				return;
+			},
+		};
+		if ev.state().warrants_exited_vtxo() && !paid_fallback {
 			if let Err(e) = wallet.mark_vtxos_as_exited([ev.id()]).await {
 				error!("Failed to mark VTXO {} as Exited: {:#}", ev.id(), e);
 			}
@@ -826,6 +855,7 @@ impl Exit {
 		&self,
 		wallet: &Wallet,
 	) -> anyhow::Result<()> {
+		let _receipt_guard = wallet.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
 		let mut guard = self.inner.write().await;
 		guard.refresh_tx_state().await?;
 		let mut exit_vtxos = std::mem::take(&mut guard.exit_vtxos);
@@ -858,8 +888,13 @@ impl Exit {
 	/// Call [Exit::provide_cpfp_tx] to submit the child.
 	pub async fn exits_needing_cpfp(&self) -> Vec<ExitCpfpRequest> {
 		let guard = self.inner.read().await;
+		let receipts = match guard.persister.get_fallback_receipts().await {
+			Ok(receipts) => receipts,
+			Err(error) => { error!("Could not check fallback commitments for CPFP selection: {error:#}"); return Vec::new(); },
+		};
 		let mut requests = Vec::new();
 		for ev in &guard.exit_vtxos {
+			if fallback_blocks_abortable_exit(ev.state(), ev.id(), &receipts) { continue; }
 			let ExitState::Processing(s) = ev.state() else { continue };
 			for tx in &s.transactions {
 				let rbf_requirement = match &tx.status {
@@ -916,8 +951,17 @@ impl Exit {
 		child_tx: Transaction,
 	) -> anyhow::Result<(), ExitError> {
 		let origin = ExitTxOrigin::Wallet { confirmed_in: None };
+		let _receipt_guard = wallet.lock_fallback_history(std::time::Duration::from_secs(30)).await
+			.map_err(|error| ExitError::InvalidWalletState { error: error.to_string() })?;
 		let mut guard = self.inner.write().await;
 		let inner = &mut *guard;
+		let receipts = inner.persister.get_fallback_receipts().await
+			.map_err(|error| ExitError::InvalidWalletState { error: error.to_string() })?;
+		let matching = inner.exit_vtxos.iter().filter(|exit| exit.txids().is_some_and(|txids| txids.contains(&exit_txid)))
+			.collect::<Vec<_>>();
+		if matching.is_empty() || matching.iter().all(|exit| fallback_blocks_abortable_exit(exit.state(), exit.id(), &receipts)) {
+			return Err(ExitError::InvalidWalletState { error: "a committed fallback source cannot publish another abortable exit".into() });
+		}
 
 		// Broadcast the package first and only commit the child if it's accepted
 		if !inner.tx_manager.broadcast_and_set_child(exit_txid, child_tx, origin).await? {
@@ -1097,6 +1141,13 @@ impl Exit {
 
 			{
 				let guard = self.inner.read().await;
+				let receipts = guard.persister.get_fallback_receipts().await
+					.map_err(|error| ExitError::InvalidWalletState { error: error.to_string() })?;
+				let state = guard.exit_vtxos.iter().find(|exit| exit.id() == vtxo_id).map(|exit| exit.state());
+				if receipts.iter().any(|receipt| receipt.affects(vtxo_id)) && state.is_none_or(|state|
+					fallback_blocks_abortable_exit(state, vtxo_id, &receipts)) {
+					return Err(ExitError::InvalidWalletState { error: "a committed fallback source cannot be exited".into() });
+				}
 				match guard.exit_vtxos.iter().find(|ev| ev.id() == vtxo_id).map(|ev| ev.state()) {
 					Some(ExitState::Claimed(_)) => {
 						return Err(ExitError::VtxoAlreadyExited { vtxo: vtxo_id });

@@ -33,12 +33,14 @@ fn check_auth_not_expired(auth: &MailboxAuthorization) -> Result<(), tonic::Stat
 
 #[allow(deprecated)]
 fn new_mailbox_msg(entry: MailboxEntry) -> protos::mailbox_server::MailboxMessage {
+	let owners = super::convert::owner_mailboxes(&entry.owner_mailboxes);
 	match entry.payload {
 		MailboxPayload::Arkoor { vtxos } => {
 			protos::mailbox_server::MailboxMessage {
 				message: Some(protos::mailbox_server::mailbox_message::Message::Arkoor(
 					protos::mailbox_server::ArkoorMessage {
 						vtxos: vtxos.into_iter().map(|v| v.serialize()).collect(),
+						owners,
 					}
 				)),
 				checkpoint: entry.checkpoint.into(),
@@ -72,6 +74,7 @@ fn new_mailbox_msg(entry: MailboxEntry) -> protos::mailbox_server::MailboxMessag
 				message: Some(protos::mailbox_server::mailbox_message::Message::RecoveryVtxoIds(
 					protos::mailbox_server::RecoveryVtxoIdsMessage {
 						vtxo_ids: vtxo_ids.into_iter().map(|v| v.to_bytes().to_vec()).collect(),
+						owners,
 					}
 				)),
 				checkpoint: entry.checkpoint.into(),
@@ -101,6 +104,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::PostArkoorMessageRequest>,
 	) -> Result<tonic::Response<protos::core::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxos.len() > MAX_NB_MAILBOX_ARKOOR_VTXOS {
@@ -155,7 +159,6 @@ impl rpc::server::MailboxService for crate::Server {
 		// route it into a mailbox its owner doesn't watch.
 		let vtxo_ids = vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
 		let stored = self.db.read(async |t| {
-			t.require_registered_mailbox(mailbox_id, self.config.network).await?;
 			t.get_user_vtxos_by_id(&vtxo_ids).await
 		}).await.to_status()?;
 		for stored in &stored {
@@ -169,7 +172,6 @@ impl rpc::server::MailboxService for crate::Server {
 				MailboxType::ArkoorReceive,
 				mailbox_id,
 				vtxos.as_slice(),
-				self.config.network,
 			).await
 		}).await.to_status()?;
 
@@ -189,6 +191,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::MailboxRequest>,
 	) -> Result<tonic::Response<protos::mailbox_server::MailboxMessages>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
@@ -204,11 +207,17 @@ impl rpc::server::MailboxService for crate::Server {
 			self::badarg!("invalid mailbox authorization signature");
 		}
 		let limit = self.config.max_read_mailbox_items;
-		let entries_by_checkpoint = self.db.read(async |t| {
-			t.get_mailbox_messages(mailbox_id, req.checkpoint, limit, self.config.network).await
+		let cursor = req.fallback_cursor.as_deref().map(VtxoId::from_slice).transpose()
+			.badarg("invalid fallback receipt cursor")?;
+		let (entries_by_checkpoint, claims) = self.db.read(async |t| {
+			Ok((t.get_mailbox_messages(mailbox_id, req.checkpoint, limit).await?,
+				t.mailbox_fallback_claims(mailbox_id.as_pubkey(), cursor, limit).await?))
 		}).await.to_status()?;
 
 		let response = protos::mailbox_server::MailboxMessages {
+			have_more_fallback_claims: claims.len() >= limit,
+			fallback_cursor: claims.last().map(|claim| claim.vtxo_id.to_bytes().to_vec()),
+			fallback_claims: claims.iter().map(Into::into).collect(),
 			have_more: entries_by_checkpoint.len() >= limit,
 			messages: entries_by_checkpoint.into_iter().map(new_mailbox_msg).collect(),
 		};
@@ -230,6 +239,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::MailboxRequest>,
 	) -> Result<tonic::Response<Self::SubscribeMailboxStream>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
@@ -246,15 +256,12 @@ impl rpc::server::MailboxService for crate::Server {
 		}
 
 		let db = self.db.clone();
-		let network = self.config.network;
 		let starting_checkpoint = Checkpoint::from(req.checkpoint.max(0));
 		let ret_limit = self.config.max_read_mailbox_items;
 
 		// Start listening for updates on the tip of the mailbox.
 		// Marking the first value as changed makes `changed()` return
 		// immediately so the loop starts with a catch-up fetch.
-		self.db.read(async |tx| tx.require_registered_mailbox(mailbox_id, network).await)
-			.await.to_status()?;
 		let mut mailbox_tip_rx = self.mailbox_manager.subscribe(mailbox_id, 0);
 		mailbox_tip_rx.mark_changed();
 
@@ -278,7 +285,7 @@ impl rpc::server::MailboxService for crate::Server {
 
 				'fetching:
 				loop {
-					match db.read(async |tx| { tx.get_mailbox_messages(mailbox_id, processed_cp, ret_limit, network).await }).await {
+					match db.read(async |tx| { tx.get_mailbox_messages(mailbox_id, processed_cp, ret_limit).await }).await {
 						Ok(entries) => {
 							let done = entries.len() < ret_limit;
 							for entry in entries {
@@ -311,6 +318,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::PostRecoveryVtxoIdsRequest>,
 	) -> Result<tonic::Response<protos::core::Empty>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
 
 		if req.vtxo_ids.len() > MAX_NB_MAILBOX_RECOVERY_IDS {
@@ -327,18 +335,15 @@ impl rpc::server::MailboxService for crate::Server {
 		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
 			.badarg("invalid mailbox id")?;
 
-		// Optional for backward compat; verified like the read path when present.
-		// TODO: make mandatory after 0.3.1, once all clients send it.
-		if let Some(auth_bytes) = req.authorization {
-			let auth = MailboxAuthorization::deserialize(auth_bytes.as_slice())
-				.badarg("invalid mailbox authorization")?;
-			if auth.mailbox() != mailbox_id {
-				self::badarg!("authorization doesn't match mailbox id");
-			}
-			check_auth_not_expired(&auth)?;
-			if !auth.verify() {
-				self::badarg!("invalid mailbox authorization signature");
-			}
+		let auth_bytes = req.authorization.badarg("mailbox authorization required")?;
+		let auth = MailboxAuthorization::deserialize(auth_bytes.as_slice())
+			.badarg("invalid mailbox authorization")?;
+		if auth.mailbox() != mailbox_id {
+			self::badarg!("authorization doesn't match mailbox id");
+		}
+		check_auth_not_expired(&auth)?;
+		if !auth.verify() {
+			self::badarg!("invalid mailbox authorization signature");
 		}
 
 		let checkpoint = self.db.write(async |t| {
@@ -346,7 +351,6 @@ impl rpc::server::MailboxService for crate::Server {
 				MailboxType::RecoveryVtxoId,
 				mailbox_id,
 				vtxo_ids.as_slice(),
-				self.config.network,
 			).await
 		}).await.to_status()?;
 

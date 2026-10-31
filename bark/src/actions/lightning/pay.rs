@@ -31,7 +31,7 @@ use server_rpc::protos::{self, lightning_payment_status};
 use crate::Wallet;
 use crate::actions::{
 	abort, or_retry, Advance, AdvanceError, IntoAdvanceResult,
-	AdvanceResultExt, RetryUnlessRejected, WalletAction, WalletActionId,
+	AdvanceResultExt, RetryUnlessRejected, WalletAction, WalletActionCheckpoint, WalletActionId,
 };
 use crate::arkoor::{resolve_change_pieces, split_change_amount};
 use crate::movement::update::MovementUpdate;
@@ -130,19 +130,11 @@ impl LightningSend {
 impl WalletAction for LightningSend {
 	fn id(&self) -> WalletActionId { LightningSend::id(self) }
 
+	fn from_checkpoint(checkpoint: WalletActionCheckpoint) -> Option<Self> {
+		checkpoint.into_lightning_send()
+	}
+
 	async fn advance(self, wallet: &Wallet) -> Result<Advance<Self>, AdvanceError> {
-		let htlcs = match &self.progress {
-			Progress::HtlcReceived(htlcs) | Progress::PaymentInitiated(htlcs)
-				| Progress::RevocableHtlcs { htlcs, .. } | Progress::RevocationStuck { htlcs, .. } => Some(htlcs),
-			_ => None,
-		};
-		if let Some(htlcs) = htlcs {
-			match finish_fallback_refund(wallet, &self, htlcs).await {
-				Ok(true) => return Ok(Advance::Done),
-				Ok(false) => {},
-				Err(error) => return Ok(Advance::Park { state: self, wake_after: None, error: Some(error) }),
-			}
-		}
 		let new_progress = match &self.progress {
 			Progress::Start => {
 				wallet.lock_vtxos(
@@ -666,42 +658,6 @@ fn payment_status_scope_matches(ids: &[VtxoId], scope: &[Vec<u8>]) -> bool {
 	let received = scope.iter().map(|raw| VtxoId::from_slice(raw))
 		.collect::<Result<HashSet<_>, _>>();
 	received.is_ok_and(|received| received == expected)
-}
-
-/// A refund is adopted only when its own complete HTLC set was consumed by
-/// a canonical payment to the registered destination.
-async fn finish_fallback_refund(wallet: &Wallet, send: &LightningSend, htlcs: &Htlcs) -> anyhow::Result<bool> {
-	let Some(record) = wallet.fallback_registration().await? else { return Ok(false); };
-	let mut coins = Vec::new();
-	let mut total = Amount::ZERO;
-	let policy = VtxoPolicy::new_server_htlc_send(send.htlc_key, send.invoice.payment_hash(), send.htlc_expiry);
-	for id in &htlcs.vtxo_ids {
-		let coin = wallet.get_full_vtxo(*id).await?;
-		ensure!(coin.policy() == &policy, "fallback refund is not this send's HTLC");
-		total = total.checked_add(coin.amount()).context("fallback refund amount overflow")?;
-		coins.push(coin);
-	}
-	if coins.is_empty() { return Ok(false); }
-	ensure!(total == send.total_amount(), "fallback refund does not cover the complete send");
-	let paid = wallet.confirmed_fallback_vtxos(&coins, &record.spk).await?;
-	if !htlcs.vtxo_ids.iter().all(|id| paid.contains(id)) { return Ok(false); }
-	if let Ok(PaymentStatus::Success(preimage)) = check_lightning_send_payment_status(wallet, send, htlcs).await {
-		settle_lightning_send_payment(wallet, send, htlcs, preimage).await.into_anyhow()?;
-		return Ok(true);
-	}
-	let _guard = wallet.lock_fallback_history(Duration::from_secs(30)).await?;
-	ensure!(wallet.inner.db.get_paid_invoice(send.invoice.payment_hash()).await?.is_none(),
-		"confirmed lightning refund conflicts with a paid invoice");
-	let holder = VtxoLockHolder::Action { id: send.id() };
-	let mut snapshot = wallet.inner.db.get_fallback_snapshot().await?;
-	snapshot.adopted_payout_vtxos.extend(paid);
-	wallet.inner.db.store_fallback_snapshot(&snapshot).await?;
-	for id in &htlcs.vtxo_ids {
-		ensure!(wallet.inner.db.retire_vtxo_lock(*id, Some(&holder)).await?, "fallback refund HTLC holder changed");
-	}
-	wallet.inner.movements.finish_movement_with_update(htlcs.movement_id, MovementStatus::Failed,
-		MovementUpdate::new().effective_balance(SignedAmount::ZERO).fee(Amount::ZERO)).await?;
-	Ok(true)
 }
 
 /// Terminal success: mark HTLC vtxos spent, finalise the movement with

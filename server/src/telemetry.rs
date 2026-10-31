@@ -483,6 +483,7 @@ struct Metrics {
 	vtxo_pool_amount_sum_gauge: Gauge<u64>,
 	vtxo_pool_amount_sats_bucket_gauge: Gauge<u64>,
 	frontier_gauge: Gauge<u64>,
+	expiry_hold_gauge: Gauge<u64>,
 	grpc_in_progress_counter: UpDownCounter<i64>,
 	grpc_latency_histogram: Histogram<u64>,
 	grpc_request_counter: Counter<u64>,
@@ -787,6 +788,9 @@ impl Metrics {
 		let frontier_gauge = meter.u64_gauge("frontier_gauge")
 			.with_description("Unswept frontier VTXO value in sats, labeled by watchman action")
 			.build();
+		let expiry_hold_gauge = meter.u64_gauge("expiry_holds")
+			.with_description("Current durable expiry holds awaiting a decision")
+			.build();
 		// gRPC metrics
 		let grpc_in_progress_counter = meter.i64_up_down_counter("grpc_requests_in_progress").build();
 		let grpc_latency_histogram = meter.u64_histogram("grpc_request_duration_ms").build();
@@ -893,6 +897,7 @@ impl Metrics {
 			vtxo_pool_amount_sum_gauge,
 			vtxo_pool_amount_sats_bucket_gauge,
 			frontier_gauge,
+			expiry_hold_gauge,
 			grpc_in_progress_counter,
 			grpc_latency_histogram,
 			grpc_request_counter,
@@ -955,6 +960,12 @@ pub fn worker_spawned(worker: &str) {
 	if let Some(m) = TELEMETRY.get() {
 		let attrs = m.with_global_labels([KeyValue::new(ATTRIBUTE_WORKER, worker.to_owned())]);
 		m.spawn_counter.add(1, &attrs);
+	}
+}
+
+pub fn set_expiry_hold_count(count: u64) {
+	if let Some(metrics) = TELEMETRY.get() {
+		metrics.expiry_hold_gauge.record(count, &metrics.global_labels);
 	}
 }
 

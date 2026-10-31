@@ -22,6 +22,8 @@ message PostArkoorMessageRequest {
 }
 
 message MailboxRequest {
+	// Independent cursor for stage-entitled fallback receipts.
+	optional bytes fallback_cursor = 1000;
 	// The mailbox ID to obtain data from
 	bytes mailbox_id = 1;
 	// A signed proof that you are allowed to read from this mailbox
@@ -45,6 +47,7 @@ message MailboxMessage {
 
 message ArkoorMessage {
 	repeated bytes vtxos = 1;
+	repeated core.VtxoOwner owners = 1000;
 }
 
 message RoundParticipationCompleted {
@@ -61,6 +64,7 @@ message IncomingLightningPaymentMessage {
 
 message RecoveryVtxoIdsMessage {
 	repeated bytes vtxo_ids = 1;
+	repeated core.VtxoOwner owners = 1000;
 }
 
 message LightningSendFinishedMessage {
@@ -74,6 +78,9 @@ message LightningSendFinishedMessage {
 }
 
 message MailboxMessages {
+	repeated core.FallbackClaim fallback_claims = 1000;
+	bool have_more_fallback_claims = 1001;
+	optional bytes fallback_cursor = 1002;
 	repeated MailboxMessage messages = 1;
 	// Whether the server has more messages for you
 	bool have_more = 2;
@@ -85,6 +92,6 @@ message PostRecoveryVtxoIdsRequest {
 	// The recovery IDs.
 	// Maximum number of IDs is set in the `MAX_NB_MAILBOX_RECOVERY_IDS` constant
 	repeated bytes vtxo_ids = 2;
-	// Signed proof of mailbox ownership. Optional for now for backward compat.
+	// A signed proof of mailbox ownership, required by the server
 	optional bytes authorization = 3;
 }

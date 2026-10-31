@@ -210,14 +210,25 @@ impl BackingSnapshot {
 // Limit first, then count VTXO encoding lengths. Overbudget results omit blobs;
 // a single oversized bytea must not be copied into the client before refusal.
 const SNAPSHOT: &str = "
-WITH inventory AS (
+WITH RECURSIVE current_branch AS (
+	SELECT vtxo_id,oor_spent_txid,spent_in_round,offboarded_in,policy_type FROM vtxo
+	WHERE $4<>0 AND vtxo_id=ANY($1)
+	UNION
+	SELECT v.vtxo_id,v.oor_spent_txid,v.spent_in_round,v.offboarded_in,v.policy_type
+	FROM vtxo v JOIN current_branch p ON v.vtxo_txid=p.oor_spent_txid
+	WHERE ($4=2 OR (p.spent_in_round IS NULL AND p.offboarded_in IS NULL))
+		AND ($4<>2 OR p.vtxo_id=ANY($1) OR p.policy_type NOT IN (
+			'server-owned','expiry','checkpoint','hark-leaf-v1','hark-leaf',
+			'server-htlc-receive-v1','server-htlc-receive'))
+), inventory AS (
 	SELECT vtxo_id, anchor_point, id, vtxo, expiry,
 		oor_spent_txid, spent_in_round, offboarded_in, banned_until_height,
 		confirmed_height, spend_state::text AS spend_state, created_at, updated_at,
 		EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=vtxo.vtxo_id) AS decided_for_fallback,
 		onchain_spent_height, onchain_spent_txid,
 		lightning_htlc_subscription_id, vtxo_txid, exit_delta, policy_type, policy, server_pubkey, amount
-	FROM vtxo WHERE anchor_point = ANY($1)
+	FROM vtxo WHERE ($4=0 AND anchor_point=ANY($1))
+		OR ($4<>0 AND vtxo_id IN (SELECT vtxo_id FROM current_branch))
 ), bounded AS (
 	SELECT vtxo_id, anchor_point, id, vtxo, expiry,
 		oor_spent_txid, spent_in_round, offboarded_in, banned_until_height,
@@ -252,16 +263,39 @@ impl Tx<'_> {
 	pub async fn backing_snapshot(
 		&self, roots: &[ServerVtxo], limits: BackingSnapshotLimits,
 	) -> anyhow::Result<BackingSnapshot> {
+		self.read_backing_snapshot(roots, limits, 0).await
+	}
+
+	/// Load only the selected physical roots' current economic subtrees.
+	/// Historical round/offboard descendants are not this backing's burden.
+	pub async fn backing_subtree_snapshot(
+		&self, roots: &[ServerVtxo], limits: BackingSnapshotLimits,
+	) -> anyhow::Result<BackingSnapshot> {
+		self.read_backing_snapshot(roots, limits, 1).await
+	}
+
+	/// Progress needs only the first signed path to recoverable children, not
+	/// every economic descendant beyond those children. The split verifier
+	/// still authenticates every selected output, transaction and retained key.
+	pub async fn backing_recovery_snapshot(
+		&self, root: &ServerVtxo, limits: BackingSnapshotLimits,
+	) -> anyhow::Result<BackingSnapshot> {
+		self.read_backing_snapshot(std::slice::from_ref(root), limits, 2).await
+	}
+
+	async fn read_backing_snapshot(
+		&self, roots: &[ServerVtxo], limits: BackingSnapshotLimits, scope: i32,
+	) -> anyhow::Result<BackingSnapshot> {
 		ensure!(!roots.is_empty(), "backing snapshot requires physical roots");
 		ensure!(limits.max_rows > 0 && limits.max_serialized_bytes > 0, "backing snapshot budgets must be positive");
 		ensure!(roots.len() <= limits.max_rows, "backing snapshot roots exceed row budget");
 		let points = roots.iter().map(|r| r.point()).collect::<BTreeSet<_>>();
 		ensure!(points.len() == roots.len(), "backing snapshot has duplicate physical roots");
-		let anchors = roots.iter().map(|r| r.chain_anchor().to_string()).collect::<BTreeSet<_>>()
-			.into_iter().collect::<Vec<_>>();
+		let selected = roots.iter().map(|r| if scope == 0 { r.chain_anchor().to_string() } else { r.id().to_string() })
+			.collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
 		let limit = i64::try_from(limits.max_rows)?.checked_add(1).context("backing snapshot row budget overflow")?;
 		let bytes = i64::try_from(limits.max_serialized_bytes)?;
-		let rows = self.query(SNAPSHOT, &[&anchors, &limit, &bytes]).await?;
+		let rows = self.query(SNAPSHOT, &[&selected, &limit, &bytes, &scope]).await?;
 		let first = rows.first().context("backing snapshot is incomplete: no source inventory")?;
 		let count = usize::try_from(first.get::<_, i64>("row_count"))?;
 		let serialized_bytes = usize::try_from(first.get::<_, i64>("byte_count"))?;

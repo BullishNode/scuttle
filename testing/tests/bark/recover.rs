@@ -166,7 +166,7 @@ async fn recovery_state_catches_up_on_sync() {
 	let vtxo_id = vtxos[0].id.to_string();
 
 	// The drops left the vtxo unregistered server-side and the mailbox empty.
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let state = db.read(async |t| {
 		let row = t.query_one(
 			"SELECT spend_state::text FROM vtxo WHERE vtxo_id = $1", &[&vtxo_id],
@@ -302,7 +302,7 @@ async fn recovery_catchup_survives_rejected_vtxo() {
 	dropping.store(false, Ordering::Relaxed);
 	bark2.vtxos().await;
 
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let (state, blob) = db.read(async |t| {
 		let row = t.query_one(
 			"SELECT spend_state::text, vtxo FROM vtxo WHERE vtxo_id = $1",
@@ -401,7 +401,7 @@ async fn recovery_catchup_includes_exited_vtxos() {
 	let vtxo_id = vtxos[0].id.to_string();
 
 	// The drops left the vtxo unregistered server-side and the mailbox empty.
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let state = db.read(async |t| {
 		let row = t.query_one(
 			"SELECT spend_state::text FROM vtxo WHERE vtxo_id = $1", &[&vtxo_id],
@@ -471,7 +471,8 @@ impl captaind::proxy::MailboxRpcProxy for NoMailbox {
 	async fn read_mailbox(
 		&self, _upstream: &mut MailboxClient, _req: protos::mailbox_server::MailboxRequest,
 	) -> Result<protos::mailbox_server::MailboxMessages, tonic::Status> {
-		Ok(protos::mailbox_server::MailboxMessages { messages: vec![], have_more: false })
+		Ok(protos::mailbox_server::MailboxMessages {
+			fallback_claims: vec![], have_more_fallback_claims: false, fallback_cursor: None, messages: vec![], have_more: false })
 	}
 }
 
@@ -637,7 +638,8 @@ async fn recovered_wallet_follows_xpub_lookup_cursor() {
 		async fn read_mailbox(
 			&self, _upstream: &mut MailboxClient, _req: protos::mailbox_server::MailboxRequest,
 		) -> Result<protos::mailbox_server::MailboxMessages, tonic::Status> {
-			Ok(protos::mailbox_server::MailboxMessages { messages: vec![], have_more: false })
+			Ok(protos::mailbox_server::MailboxMessages {
+			fallback_claims: vec![], have_more_fallback_claims: false, fallback_cursor: None, messages: vec![], have_more: false })
 		}
 	}
 

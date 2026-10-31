@@ -938,7 +938,7 @@ async fn bark_should_exit_a_failed_htlc_out_that_server_refuse_to_revoke() {
 	let tip = ctx.generate_blocks(1).await;
 	srv.watchmand().wait_for_sync_height(tip).await;
 	let postgres = srv.config().postgres.clone();
-	let db = Db::connect(&postgres).await.unwrap();
+	let db = Db::connect(&postgres, bitcoin::Network::Regtest).await.unwrap();
 	let htlc = db.read(async |t| htlc_vtxo::get_htlc_vtxo(t, htlc_vtxos[0]).await).await
 		.unwrap().expect("htlc vtxo present");
 	assert_eq!(htlc.htlc.chain_resolution, Some(HtlcResolution::Revoked));
@@ -1113,7 +1113,7 @@ async fn bark_should_exit_a_pending_htlc_out_that_server_refuse_to_revoke() {
 	let tip = ctx.generate_blocks(1).await;
 	srv.watchmand().wait_for_sync_height(tip).await;
 	let postgres = srv.config().postgres.clone();
-	let db = Db::connect(&postgres).await.unwrap();
+	let db = Db::connect(&postgres, bitcoin::Network::Regtest).await.unwrap();
 	let htlc = db.read(async |t| htlc_vtxo::get_htlc_vtxo(t, htlc_vtxos[0]).await).await
 		.unwrap().expect("htlc vtxo present");
 	assert_eq!(htlc.htlc.chain_resolution, Some(HtlcResolution::Revoked));
@@ -1497,7 +1497,7 @@ async fn bark_should_exit_a_htlc_recv_that_server_refuse_to_cosign() {
 	let tip = ctx.generate_blocks(1).await;
 	srv.watchmand().wait_for_sync_height(tip).await;
 	let postgres = srv.config().postgres.clone();
-	let db = Db::connect(&postgres).await.unwrap();
+	let db = Db::connect(&postgres, bitcoin::Network::Regtest).await.unwrap();
 	let htlc = db.read(async |t| htlc_vtxo::get_htlc_vtxo(t, htlc_vtxos[0]).await).await
 		.unwrap().expect("htlc vtxo present");
 	assert_eq!(htlc.htlc.chain_resolution, Some(HtlcResolution::Fulfilled));

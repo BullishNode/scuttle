@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package scuttle;
+
+import "core.proto";
+
+// Scuttle operator service, exposed only on the existing privileged admin listener.
+service ScuttleService {
+	rpc ListExpiryHolds(core.Empty) returns (ListExpiryHoldsResponse) {}
+}
+
+message ExpiryHold {
+	bytes vtxo_id = 1;
+	string reason = 2;
+	int64 first_seen = 3;
+	int64 last_seen = 4;
+}
+
+message ListExpiryHoldsResponse {
+	repeated ExpiryHold holds = 1;
+}

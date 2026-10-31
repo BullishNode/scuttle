@@ -35,7 +35,7 @@ use crate::persist::models::{SerdeRoundState, StoredExit, StoredRoundState, Unlo
 use crate::lock_manager::LockManager;
 use crate::lock_manager::memory::MemoryLockManager;
 use crate::round::{RoundFlowState, RoundParticipation, RoundState};
-use crate::vtxo::{VtxoState, VtxoStateKind, WalletVtxo};
+use crate::vtxo::{FallbackStatus, VtxoState, VtxoStateKind, WalletVtxo};
 use crate::WalletProperties;
 
 // ---------------------------------------------------------------------------
@@ -62,8 +62,8 @@ macro_rules! bark_persister_tests {
 	($setup:expr) => {
 		$crate::persist::test_suite::bark_persister_tests!(@tests $setup,
 			test_init_and_read_properties,
-			test_fallback_record_is_immutable,
-			test_pending_fallback_record_never_authorizes_registration,
+			test_external_mailbox_public_identity_roundtrip,
+			test_fallback_receipt_binding_is_immutable,
 			test_set_server_pubkey,
 			test_set_server_mailbox_pubkey,
 
@@ -87,6 +87,7 @@ macro_rules! bark_persister_tests {
 			test_store_existing_vtxo_preserves_holder_discharge_and_registration,
 			test_steal_lock_to_spent,
 			test_retire_vtxo_lock,
+			test_fallback_status_keeps_commitment_and_exit_state,
 			test_steal_lock,
 
 			test_create_and_get_movement,
@@ -131,6 +132,7 @@ fn test_properties() -> WalletProperties {
 		fingerprint: Fingerprint::default(),
 		server_pubkey: None,
 		server_mailbox_pubkey: None,
+		mailbox_identity: crate::MailboxIdentity { network: Network::Regtest, public_key: test_pubkey() },
 	}
 }
 
@@ -302,6 +304,19 @@ pub async fn test_init_and_read_properties(db: &impl BarkPersister) {
 
 	let read = db.read_properties().await.expect("read_properties");
 	assert_eq!(read, Some(props), "read_properties should return the stored properties");
+}
+
+pub async fn test_external_mailbox_public_identity_roundtrip(db: &impl BarkPersister) {
+	let secp = Secp256k1::new();
+	let key = test_pubkey();
+	let key = if key.serialize()[0] == 3 { key } else { key.negate(&secp) };
+	assert_eq!(key.serialize()[0], 3);
+	let mut props = test_properties();
+	props.mailbox_identity = crate::MailboxIdentity { network: props.network, public_key: key };
+	db.init_wallet(&props).await.expect("init external mailbox identity");
+	let read = db.read_properties().await.unwrap().unwrap();
+	assert_eq!(read, props);
+	assert_eq!(read.mailbox_identity.public_key.serialize(), key.serialize());
 }
 
 pub async fn test_set_server_pubkey(db: &impl BarkPersister) {
@@ -585,6 +600,39 @@ pub async fn test_store_vtxos_idempotent(db: &impl BarkPersister) {
 		"a repeated store must not insert a second row");
 }
 
+pub async fn test_fallback_status_keeps_commitment_and_exit_state(db: &impl BarkPersister) {
+	let coin = &VTXO_VECTORS.board_vtxo;
+	let exited = &VTXO_VECTORS.round1_vtxo;
+	let holder = Some(MovementId::new(42).into());
+	let locked = VtxoState::Locked { holder: holder.clone() };
+	db.store_vtxos(&[(coin, &locked), (exited, &VtxoState::Exited)]).await.unwrap();
+	let pending = db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Pending).await.unwrap();
+	assert_eq!(pending.state, locked, "a pending decision preserves its original holder");
+	assert_eq!(pending.fallback_status, Some(FallbackStatus::Pending));
+	db.release_vtxo_lock(coin.id(), holder.as_ref()).await.unwrap();
+	assert!(!db.retire_vtxo_lock(coin.id(), holder.as_ref()).await.unwrap());
+	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap(), pending);
+	for state in [VtxoState::Spendable, VtxoState::Spent] {
+		assert!(db.update_vtxo_state_checked(coin.id(), state, VtxoStateKind::ALL).await.is_err());
+	}
+	assert!(db.remove_vtxo(coin.id()).await.is_err());
+	db.store_vtxos(&[(coin, &VtxoState::Spendable)]).await.unwrap();
+	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap(), pending);
+	let terminal = db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Spent).await.unwrap();
+	assert_eq!(terminal.state, VtxoState::Spent);
+	assert_eq!(db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Spent).await.unwrap(), terminal);
+	assert_eq!(db.get_vtxos_by_state(&[VtxoStateKind::Spent]).await.unwrap(), vec![terminal]);
+	let reorg = db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Pending).await.unwrap();
+	assert_eq!(reorg.state, VtxoState::Locked { holder: None });
+	assert_eq!(reorg.fallback_status, Some(FallbackStatus::Pending));
+	assert_eq!(db.get_full_vtxo(coin.id()).await.unwrap().unwrap().serialize(), coin.serialize());
+	for status in [FallbackStatus::Pending, FallbackStatus::Forfeited] {
+		let preserved = db.set_vtxo_fallback_status(exited.id(), status).await.unwrap();
+		assert_eq!(preserved.state, VtxoState::Exited, "an exposed exit keeps its ordinary observation lifecycle");
+		assert_eq!(preserved.fallback_status, Some(status));
+	}
+}
+
 /// Insert retries cannot erase an owned lock, remove a recovery registration,
 /// or resurrect a terminal coin. The original idempotency case only repeated
 /// the SAME initial state and therefore did not exercise this contract.
@@ -821,8 +869,7 @@ pub async fn test_store_and_get_round_state(db: &impl BarkPersister) {
 	let server = Keypair::from_seckey_slice(&ark::SECP, &[17; 32]).unwrap();
 	let recipient = Keypair::from_seckey_slice(&ark::SECP, &[18; 32]).unwrap();
 	let coin = VTXO_VECTORS.arkoor3_user_key;
-	let link = ark::fallback::OwnerLink::new(server.public_key(),
-		ark::mailbox::MailboxIdentifier::from_pubkey(recipient.public_key()), &coin).unwrap();
+	let link = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &recipient, &coin).unwrap();
 	state.participation.outputs.push(ark::VtxoRequest {
 		amount: Amount::from_sat(1_000), policy: ark::VtxoPolicy::new_pubkey(coin.public_key()),
 	});
@@ -1207,39 +1254,26 @@ pub async fn test_exit_child_tx_roundtrip(db: &impl BarkPersister) {
 	);
 }
 
-/// Canonical signatures may change, but the registered destination may not.
-pub async fn test_fallback_record_is_immutable(db: &impl BarkPersister) {
+/// Receipt updates may revisit confirmation, but cannot move a source to a
+/// different mailbox or invent a larger attributable balance.
+pub async fn test_fallback_receipt_binding_is_immutable(db: &impl BarkPersister) {
 	let mailbox = Keypair::from_seckey_slice(&ark::SECP, &[7; 32]).unwrap();
-	let spk = ScriptBuf::from_hex("00141111111111111111111111111111111111111111").unwrap();
-	let record = ark::fallback::FallbackRegistration::new(Network::Regtest, spk.clone(), &mailbox).unwrap();
-	assert!(db.get_fallback_record().await.unwrap().is_none());
-	db.store_fallback_record(&record).await.unwrap();
-	let resigned = ark::fallback::FallbackRegistration::new(Network::Regtest, spk, &mailbox).unwrap();
-	db.store_fallback_record(&resigned).await.unwrap();
-	assert_eq!(db.get_fallback_record().await.unwrap().unwrap(), resigned);
-	let alternate = ScriptBuf::from_hex("00142222222222222222222222222222222222222222").unwrap();
-	let changed = ark::fallback::FallbackRegistration::new(Network::Regtest, alternate, &mailbox).unwrap();
-	assert!(db.store_fallback_record(&changed).await.is_err());
-	assert_eq!(db.get_fallback_record().await.unwrap().unwrap(), resigned);
-}
-
-/// Local signatures reserve the identity but cannot acknowledge a server write.
-pub async fn test_pending_fallback_record_never_authorizes_registration(db: &impl BarkPersister) {
-	let mailbox = Keypair::from_seckey_slice(&ark::SECP, &[7; 32]).unwrap();
-	let script = ScriptBuf::from_hex("00141111111111111111111111111111111111111111").unwrap();
-	let record = ark::fallback::FallbackRegistration::new(Network::Regtest, script, &mailbox).unwrap();
-	db.store_pending_fallback_record(&record).await.unwrap();
-	assert!(db.get_fallback_record().await.unwrap().is_none());
-	assert_eq!(db.get_pending_fallback_record().await.unwrap(), Some(record.clone()));
-	let alternate = ScriptBuf::from_hex("00142222222222222222222222222222222222222222").unwrap();
-	let changed = ark::fallback::FallbackRegistration::new(Network::Regtest, alternate, &mailbox).unwrap();
-	assert!(db.store_pending_fallback_record(&changed).await.is_err());
-	assert!(db.store_fallback_record(&changed).await.is_err());
-	assert!(db.get_fallback_record().await.unwrap().is_none());
-	db.store_fallback_record(&record).await.unwrap();
-	assert_eq!(db.get_fallback_record().await.unwrap(), Some(record.clone()));
-	assert!(db.get_pending_fallback_record().await.unwrap().is_none());
-	db.store_pending_fallback_record(&record).await.unwrap();
-	assert_eq!(db.get_fallback_record().await.unwrap(), Some(record));
-	assert!(db.get_pending_fallback_record().await.unwrap().is_none());
+	let receipt = crate::FallbackReceipt {
+		vtxo_id: ark::test_util::VTXO_VECTORS.board_vtxo.id(),
+		source_vtxo_ids: std::collections::BTreeSet::from([ark::test_util::VTXO_VECTORS.board_vtxo.id()]), allocation_id: 1,
+		owner_mailbox: mailbox.public_key(), gross: Amount::from_sat(10_000),
+		fee: Amount::from_sat(1_000), payout: Amount::from_sat(9_000), forfeited: Amount::ZERO,
+		transaction_id: None, output_index: Some(0), confirmed_block: None, retired_block: None,
+	};
+	assert!(db.get_fallback_receipts().await.unwrap().is_empty());
+	db.store_fallback_receipt(&receipt).await.unwrap();
+	assert_eq!(db.get_fallback_receipts().await.unwrap(), vec![receipt.clone()]);
+	let mut changed = receipt.clone();
+	changed.owner_mailbox = Keypair::from_seckey_slice(&ark::SECP, &[8; 32]).unwrap().public_key();
+	assert!(db.store_fallback_receipt(&changed).await.is_err());
+	changed = receipt.clone(); changed.gross += Amount::ONE_SAT;
+	assert!(db.store_fallback_receipt(&changed).await.is_err());
+	changed = receipt.clone(); changed.source_vtxo_ids.clear();
+	assert!(db.store_fallback_receipt(&changed).await.is_err());
+	assert_eq!(db.get_fallback_receipts().await.unwrap(), vec![receipt]);
 }

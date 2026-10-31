@@ -10,7 +10,8 @@ Method | HTTP request | Description
 [**bip321_uri**](WalletApi.md#bip321_uri) | **POST** /api/v1/wallet/bip321 | Build a BIP 321 payment URI
 [**connected**](WalletApi.md#connected) | **GET** /api/v1/wallet/connected | Check server connection
 [**create_wallet**](WalletApi.md#create_wallet) | **POST** /api/v1/wallet/create | Create a wallet
-[**fallback_registration**](WalletApi.md#fallback_registration) | **GET** /api/v1/wallet/fallback | Get fallback registration and payout address
+[**debug_info**](WalletApi.md#debug_info) | **GET** /api/v1/wallet/debug-info | Get wallet debug info
+[**fallback_destination**](WalletApi.md#fallback_destination) | **GET** /api/v1/wallet/fallback | Get the mailbox-derived Bitcoin fallback address
 [**get_vtxo**](WalletApi.md#get_vtxo) | **GET** /api/v1/wallet/vtxos/{id} | Get VTXO detail
 [**get_vtxo_encoded**](WalletApi.md#get_vtxo_encoded) | **GET** /api/v1/wallet/vtxos/{id}/encoded | Get encoded VTXO
 [**history**](WalletApi.md#history) | **GET** /api/v1/wallet/history | Get wallet history (deprecated)
@@ -205,10 +206,12 @@ Name | Type | Description  | Required | Notes
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
 
 
-## fallback_registration
+## debug_info
 
-> models::FallbackRegistrationInfo fallback_registration()
-Get fallback registration and payout address
+> models::DebugInfo debug_info()
+Get wallet debug info
+
+Returns wallet information that helps to debug issues: the bitcoin network, the ID of the wallet's server mailbox and the xpub from which all VTXO keypairs are derived.
 
 ### Parameters
 
@@ -216,7 +219,32 @@ This endpoint does not need any parameter.
 
 ### Return type
 
-[**models::FallbackRegistrationInfo**](FallbackRegistrationInfo.md)
+[**models::DebugInfo**](DebugInfo.md)
+
+### Authorization
+
+[bearer](../README.md#bearer)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## fallback_destination
+
+> models::FallbackInfo fallback_destination()
+Get the mailbox-derived Bitcoin fallback address
+
+### Parameters
+
+This endpoint does not need any parameter.
+
+### Return type
+
+[**models::FallbackInfo**](FallbackInfo.md)
 
 ### Authorization
 
@@ -664,7 +692,7 @@ Name | Type | Description  | Required | Notes
 > models::SendResponse send(send_request)
 Send a payment
 
-Sends an Ark or Lightning payment to the specified destination. Accepts an Ark address, BOLT11 invoice, BOLT12 offer, Lightning address, or LNURL. Ark address payments are settled instantly via an out-of-round (arkoor) transaction. The `amount_sat` field is required for Ark addresses, Lightning addresses, and LNURL but optional for invoices and offers that already encode an amount. Comments are only supported for Lightning addresses and LNURL. To send to an on-chain bitcoin address, use `send-onchain` instead.
+Sends a payment to the specified destination. Accepts an Ark address, BOLT11 invoice, BOLT12 offer, Lightning address, LNURL, bitcoin address, or BIP 321 URI. When the destination offers several payment methods, `method` picks the kind to pay with; without it the wallet picks Ark, then Lightning, then on-chain. Ark address payments are settled instantly via an out-of-round (arkoor) transaction. The `amount_sat` field is required unless the destination carries an amount. Comments are only supported for Lightning addresses and LNURL.
 
 ### Parameters
 

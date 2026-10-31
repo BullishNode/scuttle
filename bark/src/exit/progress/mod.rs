@@ -84,6 +84,9 @@ pub(crate) struct ProgressContext<'a> {
 	pub exit_txids: &'a Vec<Txid>,
 	pub wallet: &'a Wallet,
 	pub tx_manager: &'a mut ExitTransactionManager,
+	/// A committed claim can observe an already published final transaction
+	/// without authorizing another package publication during state adoption.
+	pub allow_broadcast: bool,
 }
 
 impl<'a> ProgressContext<'a> {

@@ -4,7 +4,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
 use tokio_stream::Stream;
-use tonic::codec::CompressionEncoding;
 use server_rpc::{self as rpc, protos};
 
 use crate::daemon::captaind::{ArkClient, MailboxClient};
@@ -28,9 +27,7 @@ pub trait ArkRpcProxy: Send + Sync + Clone + 'static {
 		Ok(upstream.get_ark_info(req).await?.into_inner())
 	}
 
-	async fn set_fallback(&self, upstream: &mut ArkClient, req: protos::SetFallbackRequest) -> Result<protos::SetFallbackResponse, tonic::Status> {
-		Ok(upstream.set_fallback(req).await?.into_inner())
-	}
+
 
 
 	async fn get_offboard_fee_rate(&self, upstream: &mut ArkClient, req: protos::Empty) -> Result<protos::OffboardFeeRateResponse, tonic::Status> {
@@ -216,23 +213,15 @@ impl ArkRpcProxyServer {
 
 			let port = pick_port();
 			let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-			// Match the production server's zstd support:
-			//  - send_compressed compresses responses to clients that advertise zstd
-			//  - accept_compressed keeps the proxy transparent to any client that
-			// compresses its requests.
 			let ark_server = rpc::server::ArkServiceServer::new(ArkRpcProxyWrapper {
 				proxy: ark.0.clone(),
 				upstream: ark_upstream.clone(),
-			})
-				.accept_compressed(CompressionEncoding::Zstd)
-				.send_compressed(CompressionEncoding::Zstd);
+			});
 
 			let mailbox_server = rpc::server::MailboxServiceServer::new(MailboxRpcProxyWrapper {
 				proxy: mailbox.0.clone(),
 				upstream: mailbox_upstream.clone(),
-			})
-				.accept_compressed(CompressionEncoding::Zstd)
-				.send_compressed(CompressionEncoding::Zstd);
+			});
 
 			// The serve_with_shutdown call stays running if the port number
 			// is accepted, but returns immediatelly if it's not.
@@ -308,12 +297,7 @@ impl<T: ArkRpcProxy> rpc::server::ArkService for ArkRpcProxyWrapper<T> {
 		Ok(tonic::Response::new(ArkRpcProxy::get_ark_info(&self.proxy, &mut self.upstream_client(), req.into_inner()).await?))
 	}
 
-	async fn set_fallback(
-		&self, req: tonic::Request<protos::SetFallbackRequest>,
-	) -> Result<tonic::Response<protos::SetFallbackResponse>, tonic::Status> {
-		self.proxy.on_request(req.metadata()).await?;
-		Ok(tonic::Response::new(ArkRpcProxy::set_fallback(&self.proxy, &mut self.upstream_client(), req.into_inner()).await?))
-	}
+
 
 
 	async fn get_offboard_fee_rate(

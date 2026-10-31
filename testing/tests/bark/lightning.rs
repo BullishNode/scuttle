@@ -14,6 +14,7 @@ use ark_testing::context::LightningPaymentSetup;
 use bark::actions::lightning::receive::LightningReceiveState;
 use bark::lightning_invoice::{Bolt11Invoice, Currency, InvoiceBuilder, PaymentSecret};
 use bark_json::movements::{MovementDestination, MovementStatus, PaymentMethod};
+use bark_json::cli::LightningReceiveStateKind;
 use bark_json::primitives::VtxoStateInfo;
 use log::{info, trace};
 
@@ -529,7 +530,7 @@ async fn bark_can_receive_lightning(
 	assert_eq!(receives.len(), 1);
 	assert_eq!(receives[0].invoice, invoice_info.invoice);
 	// Preimage hasn't been revealed yet: still awaiting payment.
-	assert_eq!(receives[0].state, "awaiting-payment");
+	assert_eq!(receives[0].state, LightningReceiveStateKind::AwaitingPayment);
 
 	tokio::join!(
 		pay(invoice_info.invoice.clone()),
@@ -609,6 +610,27 @@ async fn bark_can_receive_lightning(
 	assert_eq!(parsed.description().to_string(), description);
 }
 lightning_test!(bark_can_receive_lightning);
+
+#[tokio::test]
+async fn bark_invoice_expires_when_asked() {
+	require_bark_version!(> "0.8.0");
+
+	let ctx = TestContext::new("lightningd/bark_invoice_expires_when_asked").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| {
+		cfg.invoice_expiry = Duration::from_secs(3600);
+	}).create().await;
+	let bark = ctx.bark("bark", &srv).create().await;
+
+	let invoice_info = bark.try_bolt11_invoice_with_expiry(sat(10_000), Duration::from_secs(600))
+		.await.unwrap();
+	let invoice = Bolt11Invoice::from_str(&invoice_info.invoice).unwrap();
+	assert_eq!(invoice.expiry_time(), Duration::from_secs(600));
+
+	let err = bark.try_bolt11_invoice_with_expiry(sat(10_000), Duration::from_secs(3601))
+		.await.unwrap_err().to_alt_string();
+	assert!(err.contains("exceeds the maximum of 3600s"), "err: {err}");
+}
 
 /// Reproduces the vtxo pool "More than one change output" bug.
 ///
@@ -776,7 +798,7 @@ async fn bark_check_lightning_receive_no_wait(
 					.wait(Duration::from_secs(10)).await.expect("should not fail");
 
 				if let Some(receive) = bark.lightning_receive_status(&invoice).await {
-					if receive.state == "settled" {
+					if receive.state == LightningReceiveStateKind::Settled {
 						success = true;
 						break;
 					}
@@ -1121,7 +1143,7 @@ async fn intra_ark_revoke_then_claim_does_not_drain_server() {
 	assert!(grants.iter().all(|h| h.htlc.offchain_resolution.is_none() && h.htlc.chain_resolution.is_none()));
 	let grant_ids = grants.iter().map(|h| h.vtxo.vtxo.id().to_string()).collect::<std::collections::BTreeSet<_>>();
 	assert_eq!(grant_ids.len(), grants.len());
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	let subscription = db.read(async |t| Ok(t.query_one(
 		"SELECT id,status::TEXT FROM lightning_htlc_subscription WHERE payment_hash=$1",
 		&[&payment_hash.to_string()]).await?)).await.unwrap();
@@ -1188,11 +1210,9 @@ async fn intra_ark_revoke_then_claim_does_not_drain_server() {
 				tokio::time::timeout(Duration::from_secs(10), async {
 					loop {
 						if db.read(async |t| {
-							let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-							let rebuilt = t.query_one("SELECT NOT invalid AND generation=$1 AND rebuilt_captaind_height=$2 \
-								AND rebuilt_captaind_hash=$3 AND rebuilt_watchmand_height=$2 AND rebuilt_watchmand_hash=$3 \
-								FROM expiry_chain_view WHERE id=1", &[&view.generation, &i64::from(point.height), &point.hash.to_string()]).await?.get::<_, bool>(0);
-							Ok(view.captaind == point && view.watchmand == point && rebuilt)
+							let Some(view) = t.expiry_view().await? else { return Ok(false); };
+							let rebuilt = t.expiry_view_is_current(view).await?;
+							Ok(view.processed == point && rebuilt)
 						}).await.unwrap() { break; }
 						tokio::time::sleep(Duration::from_millis(100)).await;
 					}
@@ -1968,6 +1988,51 @@ async fn server_allows_claim_receive_for_valid_token_but_not_for_invalid_or_used
 	assert!(res.is_ok());
 	assert_eq!(bark.spendable_balance_no_sync().await, btc(1));
 
+	// A token's address filter is checked: one allowing localhost works,
+	// one restricted to another address is refused
+	let receive_with_token = async |filter: &str| {
+		let stdout = srv.integration_cmd(&[
+			"generate-token", "captaind", "single-use-board", "--ip", filter,
+		]).await;
+		let token = stdout.strip_prefix("Token: ").unwrap().trim().to_string();
+		let invoice_info = bark.bolt11_invoice_with_token(sat(100_000), &token).await;
+		let invoice = invoice_info.invoice.clone();
+		let ln = lightning.clone();
+		tokio::spawn(async move { ln.external.pay_bolt11(invoice).await });
+		let payment_hash = PaymentHash::from(
+			&Bolt11Invoice::from_str(&invoice_info.invoice).expect("valid bolt11 invoice"),
+		);
+		srv.wait_for_lightning_receive_accepted(payment_hash).await;
+		bark.try_lightning_receive(&invoice_info.invoice).await
+	};
+	receive_with_token("127.0.0.0/8").await.expect("localhost is allowed");
+	assert_eq!(bark.spendable_balance_no_sync().await, btc(1) + sat(100_000));
+	let err = receive_with_token("203.0.113.1").await.expect_err("only 203.0.113.1 is allowed");
+	assert!(format!("{err:?}").contains("client's address is not allowed"), "{err:?}");
+	assert_eq!(bark.spendable_balance_no_sync().await, btc(1) + sat(100_000));
+
+	// Unused tokens of a removed integration no longer admit receives
+	srv.integration_cmd(&["add", "removed"]).await;
+	srv.integration_cmd(&["configure-token-type", "removed", "single-use-board", "1", "100"]).await;
+	let stdout = srv.integration_cmd(&["generate-token", "removed", "single-use-board"]).await;
+	let removed_token = stdout.strip_prefix("Token: ").unwrap().trim().to_string();
+	srv.integration_cmd(&["remove", "removed"]).await;
+
+	let invoice_info_removed = bark.bolt11_invoice_with_token(sat(100_000), &removed_token).await;
+	let invoice_removed = invoice_info_removed.invoice.clone();
+	let cloned_ln = lightning.clone();
+	let _res = tokio::spawn(async move {
+		cloned_ln.external.pay_bolt11(invoice_removed).await
+	});
+	let payment_hash = PaymentHash::from(
+		&Bolt11Invoice::from_str(&invoice_info_removed.invoice).expect("valid bolt11 invoice"),
+	);
+	srv.wait_for_lightning_receive_accepted(payment_hash).await;
+	let err = bark.try_lightning_receive(&invoice_info_removed.invoice).await
+		.expect_err("a token of a removed integration must be refused");
+	assert!(format!("{err:?}").contains("token's integration was removed"), "{err:?}");
+	assert_eq!(bark.spendable_balance_no_sync().await, btc(1) + sat(100_000));
+
 	// Claiming with token that has already been used should fail
 	let invoice_info_3 = bark.bolt11_invoice_with_token(btc(1), &token).await;
 
@@ -1978,7 +2043,7 @@ async fn server_allows_claim_receive_for_valid_token_but_not_for_invalid_or_used
 
 	let res = bark.try_lightning_receive(&invoice_info_3.invoice).await;
 	assert!(res.is_err());
-	assert_eq!(bark.spendable_balance_no_sync().await, btc(1));
+	assert_eq!(bark.spendable_balance_no_sync().await, btc(1) + sat(100_000));
 }
 
 /// Stress test for the TrackAll stream subscription.

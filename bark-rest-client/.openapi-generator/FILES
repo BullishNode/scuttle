@@ -31,6 +31,7 @@ docs/ChildTransactionInfo.md
 docs/ConnectedResponse.md
 docs/CreateWalletRequest.md
 docs/CreateWalletResponse.md
+docs/DebugInfo.md
 docs/DefaultApi.md
 docs/DelegatedRefreshRequest.md
 docs/EmergencyExitFeeEstimateQuery.md
@@ -116,8 +117,8 @@ docs/ExitTxStatusOneOf4.md
 docs/ExitVtxoAlreadySpentState.md
 docs/ExitVtxoSweptState.md
 docs/ExitsApi.md
+docs/FallbackInfo.md
 docs/FallbackRefusalError.md
-docs/FallbackRegistrationInfo.md
 docs/FeeEstimateQuery.md
 docs/FeeEstimateResponse.md
 docs/FeeInfo.md
@@ -134,8 +135,10 @@ docs/LightningPayRequest.md
 docs/LightningPayResponse.md
 docs/LightningReceiveFees.md
 docs/LightningReceiveInfo.md
+docs/LightningReceiveStateKind.md
 docs/LightningSendFees.md
 docs/LightningSendInfo.md
+docs/LightningSendStateKind.md
 docs/MailboxSyncResponse.md
 docs/MessageApi.md
 docs/MessageVerification.md
@@ -161,6 +164,7 @@ docs/OnchainFeeRatesResponse.md
 docs/OnchainSendManyRequest.md
 docs/OnchainSendRequest.md
 docs/PaymentMethod.md
+docs/PaymentMethodKind.md
 docs/PendingBoardInfo.md
 docs/PendingRoundInfo.md
 docs/PpmExpiryFeeEntry.md
@@ -247,6 +251,7 @@ src/models/child_transaction_info.rs
 src/models/connected_response.rs
 src/models/create_wallet_request.rs
 src/models/create_wallet_response.rs
+src/models/debug_info.rs
 src/models/delegated_refresh_request.rs
 src/models/emergency_exit_fee_estimate_query.rs
 src/models/emergency_exit_fee_estimate_response.rs
@@ -330,8 +335,8 @@ src/models/exit_tx_status_one_of_3.rs
 src/models/exit_tx_status_one_of_4.rs
 src/models/exit_vtxo_already_spent_state.rs
 src/models/exit_vtxo_swept_state.rs
+src/models/fallback_info.rs
 src/models/fallback_refusal_error.rs
-src/models/fallback_registration_info.rs
 src/models/fee_estimate_query.rs
 src/models/fee_estimate_response.rs
 src/models/fee_info.rs
@@ -345,8 +350,10 @@ src/models/lightning_pay_request.rs
 src/models/lightning_pay_response.rs
 src/models/lightning_receive_fees.rs
 src/models/lightning_receive_info.rs
+src/models/lightning_receive_state_kind.rs
 src/models/lightning_send_fees.rs
 src/models/lightning_send_info.rs
+src/models/lightning_send_state_kind.rs
 src/models/mailbox_sync_response.rs
 src/models/message_verification.rs
 src/models/mnemonic_response.rs
@@ -370,6 +377,7 @@ src/models/onchain_fee_rates_response.rs
 src/models/onchain_send_many_request.rs
 src/models/onchain_send_request.rs
 src/models/payment_method.rs
+src/models/payment_method_kind.rs
 src/models/pending_board_info.rs
 src/models/pending_round_info.rs
 src/models/ppm_expiry_fee_entry.rs

@@ -8,12 +8,12 @@ mod embedded {
 	}
 }
 
-pub mod fallback;
 pub mod expiry_attribution;
 pub(crate) mod expiry_guard;
 pub mod expiry_inventory;
 pub mod expiry_chain;
 pub mod expiry_decision;
+pub mod expiry_hold;
 pub mod expiry_ownership;
 pub mod expiry_payout;
 pub(crate) mod expiry_lightning;
@@ -23,6 +23,7 @@ pub(crate) mod expiry_geometry;
 mod ban;
 pub mod block;
 pub mod data_migrations;
+pub mod hold;
 pub mod htlc_vtxo;
 pub mod watchman;
 pub mod intman;
@@ -31,6 +32,7 @@ pub mod nursery;
 pub mod rounds;
 pub mod tree;
 pub mod vtxopool;
+pub mod xpay;
 
 mod model;
 mod query;
@@ -43,7 +45,7 @@ use std::borrow::Borrow;
 use std::str::FromStr;
 use std::task;
 use std::backtrace::Backtrace;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -54,12 +56,12 @@ use ark::vtxo::{Bare, Full};
 use bb8::{ManageConnection, Pool, PooledConnection};
 use bb8_postgres::PostgresConnectionManager;
 use bdk_wallet::{chain::Merge, ChangeSet};
-use bitcoin::{Amount, Transaction, Txid};
+use bitcoin::{Amount, OutPoint, Script, Transaction, Txid};
 use bitcoin::consensus::{serialize, deserialize};
 use bitcoin::secp256k1::{self, PublicKey};
 use chrono::Local;
 use futures::Stream;
-use tokio_postgres::{Client, IsolationLevel, NoTls, RowStream};
+use tokio_postgres::{Client, NoTls, RowStream};
 use tokio_postgres::types::Type;
 use tracing::{info, warn};
 use ark::{ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId, VtxoPolicy};
@@ -88,6 +90,7 @@ const DEFAULT_DATABASE: &str = "postgres";
 enum AdvisoryLock {
 	MailboxWrite = 1,
 	HtlcSettlementWrite = 2,
+	SchemaMigrations = 3,
 }
 
 /// An uncommitted offboard fetched for the retry-task commit path. Carries
@@ -104,6 +107,7 @@ pub struct StoredUncommittedOffboard {
 pub struct MailboxEntry {
 	pub checkpoint: Checkpoint,
 	pub payload: MailboxPayload,
+	pub owner_mailboxes: BTreeMap<VtxoId, PublicKey>,
 }
 
 impl MailboxEntry {
@@ -157,14 +161,75 @@ pub enum MailboxPayload {
 
 #[derive(Clone)]
 pub struct Db {
-	pool: Pool<ConnectionManager>
+	pool: Pool<ConnectionManager>,
+	network: bitcoin::Network,
 }
 
 impl Db {
 	async fn run_migrations(&self) -> anyhow::Result<()> {
 		let mut conn = self.get_conn().await?;
-		embedded::migrations::runner().run_async::<Client>(&mut conn).await?;
+		let lock = AdvisoryLock::SchemaMigrations as i64;
+		conn.query_one("SELECT pg_advisory_lock($1)", &[&lock]).await?;
+		let result = Self::migrate_fresh_store(&mut conn).await;
+		let unlocked = conn.query_one("SELECT pg_advisory_unlock($1)", &[&lock]).await;
+		result?;
+		unlocked?;
 		info!("All migrations got successfully run");
+		Ok(())
+	}
+
+	async fn migrate_fresh_store(conn: &mut Client) -> anyhow::Result<()> {
+		// Existing development stores are preserved, never upgraded into this
+		// fresh Scuttle schema. Check before either initialization or refinery.
+		let legacy: bool = conn.query_one(
+			"SELECT to_regclass('scuttle.refinery_schema_history') IS NOT NULL \
+			 OR to_regclass('public.fallback_record') IS NOT NULL \
+			 OR to_regclass('public.expiry_owner_key') IS NOT NULL \
+			 OR to_regclass('scuttle.fallback_record') IS NOT NULL \
+			 OR to_regclass('scuttle.expiry_owner_key') IS NOT NULL", &[],
+		).await?.get(0);
+		ensure!(!legacy, "existing database is not a fresh Scuttle store; initialization refused");
+		let initialized: bool = conn.query_one(
+			"SELECT to_regclass('scuttle.owner_key') IS NOT NULL", &[],
+		).await?.get(0);
+		if !initialized {
+			let occupied: bool = conn.query_one(
+				"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_tables \
+				 WHERE schemaname NOT IN ('pg_catalog', 'information_schema'))", &[],
+			).await?.get(0);
+			ensure!(!occupied, "existing database is not a fresh Scuttle store; initialization refused");
+		}
+
+		if initialized {
+			let bound: bool = conn.query_one(
+				"SELECT to_regclass('scuttle.coin_owner') IS NOT NULL \
+				 AND to_regclass('public.refinery_schema_history') IS NOT NULL \
+				 AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' \
+					AND table_name='cln_xpay' AND column_name='signed_invoice' AND data_type='text') \
+				 AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' \
+					AND table_name='cln_xpay' AND column_name='dispatch_count' AND data_type='bigint') \
+				 AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' \
+					AND table_name='expiry_chain_view' AND column_name='processed_height' AND data_type='bigint') \
+				 AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' \
+					AND table_name='expiry_chain_view' AND column_name='processed_hash' AND data_type='text') \
+				 AND to_regclass('public.expiry_sync_ack') IS NULL \
+				 AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='customer_coin_owner' \
+				 AND tgrelid=to_regclass('public.vtxo') AND tgdeferrable AND tginitdeferred)", &[],
+			).await?.get(0);
+			ensure!(bound, "incomplete Scuttle schema; use a fresh store");
+		}
+
+		embedded::migrations::runner()
+			.set_migration_table_name("public.refinery_schema_history")
+			.run_async::<Client>(conn).await?;
+		if !initialized {
+			// All Scuttle tables appear atomically. An interrupted upstream-only
+			// initialization is unrecognized on reopen and needs a new empty DB.
+			let tx = conn.transaction().await?;
+			tx.batch_execute("CREATE SCHEMA IF NOT EXISTS scuttle").await?;
+			tx.batch_execute(include_str!("scuttle.sql")).await?;
+			tx.commit().await?;
+		}
 		Ok(())
 	}
 
@@ -173,6 +238,7 @@ impl Db {
 		pg_config.host(&config.host);
 		pg_config.port(config.port);
 		pg_config.dbname(database);
+		pg_config.options("-c search_path=public,scuttle");
 		if let Some(user) = &config.user {
 			pg_config.user(user);
 		}
@@ -233,16 +299,16 @@ impl Db {
 		Ok(())
 	}
 
-	pub async fn connect(config: &PostgresConfig) -> anyhow::Result<Self> {
+	pub async fn connect(config: &PostgresConfig, network: bitcoin::Network) -> anyhow::Result<Self> {
 		let pool = Self::pool_connect(&config.name, config).await?;
 
-		let db = Db { pool };
+		let db = Db { pool, network };
 		db.run_migrations().await?;
 
 		Ok(db)
 	}
 
-	pub async fn create(config: &PostgresConfig) -> anyhow::Result<Self> {
+	pub async fn create(config: &PostgresConfig, network: bitcoin::Network) -> anyhow::Result<Self> {
 		info!("Checking if a database exists...");
 		let connect = Self::raw_connect(config).await;
 
@@ -260,7 +326,7 @@ impl Db {
 			conn.execute(&statement, &[]).await?;
 		}
 
-		Self::connect(config).await
+		Self::connect(config, network).await
 	}
 
 	/// Check out a raw pooled connection, below the [Db::read]/[Db::write]
@@ -323,10 +389,9 @@ impl Db {
 		let mut conn = self.get_conn().await.context("unable to get db connection")?;
 		let pgtx = conn.build_transaction()
 			.read_only(read_only)
-			.isolation_level(IsolationLevel::ReadCommitted)
 			.start().await
 			.context("unable to start db tx")?;
-		let tx = Tx { inner: &pgtx };
+		let tx = Tx { inner: &pgtx, network: self.network };
 		let ret = f(&tx).await;
 		if read_only {
 			// We want to commit read queries regardless of error because it's the
@@ -350,7 +415,6 @@ impl Db {
 		self.do_in_tx(true, f).await
 	}
 
-
 	/// Perform db operations in write mode
 	pub async fn write<R, F>(&self, f: F) -> anyhow::Result<R>
 	where
@@ -363,6 +427,7 @@ impl Db {
 /// A managed postgres DB transaction
 pub struct Tx<'t> {
 	inner: &'t tokio_postgres::Transaction<'t>,
+	network: bitcoin::Network,
 }
 
 impl<'t> std::ops::Deref for Tx<'t> {
@@ -382,12 +447,11 @@ impl<'t> Tx<'t> {
 	pub async fn upsert_vtxos(
 		&self,
 		vtxos: impl IntoIterator<Item = impl Borrow<ServerVtxo<Full>>>,
-		owners: Option<(bitcoin::Network, &secp256k1::Keypair)>,
 	) -> anyhow::Result<()> {
 		let vtxos = vtxos.into_iter().map(|v| v.borrow().clone()).collect::<Vec<_>>();
 		let update = tree::VtxoTreeUpdate::new()
 			.insert_spendable_vtxos(vtxos);
-		self.execute_vtxo_tree_update(update, owners).await?;
+		self.execute_vtxo_tree_update(update).await?;
 		Ok(())
 	}
 
@@ -467,9 +531,8 @@ impl<'t> Tx<'t> {
 	pub async fn execute_vtxo_tree_update(
 		&self,
 		update: tree::VtxoTreeUpdate,
-		owners: Option<(bitcoin::Network, &secp256k1::Keypair)>,
 	) -> anyhow::Result<u64> {
-		tree::execute_vtxo_tree_update(self, update, owners).await
+		tree::execute_vtxo_tree_update(self, update).await
 	}
 
 	/// Queries a virtual transaction by txid
@@ -491,11 +554,14 @@ impl<'t> Tx<'t> {
 		mailbox_type: MailboxType,
 		mailbox_id: MailboxIdentifier,
 		vtxos: &[Vtxo<Full>],
-		network: bitcoin::Network,
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.require_registered_mailbox(mailbox_id, network).await?;
 		if vtxos.is_empty() {
 			return Ok(None);
+		}
+		// Check the complete batch before allocating any message checkpoint.
+		let ids = vtxos.iter().map(|vtxo| vtxo.id()).collect::<Vec<_>>();
+		if !self.delivery_owners_match(&ids, mailbox_id).await? {
+			return crate::error::badarg!("mailbox delivery has missing or mismatched coin ownership");
 		}
 
 		// Acquire advisory lock to serialize all mailbox writes.
@@ -539,9 +605,8 @@ impl<'t> Tx<'t> {
 		mailbox_id: MailboxIdentifier,
 		checkpoint: Checkpoint,
 		limit: usize,
-		network: bitcoin::Network,
 	) -> anyhow::Result<Vec<MailboxEntry>> {
-		let entries = self.get_mailbox_messages(mailbox_id, checkpoint, limit, network).await?;
+		let entries = self.get_mailbox_messages(mailbox_id, checkpoint, limit).await?;
 		Ok(entries.into_iter()
 			.filter(|e| matches!(e.payload, MailboxPayload::Arkoor { .. }))
 			.collect())
@@ -561,9 +626,7 @@ impl<'t> Tx<'t> {
 		mailbox_id: MailboxIdentifier,
 		checkpoint: Checkpoint,
 		limit: usize,
-		network: bitcoin::Network,
 	) -> anyhow::Result<Vec<MailboxEntry>> {
-		self.require_registered_mailbox(mailbox_id, network).await?;
 		let statement = self.prepare(&format!("
 			WITH checkpoints AS (
 				SELECT DISTINCT checkpoint FROM mailbox
@@ -621,6 +684,7 @@ impl<'t> Tx<'t> {
 					res.push(MailboxEntry {
 						checkpoint: cp,
 						payload: MailboxPayload::LightningReceive { payment_hash, amount },
+						owner_mailboxes: BTreeMap::new(),
 					});
 					telemetry::set_mailbox_get_metric(mailbox_type, 1);
 
@@ -641,6 +705,7 @@ impl<'t> Tx<'t> {
 					res.push(MailboxEntry {
 						checkpoint: cp,
 						payload: MailboxPayload::RoundParticipationCompleted { unlock_hash },
+						owner_mailboxes: BTreeMap::new(),
 					});
 					telemetry::set_mailbox_get_metric(mailbox_type, 1);
 
@@ -664,6 +729,7 @@ impl<'t> Tx<'t> {
 						payload: MailboxPayload::LightningSendFinished {
 							payment_hash, preimage, failure,
 						},
+						owner_mailboxes: BTreeMap::new(),
 					});
 					telemetry::set_mailbox_get_metric(mailbox_type, 1);
 					continue;
@@ -676,6 +742,7 @@ impl<'t> Tx<'t> {
 			// we check if we have an item ongoing
 			let entry = current_entry.get_or_insert_with(|| MailboxEntry {
 				checkpoint: cp,
+				owner_mailboxes: BTreeMap::new(),
 				payload: match mailbox_type {
 					MailboxType::ArkoorReceive => MailboxPayload::Arkoor { vtxos: vec![], },
 					MailboxType::RecoveryVtxoId => {
@@ -721,6 +788,23 @@ impl<'t> Tx<'t> {
 			telemetry::set_mailbox_get_metric(entry.mailbox_type(), entry.len());
 			res.push(entry);
 		}
+		let mut ids = Vec::new();
+		for entry in &res {
+			match &entry.payload {
+				MailboxPayload::Arkoor { vtxos } => ids.extend(vtxos.iter().map(|v| v.id())),
+				MailboxPayload::RecoveryVtxoIds { vtxo_ids } => ids.extend(vtxo_ids),
+				_ => {},
+			}
+		}
+		let owners = self.coin_owner_mailboxes(&ids).await?;
+		for entry in &mut res {
+			let ids = match &entry.payload {
+				MailboxPayload::Arkoor { vtxos } => vtxos.iter().map(|v| v.id()).collect::<Vec<_>>(),
+				MailboxPayload::RecoveryVtxoIds { vtxo_ids } => vtxo_ids.clone(),
+				_ => continue,
+			};
+			entry.owner_mailboxes = ids.into_iter().filter_map(|id| owners.get(&id).map(|owner| (id, *owner))).collect();
+		}
 
 		Ok(res)
 	}
@@ -729,9 +813,7 @@ impl<'t> Tx<'t> {
 		&self,
 		mailbox_id: MailboxIdentifier,
 		unlock_hash: UnlockHash,
-		network: bitcoin::Network,
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.require_registered_mailbox(mailbox_id, network).await?;
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
@@ -765,9 +847,7 @@ impl<'t> Tx<'t> {
 		mailbox_id: MailboxIdentifier,
 		payment_hash: &str,
 		amount: Amount,
-		network: bitcoin::Network,
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.require_registered_mailbox(mailbox_id, network).await?;
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
@@ -812,9 +892,7 @@ impl<'t> Tx<'t> {
 		payment_hash: PaymentHash,
 		preimage: Option<Preimage>,
 		failure: Option<LightningFailureKind>,
-		network: bitcoin::Network,
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.require_registered_mailbox(mailbox_id, network).await?;
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
@@ -849,14 +927,14 @@ impl<'t> Tx<'t> {
 		}
 	}
 
+	/// Store recovery hints only. A mailbox holder may name foreign or unknown
+	/// IDs; this path must never create VTXOs or coin-to-mailbox bindings.
 	pub async fn store_vtxo_ids_in_mailbox(
 		&self,
 		mailbox_type: MailboxType,
 		mailbox_id: MailboxIdentifier,
 		vtxo_ids: &[VtxoId],
-		network: bitcoin::Network,
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.require_registered_mailbox(mailbox_id, network).await?;
 		if vtxo_ids.is_empty() {
 			return Ok(None);
 		}
@@ -1000,13 +1078,39 @@ impl<'t> Tx<'t> {
 				&forfeit_result.connector_vtxos, SpendState::OffboardConnector
 			)
 			.mark_vtxos_offboard_spent(offboard_triples);
-		tree::execute_vtxo_tree_update(self, update, None).await?;
+		tree::execute_vtxo_tree_update(self, update).await?;
 
 		// register the connector output vtxo directly into the frontier, so
 		// the watchman can sweep it once the input vtxos have expired
 		self.add_funding_vtxos_to_frontier(offboard_txid, None).await?;
 
 		Ok(())
+	}
+
+	/// Bind a board funding output to `exit_txid`, unless it is bound
+	/// already. Returns the exit txid the output is bound to.
+	pub async fn bind_board_exit(
+		&self,
+		funding_outpoint: OutPoint,
+		funding_spk: &Script,
+		exit_txid: Txid,
+	) -> anyhow::Result<Txid> {
+		let insert = self.prepare_typed(
+			"INSERT INTO board_exit (funding_outpoint, funding_spk, exit_txid)
+			VALUES ($1, $2, $3) ON CONFLICT DO NOTHING;",
+			&[Type::TEXT, Type::BYTEA, Type::TEXT],
+		).await?;
+		let outpoint = funding_outpoint.to_string();
+		let spk = funding_spk.as_bytes();
+		self.execute(&insert, &[&outpoint, &spk, &exit_txid.to_string()]).await?;
+
+		// a separate statement, so it sees a row a concurrent insert committed
+		let select = self.prepare_typed(
+			"SELECT exit_txid FROM board_exit WHERE funding_outpoint = $1 AND funding_spk = $2;",
+			&[Type::TEXT, Type::BYTEA],
+		).await?;
+		let row = self.query_one(&select, &[&outpoint, &spk]).await?;
+		Ok(Txid::from_str(row.get("exit_txid"))?)
 	}
 
 	/// Flip `wallet_commit` from FALSE to TRUE for the given offboard.

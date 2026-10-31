@@ -1,4 +1,4 @@
-//! An application-owned BIP84 wallet attached through the public SDK interface.
+//! An application-owned BIP86 wallet attached through the public SDK interface.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -11,9 +11,11 @@ use bark::persist::BarkPersister;
 use bdk_wallet::chain::ChainPosition;
 use bdk_wallet::{KeychainKind, LocalOutput, TxOrdering};
 use bitcoin::{Address, Amount, FeeRate, Network, Psbt, Script, ScriptBuf, Transaction, Txid};
-use bitcoin_ext::BlockHeight;
+use bitcoin_ext::{BlockHeight, TransactionExt};
 use bitcoin_ext::bdk::{CpfpInternalError, WalletExt};
-use bitcoin_ext::rpc::BitcoinRpcClient;
+use bitcoin_ext::rpc::{BitcoinRpcClient, BitcoinRpcExt, RpcApi};
+
+use crate::TestContext;
 
 const EVICTION_GRACE_SECS: u64 = 30;
 
@@ -22,18 +24,26 @@ fn timestamp() -> u64 {
 }
 
 /// Keeps its own descriptor, keys and persistence; the SDK sees a trait object.
-pub struct AppBip84Wallet {
+pub struct AppBip86Wallet {
 	inner: bdk_wallet::Wallet,
 	db: Arc<dyn BarkPersister>,
 	rpc: BitcoinRpcClient,
 }
 
-impl AppBip84Wallet {
+impl AppBip86Wallet {
+	/// The app supplies its first external BIP86 key independently of Ark keys.
+	pub fn mailbox_keypair(network: Network, seed: &[u8; 64]) -> anyhow::Result<bitcoin::secp256k1::Keypair> {
+		let coin = if network == Network::Bitcoin { 0 } else { 1 };
+		let path = format!("m/86'/{coin}'/0'/0/0").parse::<bitcoin::bip32::DerivationPath>()?;
+		let key = bitcoin::bip32::Xpriv::new_master(network, seed)?.derive_priv(&ark::SECP, &path)?;
+		Ok(bitcoin::secp256k1::Keypair::from_secret_key(&ark::SECP, &key.private_key))
+	}
+
 	pub async fn load_or_create(
 		network: Network, seed: [u8; 64], db: Arc<dyn BarkPersister>, rpc: BitcoinRpcClient,
 	) -> anyhow::Result<Self> {
 		let xpriv = bitcoin::bip32::Xpriv::new_master(network, &seed)?;
-		let descriptor = bdk_wallet::template::Bip84(xpriv, KeychainKind::External);
+		let descriptor = bdk_wallet::template::Bip86(xpriv, KeychainKind::External);
 		let changeset = db.initialize_bdk_wallet().await?;
 		let inner = bdk_wallet::Wallet::load()
 			.descriptor(KeychainKind::External, Some(descriptor.clone()))
@@ -77,7 +87,7 @@ impl AppBip84Wallet {
 }
 
 #[async_trait]
-impl OnchainWalletTrait for AppBip84Wallet {
+impl OnchainWalletTrait for AppBip86Wallet {
 	async fn balance(&self) -> Amount {
 		self.inner.balance().total()
 	}
@@ -191,4 +201,29 @@ impl OnchainWalletTrait for AppBip84Wallet {
 	async fn store_signed_p2a_cpfp(&mut self, tx: &Transaction) -> Result<(), CpfpError> {
 		self.register_tx(tx).await.map_err(|error| CpfpError::StoreError(error.to_string()))
 	}
+}
+
+/// Read the actual package child and its fee from Core or the canonical block.
+pub fn observed_payout_fee_child(ctx: &TestContext, parent: &Transaction) -> Option<(Transaction, i64)> {
+	let core = ctx.bitcoind().sync_client();
+	let (anchor, _) = parent.fee_anchor().expect("payout parent must have one fee anchor");
+	let child = if let Some(txid) = core.get_mempool_spending_tx(anchor).unwrap() {
+		core.get_raw_transaction(&txid, None).ok()?
+	} else {
+		let info = core.custom_get_raw_transaction_info(parent.compute_txid(), None).unwrap()?;
+		let hash = info.blockhash?;
+		let block = core.get_block(&hash).unwrap();
+		assert_eq!(core.get_block_hash(core.get_block_header_info(&hash).unwrap().height as u64).unwrap(), hash);
+		assert!(block.txdata.iter().any(|tx| tx == parent));
+		let mut children = block.txdata.into_iter().filter(|tx|
+			tx.input.iter().any(|input| input.previous_output == anchor));
+		let child = children.next()?;
+		assert!(children.next().is_none(), "one canonical child must spend the anchor");
+		child
+	};
+	assert_eq!(child.input.iter().filter(|input| input.previous_output == anchor).count(), 1);
+	let inputs = child.input.iter().map(|input| core.get_raw_transaction(
+		&input.previous_output.txid, None).unwrap().output[input.previous_output.vout as usize].value).sum::<Amount>();
+	let fee = inputs.checked_sub(child.output.iter().map(|out| out.value).sum::<Amount>()).unwrap();
+	Some((child, i64::try_from(fee.to_sat()).unwrap()))
 }

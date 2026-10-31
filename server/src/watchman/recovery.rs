@@ -1,20 +1,17 @@
-//! Rebuild chain observations from a completed, canonical sync generation.
-//! Immutable ownership decisions and spend fences are never rolled back.
+//! Incremental canonical expiry observations from watchmand's real block listener.
+//! Decisions, signed parents and source spend fences are never reconstructed.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::str::FromStr;
-
+use std::collections::BTreeMap;
+use anyhow::Context;
 use bitcoin::{Transaction, Txid};
 use bitcoin::taproot::LeafVersion;
-use bitcoin_ext::{BlockRef, TxStatus};
-use bitcoind_async_client::traits::Reader;
+use bitcoin_ext::BlockRef;
 
-use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoPolicy};
+use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 use ark::vtxo::TapScriptClause;
 
-use crate::bitcoind as bcd;
-use crate::database::expiry_chain::ExpiryViewToken;
-use super::Watchman;
+use crate::database::Tx;
+use crate::sync::BlockData;
 
 /// An intermediate signed tree transaction never proves a terminal user exit.
 fn terminal_user_claim(vtxo: &ServerVtxo, spend: &Transaction) -> bool {
@@ -38,222 +35,96 @@ fn terminal_user_claim(vtxo: &ServerVtxo, spend: &Transaction) -> bool {
 	leaf.script == script.as_script()
 }
 
-impl Watchman {
-	/// Keep preparation responsive to either daemon's completed view without
-	/// repeating the financial reconstruction on every idle timer tick.
-	pub(crate) async fn refresh_expiry_readiness(&self) -> anyhow::Result<()> {
-		let current = self.db.read(async |t| {
-			let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-			t.expiry_view_is_rebuilt(view).await
-		}).await?;
-		if !current { self.rebuild_expiry_state().await?; }
-		Ok(())
+impl Tx<'_> {
+	/// Called only after the ordinary frontier listeners committed this block.
+	/// Persist these observations with its block-table row, before publishing
+	/// a completed view. Retrying a partial listener cycle is idempotent.
+	pub(crate) async fn observe_expiry_block(&self, block: &BlockData) -> anyhow::Result<()> {
+		self.query_one("SELECT generation FROM expiry_chain_view WHERE id=1 FOR SHARE", &[]).await?;
+		let mut spends = BTreeMap::<String, String>::new();
+		let transactions = block.block.txdata.iter().map(|tx| (tx.compute_txid(), tx)).collect::<BTreeMap<_, _>>();
+		for (txid, tx) in &transactions {
+			for input in &tx.input { spends.insert(VtxoId::from(input.previous_output).to_string(), txid.to_string()); }
+		}
+		let inputs = spends.keys().cloned().collect::<Vec<_>>();
+		let spenders = spends.values().cloned().collect::<Vec<_>>();
+		let txids = transactions.keys().map(ToString::to_string).collect::<Vec<_>>();
+		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&inputs]).await?;
+		let allocations = self.query("SELECT a.id FROM expiry_allocation a WHERE a.sweep_txid=ANY($1) \
+			OR EXISTS(SELECT 1 FROM expiry_allocation_input i WHERE i.allocation_id=a.id AND i.vtxo_id=ANY($2)) \
+			OR EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.allocation_id=a.id AND c.entitlement_id IN ( \
+				SELECT touched.entitlement_id FROM expiry_allocation_coin touched JOIN expiry_allocation parent ON parent.id=touched.allocation_id \
+				JOIN expiry_entitlement e ON e.id=touched.entitlement_id WHERE parent.sweep_txid=ANY($1) OR e.vtxo_id=ANY($2))) \
+			ORDER BY a.id FOR UPDATE", &[&txids, &inputs]).await?.into_iter().map(|r| r.get::<_, i64>(0)).collect::<Vec<_>>();
+		self.execute("UPDATE expiry_allocation SET status='confirmed',confirmed_height=$2,confirmed_hash=$3 \
+			WHERE sweep_txid=ANY($1)", &[&txids, &i64::from(block.block_ref.height), &block.block_ref.hash.to_string()]).await?;
+		self.execute("UPDATE expiry_allocation a SET status='conflicted' WHERE a.status='pending' AND EXISTS( \
+			SELECT 1 FROM expiry_allocation_input i JOIN unnest($1::TEXT[],$2::TEXT[]) s(vtxo_id,txid) ON s.vtxo_id=i.vtxo_id \
+			WHERE i.allocation_id=a.id AND s.txid IS DISTINCT FROM a.sweep_txid)", &[&inputs, &spenders]).await?;
+		for row in self.query("SELECT e.id,v.vtxo FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
+			WHERE e.vtxo_id=ANY($1) ORDER BY e.vtxo_id", &[&inputs]).await? {
+			let vtxo = ServerVtxo::deserialize(row.get("vtxo"))?;
+			let txid: Txid = spends.get(&vtxo.id().to_string()).context("expiry source body differs from its observed input")?.parse()?;
+			if self.get_virtual_transaction_by_txid(txid).await?.is_some() { continue; }
+			let spend = transactions.get(&txid).context("expiry source spender is absent from its observed block")?;
+			if terminal_user_claim(&vtxo, spend) {
+				let id: i64 = row.get("id");
+				let changed = self.execute("INSERT INTO expiry_terminal_claim(entitlement_id,txid,height,hash) VALUES($1,$2,$3,$4) \
+					ON CONFLICT(entitlement_id) DO UPDATE SET txid=EXCLUDED.txid \
+					WHERE expiry_terminal_claim.txid=EXCLUDED.txid AND expiry_terminal_claim.height=EXCLUDED.height AND expiry_terminal_claim.hash=EXCLUDED.hash",
+					&[&id, &txid.to_string(), &i64::from(block.block_ref.height), &block.block_ref.hash.to_string()]).await?;
+				ensure!(changed == 1, "expiry entitlement has conflicting canonical terminal claims");
+				self.clear_expiry_hold(vtxo.id()).await?;
+			}
+		}
+		self.reconcile_expiry_allocations(&allocations, block.block_ref).await
 	}
 
-	pub(crate) async fn rebuild_expiry_state(&self) -> anyhow::Result<Option<ExpiryViewToken>> {
-		let Some(view) = self.db.read(async |t| t.expiry_rebuild_token().await).await? else {
-			return Ok(None);
-		};
-		view.verify(&self.bitcoind).await?;
-		let (ids, recheck, txids, claims) = self.db.read(async |t| {
-			let allocations = t.query("
-				SELECT id, sweep_txid, status <> 'confirmed'
-					OR confirmed_height + 6 >= $1
-					OR NOT EXISTS(SELECT 1 FROM watchmand_block b
-						WHERE b.height=confirmed_height AND b.hash=confirmed_hash) AS recheck
-				FROM expiry_allocation
-				ORDER BY id
-			", &[&i64::from(view.captaind.height.min(view.watchmand.height))]).await?;
-			let ids = allocations.iter().map(|r| r.get::<_, i64>("id")).collect::<Vec<_>>();
-			let recheck = allocations.iter().filter(|r| r.get::<_, bool>("recheck"))
-				.map(|r| r.get::<_, i64>("id")).collect::<Vec<_>>();
-			let mut txids = allocations.iter().filter(|r| r.get::<_, bool>("recheck"))
-				.filter_map(|r| r.get::<_, Option<&str>>("sweep_txid"))
-				.map(Txid::from_str).collect::<Result<BTreeSet<_>, _>>()?;
-			let settled = allocations.iter().filter(|r| !r.get::<_, bool>("recheck"))
-				.filter_map(|r| r.get::<_, Option<&str>>("sweep_txid"))
-				.map(Txid::from_str).collect::<Result<BTreeSet<_>, _>>()?;
-			let mut claims = Vec::new();
-			for row in t.query("
-				SELECT e.id, v.vtxo, v.onchain_spent_txid
-				FROM expiry_entitlement e
-				JOIN vtxo v ON v.vtxo_id = e.vtxo_id
-				WHERE v.onchain_spent_height IS NOT NULL
-				AND v.onchain_spent_height <= $1
-			", &[&i32::try_from(view.captaind.height.min(view.watchmand.height).to_u32())?]).await? {
-				let txid: Txid = row.get::<_, &str>("onchain_spent_txid").parse()?;
-				if settled.contains(&txid) { continue; }
-				// The persisted virtual transaction index distinguishes known
-				// intermediate steps from a terminal claimant transaction.
-				if t.get_virtual_transaction_by_txid(txid).await?.is_some() {
-					continue;
-				}
-				txids.insert(txid);
-				claims.push((row.get::<_, i64>("id"), ServerVtxo::deserialize(row.get("vtxo"))?, txid));
-			}
-			Ok((ids, recheck, txids, claims))
-		}).await?;
-		let mut confirmed = BTreeMap::<Txid, BlockRef>::new();
-		for txid in txids {
-			if let TxStatus::Confirmed(point) = bcd::tx_status(&self.bitcoind, txid).await? {
-				if point.height <= view.captaind.height.min(view.watchmand.height) {
-					confirmed.insert(txid, point);
-				}
-			}
-		}
-		let mut paid_claims = Vec::new();
-		for (id, vtxo, txid) in claims {
-			let Some(point) = confirmed.get(&txid) else {
-				continue;
-			};
-			let spend = self.bitcoind.get_raw_transaction_verbosity_zero(&txid).await?.0;
-			if terminal_user_claim(&vtxo, &spend) {
-				paid_claims.push((id, txid, *point));
-			}
-		}
-		view.verify(&self.bitcoind).await?;
-		let rebuilt = self.db.write(async |t| {
-			t.query_one("
-				SELECT generation
-				FROM expiry_chain_view
-				WHERE id = 1
-				FOR UPDATE
-			", &[]).await?;
-			if t.expiry_rebuild_token().await? != Some(view) {
-				return Ok(false);
-			}
-			let current = t.query("
-				SELECT id
-				FROM expiry_allocation
-				ORDER BY id
-				FOR UPDATE
-			", &[]).await?
-				.into_iter().map(|r| r.get::<_, i64>("id")).collect::<Vec<_>>();
-			ensure!(current == ids, "expiry allocations changed during chain reconstruction");
-			t.execute("
-				UPDATE expiry_allocation
-				SET confirmed_height = NULL, confirmed_hash = NULL, status = 'pending'
-				WHERE id = ANY($1)
-			", &[&recheck]).await?;
-			t.execute("
-				DELETE
-				FROM expiry_terminal_claim
-			", &[]).await?;
-			for (txid, point) in &confirmed {
-				t.execute("
-					UPDATE expiry_allocation
-					SET status = 'confirmed', confirmed_height = $2, confirmed_hash = $3
-					WHERE sweep_txid = $1
-				", &[
-					&txid.to_string(),
-					&i64::from(point.height),
-					&point.hash.to_string()
-				]).await?;
-			}
-			// Only an observed spend in the completed prefix invalidates a
-			// parent. A mempool conflict is not a final discharge or replan.
-			t.execute("
-				UPDATE expiry_allocation a
-				SET status = 'conflicted'
-				WHERE a.status = 'pending'
-				AND EXISTS(SELECT 1
-					FROM expiry_allocation_input i
-					JOIN vtxo v ON v.vtxo_id = i.vtxo_id
-					WHERE i.allocation_id = a.id
-					AND v.onchain_spent_height <= $1
-					AND v.onchain_spent_txid IS DISTINCT FROM a.sweep_txid)
-			", &[&i32::try_from(view.captaind.height.min(view.watchmand.height).to_u32())?]).await?;
-			// A chain-only ownership premise may have disappeared even when
-			// another input in that group remains unspent. It needs a fresh
-			// derived allocation before this process may publish its parent.
-			t.execute("
-				UPDATE expiry_allocation a
-				SET status = 'conflicted'
-				WHERE a.status = 'pending'
-				AND EXISTS(SELECT 1
-					FROM expiry_allocation_coin c
-					WHERE c.allocation_id = a.id
-					AND c.evidence->>'kind' IN ('htlc_chain', 'htlc_internal_grants_reclaimed')
-					AND NOT EXISTS(SELECT 1
-						FROM watchmand_block b
-						WHERE b.height = (c.evidence->>'height')::BIGINT
-						AND b.hash = c.evidence->>'hash'))
-			", &[]).await?;
-			for (id, txid, point) in &paid_claims {
-				t.execute("
-					INSERT INTO expiry_terminal_claim(entitlement_id, txid, height, hash)
-					VALUES($1, $2, $3, $4)
-				", &[
-					id,
-					&txid.to_string(),
-					&i64::from(point.height),
-					&point.hash.to_string()
-				]).await?;
-			}
-			let duplicated = t.query_one("
-				SELECT EXISTS(SELECT 1
-					FROM expiry_allocation_coin c
-					JOIN expiry_allocation a ON a.id = c.allocation_id
-					WHERE a.status = 'confirmed'
-					GROUP BY c.entitlement_id
-					HAVING COUNT(DISTINCT a.sweep_txid) > 1) AS duplicated
-			", &[]).await?.get::<_, bool>("duplicated");
-			ensure!(!duplicated, "one expiry entitlement has multiple canonical payout transactions");
-			// A reorg may restore an earlier immutable parent and remove a
-			// replacement's input branch. The canonical payment wins globally,
-			// including when that older allocation link was inactive.
-			t.execute("
-				UPDATE expiry_allocation a
-				SET status = 'conflicted'
-				WHERE a.status = 'pending'
-				AND EXISTS(SELECT 1
-					FROM expiry_allocation_coin c
-					WHERE c.allocation_id = a.id
-					AND (EXISTS(SELECT 1
-							FROM expiry_terminal_claim p
-							WHERE p.entitlement_id = c.entitlement_id)
-						OR EXISTS(SELECT 1
-							FROM expiry_allocation_coin paid
-							JOIN expiry_allocation winner ON winner.id = paid.allocation_id
-							WHERE paid.entitlement_id = c.entitlement_id
-							AND winner.status = 'confirmed'
-							AND winner.id <> a.id)))
-			", &[]).await?;
-			t.execute("
-				UPDATE expiry_allocation_coin c
-				SET active = FALSE
-				WHERE EXISTS(SELECT 1
-					FROM expiry_terminal_claim p
-					WHERE p.entitlement_id = c.entitlement_id)
-				OR EXISTS(SELECT 1
-					FROM expiry_allocation_coin paid
-					JOIN expiry_allocation winner ON winner.id = paid.allocation_id
-					WHERE paid.entitlement_id = c.entitlement_id
-					AND winner.status = 'confirmed')
-			", &[]).await?;
-			t.execute("
-				UPDATE expiry_allocation_coin c
-				SET active = TRUE
-				FROM expiry_allocation a
-				WHERE a.id = c.allocation_id
-				AND a.status = 'confirmed'
-				AND NOT EXISTS(SELECT 1
-					FROM expiry_terminal_claim p
-					WHERE p.entitlement_id = c.entitlement_id)
-			", &[]).await?;
-			// Spent fences survive every rebuild. A later wallet sync must not
-			// turn an allocated obligation back into a spendable source coin.
-			t.execute("
-				UPDATE vtxo
-				SET spend_state = 'spent', updated_at = NOW()
-				WHERE spend_state <> 'spent'
-				AND EXISTS(SELECT 1
-					FROM expiry_entitlement d
-					WHERE d.vtxo_id = vtxo.vtxo_id)
-			", &[]).await?;
-			t.finish_expiry_rebuild(view).await
-		}).await?;
-		Ok(rebuilt.then_some(view))
+	/// Reorg repair uses the retained facts after frontier rollback. It neither
+	/// queries Core for every historical allocation nor rewrites signed parents.
+	/// The caller holds the exclusive validity barrier through this transaction.
+	pub(crate) async fn reorg_expiry_observations(&self, fork: BlockRef) -> anyhow::Result<()> {
+		let height = i64::from(fork.height);
+		let allocations = self.query("SELECT a.id FROM expiry_allocation a WHERE a.status<>'confirmed' OR a.confirmed_height>$1 \
+			OR EXISTS(SELECT 1 FROM expiry_allocation_coin c JOIN expiry_terminal_claim p ON p.entitlement_id=c.entitlement_id \
+				WHERE c.allocation_id=a.id AND p.height>$1) ORDER BY a.id", &[&height]).await?
+			.into_iter().map(|r| r.get::<_, i64>(0)).collect::<Vec<_>>();
+		self.query("SELECT v.vtxo_id FROM vtxo v JOIN expiry_entitlement e ON e.vtxo_id=v.vtxo_id \
+			WHERE EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND c.allocation_id=ANY($1)) \
+			ORDER BY v.vtxo_id FOR UPDATE OF v", &[&allocations]).await?;
+		self.query("SELECT id FROM expiry_allocation WHERE id=ANY($1) ORDER BY id FOR UPDATE", &[&allocations]).await?;
+		self.execute("UPDATE expiry_allocation SET status='pending',confirmed_height=NULL,confirmed_hash=NULL \
+			WHERE id=ANY($1) AND (status<>'confirmed' OR confirmed_height>$2)", &[&allocations, &height]).await?;
+		self.execute("DELETE FROM expiry_terminal_claim WHERE height>$1", &[&height]).await?;
+		self.reconcile_expiry_allocations(&allocations, fork).await
+	}
+
+	/// Canonical winners dominate every competing immutable allocation link,
+	/// including inactive predecessors. Only event-touched allocations change.
+	async fn reconcile_expiry_allocations(&self, allocations: &[i64], point: BlockRef) -> anyhow::Result<()> {
+		self.execute("UPDATE expiry_allocation a SET status='conflicted' WHERE a.id=ANY($1) AND a.status='pending' AND ( \
+			EXISTS(SELECT 1 FROM expiry_allocation_input i JOIN vtxo v ON v.vtxo_id=i.vtxo_id WHERE i.allocation_id=a.id \
+				AND v.onchain_spent_height<=$2 AND v.onchain_spent_txid IS DISTINCT FROM a.sweep_txid) \
+			OR EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.allocation_id=a.id \
+				AND c.evidence->>'kind' IN ('htlc_chain','htlc_internal_grants_reclaimed') \
+				AND NOT EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=(c.evidence->>'height')::BIGINT AND b.hash=c.evidence->>'hash')) \
+			OR EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.allocation_id=a.id AND ( \
+				EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=c.entitlement_id) \
+				OR EXISTS(SELECT 1 FROM expiry_allocation_coin paid JOIN expiry_allocation winner ON winner.id=paid.allocation_id \
+					WHERE paid.entitlement_id=c.entitlement_id AND winner.status='confirmed' AND winner.id<>a.id))))",
+			&[&allocations, &i32::try_from(point.height.to_u32())?]).await?;
+		let duplicate = self.query_one("SELECT EXISTS(SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation a ON a.id=c.allocation_id \
+			WHERE a.status='confirmed' GROUP BY c.entitlement_id HAVING COUNT(DISTINCT a.sweep_txid)>1)", &[]).await?.get::<_, bool>(0);
+		ensure!(!duplicate, "one expiry entitlement has multiple canonical payout transactions");
+		self.execute("UPDATE expiry_allocation_coin c SET active=FALSE WHERE c.entitlement_id IN ( \
+			SELECT entitlement_id FROM expiry_allocation_coin WHERE allocation_id=ANY($1)) AND ( \
+			EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=c.entitlement_id) \
+			OR EXISTS(SELECT 1 FROM expiry_allocation_coin paid JOIN expiry_allocation winner ON winner.id=paid.allocation_id \
+				WHERE paid.entitlement_id=c.entitlement_id AND winner.status='confirmed'))", &[&allocations]).await?;
+		self.execute("UPDATE expiry_allocation_coin c SET active=TRUE FROM expiry_allocation a WHERE a.id=c.allocation_id \
+			AND a.status='confirmed' AND c.entitlement_id IN (SELECT entitlement_id FROM expiry_allocation_coin WHERE allocation_id=ANY($1)) \
+			AND NOT EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=c.entitlement_id)", &[&allocations]).await?;
+		Ok(())
 	}
 }
 

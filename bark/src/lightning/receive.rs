@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Context;
 use bitcoin::Amount;
 use futures::StreamExt;
@@ -16,6 +18,106 @@ use crate::actions::lightning::receive::{
 use crate::movement::MovementStatus;
 use crate::movement::update::MovementUpdate;
 use crate::vtxo::VtxoStateKind;
+
+/// Builds a [`Bolt11Invoice`] for an incoming lightning payment, see
+/// [`Wallet::bolt11_invoice_builder`].
+///
+/// Setters take an `Option` too, so an optional value can be passed through
+/// as is; `None` leaves the default.
+pub struct Bolt11InvoiceBuilder<'a> {
+	wallet: &'a Wallet,
+	amount: Option<Amount>,
+	description: Option<String>,
+	expiry: Option<Duration>,
+	token: Option<String>,
+	claim_destination: Option<ark::Address>,
+}
+
+impl<'a> Bolt11InvoiceBuilder<'a> {
+	pub fn new(wallet: &'a Wallet) -> Self {
+		Self {
+			wallet,
+			amount: None,
+			description: None,
+			expiry: None,
+			token: None,
+			claim_destination: None,
+		}
+	}
+
+	/// The amount the invoice requests. Currently required.
+	pub fn amount(mut self, amount: impl Into<Option<Amount>>) -> Self {
+		self.amount = amount.into();
+		self
+	}
+
+	/// Embed a description in the invoice as its memo.
+	pub fn description(mut self, description: impl Into<Option<String>>) -> Self {
+		self.description = description.into();
+		self
+	}
+
+	/// How long the invoice can be paid for.
+	///
+	/// Defaults to, and cannot exceed, the server's invoice expiry. Building
+	/// fails if the server does not honour it.
+	pub fn expiry(mut self, expiry: impl Into<Option<Duration>>) -> Self {
+		self.expiry = expiry.into();
+		self
+	}
+
+	/// A lightning receive token that authenticates the later claim, for when
+	/// the server requires one and the wallet owns no spendable vtxo to prove
+	/// ownership with.
+	pub fn token(mut self, token: impl Into<Option<String>>) -> Self {
+		self.token = token.into();
+		self
+	}
+
+	/// Forward the claimed Ark VTXO to `claim_destination`. A destination
+	/// owned by this wallet is claimed locally instead of via its mailbox.
+	///
+	/// Trust model: the claim arkoor is built directly against
+	/// `claim_destination`'s policy, so the funds are signed to the
+	/// destination the moment they're claimed. This wallet never holds a
+	/// key that can spend them, so it has no custodial control and cannot
+	/// redirect — a malicious or compromised caller of this method cannot
+	/// steal the payment unless they provide a different address than the
+	/// desired end user.
+	///
+	/// It can still strand it: delivering the signed output to the
+	/// destination's mailbox is a separate step that only this wallet can
+	/// perform, and nothing else (not the server, not the destination) can
+	/// discover or recover that output until it does. The delivery is a
+	/// parked action that resumes automatically on restart, so a crash
+	/// recovers on its own — but for as long as this wallet stays offline
+	/// (or simply never delivers), the destination cannot claim funds that
+	/// are already theirs. Forwarding through a third party means trusting
+	/// it to eventually come back online and deliver, not trusting it with
+	/// custody.
+	pub fn claim_destination(mut self, claim_destination: impl Into<Option<ark::Address>>) -> Self {
+		self.claim_destination = claim_destination.into();
+		self
+	}
+
+	/// Mint the invoice and persist an `AwaitingPayment` checkpoint for it.
+	///
+	/// This does not wait for payment. The background sync (or an explicit
+	/// [`Wallet::try_claim_lightning_receive`]) drives the receive once an
+	/// inbound HTLC arrives.
+	pub async fn build(self) -> anyhow::Result<Bolt11Invoice> {
+		let amount = self.amount.context("an invoice amount is required")?;
+		let start = start_lightning_receive(
+			self.wallet, amount, self.description, self.expiry, self.token,
+			self.claim_destination,
+		).await?;
+		let invoice = start.invoice.clone();
+		let mut checkpoint = self.wallet.try_lock_action::<LightningReceive>(&start.id()).await?
+			.context("receive operation already in progress for this payment")?;
+		checkpoint.create(self.wallet, start).await?;
+		Ok(invoice)
+	}
+}
 
 impl Wallet {
 	/// Returns every in-progress lightning receive checkpoint, newest first.
@@ -60,7 +162,7 @@ impl Wallet {
 		info!("Syncing {} pending lightning receives", pending.len());
 		for recv in pending {
 			let id = recv.id();
-			if let Err(e) = self.drive_action(recv, DriveMode::UntilParkOrDone).await {
+			if let Err(e) = self.drive_action::<LightningReceive>(&id, DriveMode::UntilParkOrDone).await {
 				warn!("Failed to sync lightning receive {}: {:#}", id, e);
 			}
 		}
@@ -115,20 +217,27 @@ impl Wallet {
 	/// An optional `description` is embedded as the invoice memo. An optional
 	/// `token` authenticates the later claim when the wallet owns no spendable
 	/// vtxo to prove ownership with.
+	///
+	/// See [`Self::bolt11_invoice_builder`] for more options.
 	pub async fn bolt11_invoice(
 		&self,
 		amount: Amount,
 		description: Option<String>,
 		token: Option<String>,
 	) -> anyhow::Result<Bolt11Invoice> {
-		let start = start_lightning_receive(self, amount, description, token, None).await?;
-		self.inner.db.upsert_wallet_action_checkpoint(&start.id(), &start.clone().into()).await?;
-		Ok(start.invoice.clone())
+		self.bolt11_invoice_builder()
+			.amount(amount)
+			.description(description)
+			.token(token)
+			.build().await
 	}
 
 	/// Create, store and return a [`Bolt11Invoice`] whose claimed Ark VTXO
 	/// will be forwarded to `claim_destination`. A destination owned by
 	/// this wallet is claimed locally instead of via its mailbox.
+	///
+	/// See [`Bolt11InvoiceBuilder::claim_destination`] for the trust model,
+	/// and [`Self::bolt11_invoice_builder`] for more options.
 	///
 	/// Trust model: the claim arkoor is built directly against
 	/// `claim_destination`'s policy, so the funds are signed to the
@@ -141,9 +250,9 @@ impl Wallet {
 	/// Mailbox delivery is a separate step that only this wallet performs.
 	/// The parked delivery action resumes automatically on restart. If
 	/// delivery does not occur, the server can pay an expired receive to
-	/// the recipient's registered on-chain fallback script without this
+	/// the recipient's mailbox-derived BIP86 script without this
 	/// wallet. The Ark server verifies the destination's signed owner link
-	/// and fallback registration before it creates the invoice.
+	/// and mailbox-key authorization before it creates the invoice.
 	pub async fn bolt11_invoice_for_address(
 		&self,
 		amount: Amount,
@@ -151,11 +260,30 @@ impl Wallet {
 		description: Option<String>,
 		token: Option<String>,
 	) -> anyhow::Result<Bolt11Invoice> {
-		let start = start_lightning_receive(
-			self, amount, description, token, Some(claim_destination),
-		).await?;
-		self.inner.db.upsert_wallet_action_checkpoint(&start.id(), &start.clone().into()).await?;
-		Ok(start.invoice.clone())
+		self.bolt11_invoice_builder()
+			.amount(amount)
+			.claim_destination(claim_destination)
+			.description(description)
+			.token(token)
+			.build().await
+	}
+
+	/// Start building a [`Bolt11Invoice`] for an incoming lightning payment.
+	///
+	/// ```no_run
+	/// # use std::time::Duration;
+	/// # use bitcoin::Amount;
+	/// # async fn example(wallet: &bark::Wallet) -> anyhow::Result<()> {
+	/// let invoice = wallet.bolt11_invoice_builder()
+	/// 	.amount(Amount::from_sat(10_000))
+	/// 	.description("coffee".to_string())
+	/// 	.expiry(Duration::from_secs(600))
+	/// 	.build().await?;
+	/// # Ok(())
+	/// # }
+	/// ```
+	pub fn bolt11_invoice_builder(&self) -> Bolt11InvoiceBuilder<'_> {
+		Bolt11InvoiceBuilder::new(self)
 	}
 
 	/// Cancel a pending lightning receive.
@@ -166,12 +294,11 @@ impl Wallet {
 	/// are granted the server has committed, so we refuse — the receive must
 	/// complete or be abandoned on its own near expiry.
 	pub async fn cancel_lightning_receive(&self, hash: PaymentHash) -> anyhow::Result<()> {
-		let key = ln_recv_action_id(hash);
 		// Don't fight a live drive of the same action.
-		let _guard = self.inner.lock_manager.try_lock(&key).await
+		let checkpoint = self.try_lock_action::<LightningReceive>(&ln_recv_action_id(hash)).await?
 			.context("receive operation already in progress for this payment")?;
 
-		let recv = self.lightning_receive_checkpoint(hash).await?
+		let recv = checkpoint.get()
 			.context("no pending lightning receive found for this payment hash")?;
 
 		match recv.progress {
@@ -185,8 +312,7 @@ impl Wallet {
 						warn!("server did not cancel lightning receive {}: {}", hash, e);
 					}
 				}
-				self.stop_wallet_action(&key).await?;
-				Ok(())
+				checkpoint.finish(self).await
 			},
 			Progress::HtlcsReady(_) => {
 				bail!("cannot cancel: HTLCs already granted; the receive will complete \
@@ -214,12 +340,11 @@ impl Wallet {
 		payment: impl Into<PaymentHash>,
 	) -> anyhow::Result<()> {
 		let hash = payment.into();
-		let key = ln_recv_action_id(hash);
 		// Don't fight a live drive of the same action.
-		let _guard = self.inner.lock_manager.try_lock(&key).await
+		let checkpoint = self.try_lock_action::<LightningReceive>(&ln_recv_action_id(hash)).await?
 			.context("receive operation already in progress for this payment")?;
 
-		let recv = self.lightning_receive_checkpoint(hash).await?
+		let recv = checkpoint.get()
 			.context("no pending lightning receive found for this payment hash")?;
 
 		let htlcs = match &recv.progress {
@@ -227,12 +352,11 @@ impl Wallet {
 			_ => bail!("preimage must be revealed before attempting to exit"),
 		};
 
-		self.exit_lightning_receive_htlcs(&recv, htlcs).await?;
+		self.exit_lightning_receive_htlcs(recv, htlcs).await?;
 
 		// The receive is now terminal: release any locks and drop the
 		// checkpoint row.
-		self.stop_wallet_action(&key).await?;
-		Ok(())
+		checkpoint.finish(self).await
 	}
 
 	/// Escalation: when the preimage has been revealed but the claim cannot
@@ -277,10 +401,8 @@ impl Wallet {
 	pub async fn try_claim_lightning_receive(&self, hash: PaymentHash, wait: bool)
 		-> anyhow::Result<LightningReceiveState>
 	{
-		if let Some(recv) = self.lightning_receive_checkpoint(hash).await? {
-			let mode = if wait { DriveMode::UntilDone } else { DriveMode::UntilParkOrDone };
-			self.drive_action(recv, mode).await?;
-		}
+		let mode = if wait { DriveMode::UntilDone } else { DriveMode::UntilParkOrDone };
+		self.drive_action::<LightningReceive>(&ln_recv_action_id(hash), mode).await?;
 		self.lightning_receive_state(hash).await
 	}
 

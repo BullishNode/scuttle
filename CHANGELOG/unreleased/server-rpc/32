@@ -1,4 +1,0 @@
-- Add authenticated fallback registration and customer fallback-pending status
-  Carry signed recipient destinations through issuance and Lightning invoice requests.
-  [#32](https://github.com/BullishNode/abandon-ship-bark/pull/32), [#46](https://github.com/BullishNode/abandon-ship-bark/pull/46)
-  - **BREAKING:** Matching clients must register before mailbox use and handle fallback-pending recovery status.

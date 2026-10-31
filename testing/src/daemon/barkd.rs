@@ -289,6 +289,7 @@ impl Barkd {
 			amount_sat: None,
 			comment: None,
 			retry_for_secs,
+			method: None,
 		}).await.expect("barkd lightning send failed");
 	}
 
@@ -313,7 +314,7 @@ impl Barkd {
 	}
 
 	/// Request a short-lived websocket authentication ticket.
-	async fn create_ws_ticket(&self) -> String {
+	pub async fn create_ws_ticket(&self) -> String {
 		// The ticket endpoint is exercised directly via reqwest rather than the
 		// generated bark-rest-client because its ticket + websocket flow can't
 		// be represented in OpenAPI and we need a raw websocket handshake
@@ -330,6 +331,20 @@ impl Barkd {
 		resp.json::<String>().await.expect("barkd ws ticket decode failed")
 	}
 
+	fn notification_websocket_url(&self, ticket: &str) -> String {
+		format!("ws://127.0.0.1:{}/api/v1/notifications/ws?ticket={}", self.inner.port(), ticket)
+	}
+
+	/// Attempt the `/notifications/ws` handshake with `ticket` and return the
+	/// HTTP status that rejected it, or `None` if the upgrade succeeded.
+	pub async fn notification_websocket_rejection(&self, ticket: &str) -> Option<u16> {
+		match tokio_tungstenite::connect_async(self.notification_websocket_url(ticket)).await {
+			Ok(_) => None,
+			Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Some(resp.status().as_u16()),
+			Err(e) => panic!("barkd websocket handshake failed: {}", e),
+		}
+	}
+
 	/// Open a websocket connection to `/notifications/ws` and return a stream
 	/// of [`WalletNotification`]s pushed by the daemon.
 	///
@@ -340,12 +355,8 @@ impl Barkd {
 		-> impl Stream<Item = WalletNotification> + Unpin + Send
 	{
 		let ticket = self.create_ws_ticket().await;
-		let url = format!(
-			"ws://127.0.0.1:{}/api/v1/notifications/ws?ticket={}",
-			self.inner.port(), ticket,
-		);
-		let (ws, _resp) = tokio_tungstenite::connect_async(&url).await
-			.expect("failed to open barkd websocket");
+		let (ws, _resp) = tokio_tungstenite::connect_async(self.notification_websocket_url(&ticket))
+			.await.expect("failed to open barkd websocket");
 		let (_sink, stream) = ws.split();
 		Box::pin(stream.filter_map(|msg| async move {
 			match msg.ok()? {
@@ -707,7 +718,7 @@ impl Barkd {
 	pub async fn lightning_invoice(&self, amount: Amount) -> InvoiceInfo {
 		info!("{}: Create lightning invoice for {}", self.name, amount);
 		let config = self.client_config();
-		let req = LightningInvoiceRequest { amount_sat: amount.to_sat(), description: None, token: None };
+		let req = LightningInvoiceRequest { amount_sat: amount.to_sat(), description: None, expiry_secs: None, token: None };
 		lightning_api::generate_invoice(&config, req).await
 			.expect("failed to generate lightning invoice via barkd")
 	}
@@ -727,6 +738,7 @@ impl Barkd {
 			amount_sat: Some(amount.to_sat()),
 			comment: None,
 			retry_for_secs: None,
+			method: None,
 		};
 		wallet_api::send(&config, req).await.expect("barkd send failed");
 	}

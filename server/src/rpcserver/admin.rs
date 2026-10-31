@@ -82,7 +82,7 @@ impl rpc::server::LightningAdminService for Server {
 		req: tonic::Request<protos::LightningNodeUri>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
 		let req = req.into_inner();
-		let uri = http::Uri::from_str(req.uri.as_str()).unwrap();
+		let uri = http::Uri::from_str(req.uri.as_str()).badarg("invalid lightning node uri")?;
 		let _ = self.lightning_manager.activate(uri);
 		Ok(tonic::Response::new(protos::Empty{}))
 	}
@@ -93,7 +93,7 @@ impl rpc::server::LightningAdminService for Server {
 		req: tonic::Request<protos::LightningNodeUri>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
 		let req = req.into_inner();
-		let uri = http::Uri::from_str(req.uri.as_str()).unwrap();
+		let uri = http::Uri::from_str(req.uri.as_str()).badarg("invalid lightning node uri")?;
 		let _ = self.lightning_manager.disable(uri);
 		Ok(tonic::Response::new(protos::Empty{}))
 	}
@@ -235,6 +235,22 @@ impl rpc::server::BanAdminService for Server {
 	}
 }
 
+#[async_trait]
+impl rpc::server::ScuttleService for Server {
+	async fn list_expiry_holds(
+		&self, req: tonic::Request<protos::Empty>,
+	) -> Result<tonic::Response<protos::scuttle::ListExpiryHoldsResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
+		let holds = self.db.read(async |tx| tx.list_expiry_holds().await).await.to_status()?;
+		Ok(tonic::Response::new(protos::scuttle::ListExpiryHoldsResponse {
+			holds: holds.into_iter().map(|hold| protos::scuttle::ExpiryHold {
+				vtxo_id: hold.vtxo_id.to_bytes().to_vec(), reason: hold.reason,
+				first_seen: hold.first_seen.timestamp(), last_seen: hold.last_seen.timestamp(),
+			}).collect(),
+		}))
+	}
+}
+
 /// Run the captaind admin gRPC endpoint.
 pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 	RPC_RICH_ERRORS.store(srv.config.rpc_rich_errors, atomic::Ordering::Relaxed);
@@ -245,6 +261,7 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 	info!("Starting admin gRPC service on address {}", addr);
 
 	let routes = tonic::service::Routes::default()
+		.add_service(rpc::server::ScuttleServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::WalletAdminServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::RoundAdminServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::LightningAdminServiceServer::from_arc(srv.clone()))

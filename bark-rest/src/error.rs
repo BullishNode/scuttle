@@ -88,6 +88,7 @@ impl BadRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BadRequestError {
 	pub message: String,
 }

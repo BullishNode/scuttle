@@ -79,6 +79,9 @@ impl Bitcoind {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Rpc {
 	/// The socket to bind to for the public Ark gRPC.
+	///
+	/// captaind does not rate-limit this API; the reverse proxy in front of
+	/// it must. See `contrib/docs/captaind-deployment.md`.
 	pub public_address: SocketAddr,
 
 	/// The value set for the `http2_max_pending_accept_reset_streams` variable
@@ -203,6 +206,9 @@ mod defaults {
 
 	/// Seed recovery runs at most this many xpub scans at once.
 	pub fn max_concurrent_xpub_recoveries() -> usize { 1 }
+
+	/// Pending offboard sessions may lock a quarter of the rounds wallet.
+	pub fn offboard_max_locked_percent() -> u8 { 25 }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -362,9 +368,10 @@ pub struct Config {
 	/// route yet, so it needs this config to be sufficiently high to account
 	/// for the worst routing scenario.
 	///
-	/// Default is `min_final_cltv_expiry_delta + n_hops * cltv_expiry_delta`
-	/// where _n_hops_ is an upper bound on the expected number of hops a lightning
-	/// route usually takes and other vars are lightning defaults: _18 + 6*40 = 258_
+	/// Default is 1008 blocks (one week). Paying another Ark server's invoices,
+	/// which ask for up to `max_user_invoice_cltv_delta + htlc_expiry_delta`,
+	/// needs at least `htlc_expiry_delta + max invoice cltv + n_hops * cltv_expiry_delta`:
+	/// _40 + 290 + 6*40 = 570_. The rest is headroom for longer routes.
 	///
 	/// Note: it is added to [Config::htlc_expiry_delta] to provide `maxdelay` in
 	/// xpay call.
@@ -381,7 +388,8 @@ pub struct Config {
 	///
 	/// Default is 250
 	pub max_user_invoice_cltv_delta: BlockDelta,
-	/// The duration after which a generated invoice will expire.
+	/// The duration after which a generated invoice will expire, unless the
+	/// client asks for a shorter one. It is also the longest a client can ask for.
 	#[serde(with = "utils::serde::duration")]
 	pub invoice_expiry: Duration,
 	/// The duration for which the server will hold inbound HTLC(s) while
@@ -395,6 +403,16 @@ pub struct Config {
 	/// when preparing a lightning claim.
 	pub ln_receive_anti_dos_required: bool,
 
+	/// Indicates whether the Ark server requires clients to sign with the
+	/// participation's mailbox key when querying a round participation status.
+	#[serde(default)]
+	pub round_status_attestation_required: bool,
+
+	/// Indicates whether the Ark server requires clients to prove ownership
+	/// of their round inputs when requesting forfeit nonces.
+	#[serde(default)]
+	pub forfeit_attestation_required: bool,
+
 	/// The fraction of the fee we charge that we allow CLN to claim at most
 	///
 	/// E.g. if a user wants to pay 1000 sat, we charge him 0.4%, so 4 sats,
@@ -407,6 +425,11 @@ pub struct Config {
 	/// This is also the duration during which UTXOs stay locked in offboard sessions.
 	#[serde(with = "utils::serde::duration")]
 	pub offboard_session_timeout: Duration,
+
+	/// The most of the rounds wallet's trusted balance that pending offboard
+	/// sessions may lock together, in percent.
+	#[serde(default = "defaults::offboard_max_locked_percent")]
+	pub offboard_max_locked_percent: u8,
 
 	/// How often we check pending offboards: expiring sessions that reached
 	/// [Config::offboard_session_timeout] and retrying the commit and
@@ -569,6 +592,12 @@ impl Config {
 			);
 		}
 
+		if self.offboard_max_locked_percent > 100 {
+			bail!("Invalid configuration: offboard_max_locked_percent ({}) may not exceed 100",
+				self.offboard_max_locked_percent,
+			);
+		}
+
 		// A send-onchain splits its inputs with an arkoor over the same total,
 		// so an offboard limit above the arkoor one dies at that split.
 		if self.max_offboard_amount.unwrap_or(Amount::MAX)
@@ -618,6 +647,11 @@ impl Config {
 
 		if self.network == bitcoin::Network::Bitcoin && self.round_legacy_hashlock_clauses {
 			bail!("Cannot turn on round_legacy_hashlock_clauses on mainnet");
+		}
+
+		// at zero the user's preimage path opens with the server's reclaim
+		if self.network == bitcoin::Network::Bitcoin && self.htlc_expiry_delta == BlockDelta::ZERO {
+			bail!("Cannot set htlc_expiry_delta to zero on mainnet");
 		}
 
 		Ok(())
@@ -763,6 +797,21 @@ mod test {
 	}
 
 	#[test]
+	fn mainnet_refuses_zero_htlc_expiry_delta() {
+		let mut cfg = Config::load(DEFAULT_CAPTAIND_CONFIG_PATH).unwrap();
+		cfg.bitcoind.cookie = Some(".cookie".into());
+		cfg.network = bitcoin::Network::Bitcoin;
+		cfg.require_board_funding_tx = true;
+		cfg.validate().expect("default config on mainnet");
+
+		cfg.htlc_expiry_delta = BlockDelta::ZERO;
+		cfg.validate().expect_err("zero htlc_expiry_delta on mainnet");
+
+		cfg.network = bitcoin::Network::Signet;
+		cfg.validate().expect("zero htlc_expiry_delta off mainnet");
+	}
+
+	#[test]
 	fn default_offboard_fixed_vb_covers_a_two_in_three_out_keyspend() {
 		let cfg = Config::load(DEFAULT_CAPTAIND_CONFIG_PATH).unwrap();
 
@@ -843,6 +892,38 @@ mod test {
 		let cfg = load(Path::new(DEFAULT_CAPTAIND_CONFIG_PATH), "10m");
 		assert_eq!(cfg.cln_xpay_max_retry_for, Duration::from_secs(5 * 60));
 		cfg.validate().expect_err("explicit maximum below the timeout");
+	}
+
+	#[test]
+	fn round_status_attestation_required_defaults_to_off() {
+		let dir = std::env::temp_dir().join("captaind-config-test");
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let default = std::fs::read_to_string(DEFAULT_CAPTAIND_CONFIG_PATH).unwrap();
+		let without = default.lines()
+			.filter(|l| !l.starts_with("round_status_attestation_required"))
+			.collect::<Vec<_>>().join("\n");
+		let path = dir.join("without-round-status-attestation-required.toml");
+		std::fs::write(&path, without).unwrap();
+
+		let cfg = Config::load(&path).expect("a config without the setting still loads");
+		assert!(!cfg.round_status_attestation_required);
+	}
+
+	#[test]
+	fn forfeit_attestation_required_defaults_to_off() {
+		let dir = std::env::temp_dir().join("captaind-config-test");
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let default = std::fs::read_to_string(DEFAULT_CAPTAIND_CONFIG_PATH).unwrap();
+		let without = default.lines()
+			.filter(|l| !l.starts_with("forfeit_attestation_required"))
+			.collect::<Vec<_>>().join("\n");
+		let path = dir.join("without-forfeit-attestation-required.toml");
+		std::fs::write(&path, without).unwrap();
+
+		let cfg = Config::load(&path).expect("a config without the setting still loads");
+		assert!(!cfg.forfeit_attestation_required);
 	}
 
 	#[test]

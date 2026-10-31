@@ -1,0 +1,64 @@
+- Keep an outgoing Lightning attempt pending while its own native payment is pending.
+  An xpay error no longer marks that unresolved payment failed.
+  An empty own-payment lookup also retains the current open status and custody.
+  A fresh native NoRoute reply can fail its exact call after the qualified CLN
+  version acknowledges persistent slow mode; the reply and failure commit
+  together. Lost replies and unqualified errors remain unresolved.
+  Bound route delay by the higher native or recorded server height and apply
+  the existing retry time plus buffer as the RPC deadline. A timed-out RPC
+  releases its waiter while native reconciliation retains the payment.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Resume an intra-Ark receive after its sender already settled.
+  A restart between the sender and receive commits no longer retries a cancelled
+  external hold or repeats the sender's success notification.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Keep fulfilled receive grants committed and wait for six confirmations in
+  both processed views before treating an on-chain revocation as terminal.
+  Refuse a first claim inside the existing margin of its earliest grant expiry.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Retry failed hold settlements without blocking unrelated durable settlements.
+  Timeout processing reports each invoice failure and continues the pass while
+  keeping the original payment and retry evidence.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Record each Lightning settlement's actual attempt, receive or on-chain source
+  with its preimage. Missing or inconsistent provenance holds the affected funds
+  instead of authorizing a refund or an operator payout from cached status.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Expose durable expiry hold reasons on the private operator listener and through
+  `captaind rpc expiry-holds`. Holds remain alarmed and counted until an actual
+  decision clears them; listing cannot change a payment or release held funds.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Confine invalid expiry ownership to its own terminal and preserve unrelated
+  ready outputs when signed split preparation is unavailable. Database and
+  allocation failures still propagate. Operator-only sweeps continue without a
+  customer payout view, and watchmand refuses Bitcoin nodes without txindex.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Derive fallback payouts from admitted joint coin/mailbox bindings and the
+  existing stage-entitlement rules. Authenticated mailbox receipts also discover
+  provisional input-owner and unmaterialized recipient claims.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+  - **BREAKING:** Registration and legacy-proof dispatch are removed. Use fresh
+    matched stores; registration-era databases are refused before writes.
+- Bound dust aggregation to currently ready payouts for the same script and
+  expiry, ending that hold after 144 blocks in the completed chain view.
+  Only committed groups affect pass inclusion, and dropped groups leave their
+  unfinished round participations unchanged.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Prepare expiry payouts within each physical subtree's inventory budget and
+  use the existing signed recovery prefix when the larger tree needs splitting.
+  A known mempool prefix can receive its watchman fee bump; a different spender
+  stays held. Conflicted operator reservations no longer permanently block that
+  progress, while customer and off-chain fences remain protected.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Keep operator entitlements reserved until all associated allocations conflict.
+  The watchman can then recover operator-only outputs without relaxing ordinary
+  off-chain or customer fences. Entitlements without an allocation stay held.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Abandon a round instead of stopping captaind when an expiry decision takes
+  one of its inputs before the funding transaction is signed.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Log an error on each node check while an offline Lightning node has open
+  external payments or receives. Their unresolved obligations stay open.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+  - **BREAKING:** Remove the unimplemented `FailLightningAttempt` and duplicate
+    `ScopedPaymentStatus` calls. Use `CheckLightningPayment` for payment status.

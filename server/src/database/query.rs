@@ -179,6 +179,10 @@ pub async fn get_vtxos_by_id(
 ///
 /// The page holds at most `limit` VTXOs ordered by id, starting after the
 /// VTXO `after` when given.
+///
+/// The pagination doesn't take into account new VTXOs sent to the policy
+/// between 2 requests. We assume it is unlikely to happen in the context
+/// of a recovery.
 pub async fn get_vtxos_by_policy_page(
 	tx: &PgTransaction<'_>,
 	policy: &VtxoPolicy,
@@ -264,6 +268,12 @@ pub async fn store_round_participation(
 	outputs: impl IntoIterator<Item = &StoredRoundOutput>,
 	scheduled_height: Option<BlockHeight>,
 ) -> anyhow::Result<()> {
+	// The column is an INTEGER, so a larger height would wrap negative.
+	let scheduled_height = scheduled_height
+		.map(|h| i32::try_from(h.to_u32())
+			.map_err(|_| badarg_err!("scheduled height {} is out of range", h)))
+		.transpose()?;
+
 	let part_stmt = tx.prepare_typed(
 		"INSERT INTO round_participation \
 			(unlock_hash, unlock_preimage, scheduled_height, created_at) \
@@ -274,7 +284,7 @@ pub async fn store_round_participation(
 	let part_row = tx.query_one(&part_stmt, &[
 		&unlock_hash.to_string(),
 		&unlock_preimage.to_lower_hex_string(),
-		&scheduled_height.map(|h| h.to_u32() as i32),
+		&scheduled_height,
 	]).await?;
 
 	let part_id = part_row.get::<_, i64>("id");
@@ -325,7 +335,10 @@ pub async fn delete_pending_participations_for_inputs(
 			WHERE rp.round_id IS NULL AND rpi.vtxo_id = ANY($1)
 		),
 		deleted AS (
-			DELETE FROM round_participation WHERE id IN (SELECT id FROM stale) RETURNING id
+			-- recheck: a concurrent finish_round may have assigned it meanwhile
+			DELETE FROM round_participation
+			WHERE id IN (SELECT id FROM stale) AND round_id IS NULL
+			RETURNING id
 		),
 		_inputs AS (
 			DELETE FROM round_part_input WHERE participation_id IN (SELECT id FROM deleted)
@@ -402,7 +415,8 @@ pub async fn complete_round_participation(
 
 	let forfeited_at = part_row.get::<_, Option<chrono::DateTime<chrono::Local>>>("forfeited_at");
 	let scheduled_height = part_row.get::<_, Option<i32>>("scheduled_height")
-		.map(|h| BlockHeight::try_from(h).expect("invalid block height in db"));
+		.map(|h| BlockHeight::try_from(h).context("invalid scheduled_height in db"))
+		.transpose()?;
 
 	Ok(StoredRoundParticipation {
 		unlock_preimage: Secret::new(unlock_preimage),

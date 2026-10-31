@@ -17,7 +17,9 @@ pub(crate) mod hold;
 pub(crate) mod xpay;
 
 use std::str::FromStr;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use bitcoin::secp256k1::PublicKey;
@@ -42,6 +44,18 @@ use self::hold::{ClnHold, ClnHoldConfig};
 use self::xpay::{ClnXpay, ClnXpayClient, ClnXpayConfig};
 
 type ClnGrpcClient = NodeClient<Channel>;
+
+/// Bound short native reads/settles within the existing 60s processing
+/// requirement. A failed settle plus its paid-state read take at most 20s
+/// of native waiting; the existing queue then retries the durable preimage.
+/// This is not the live Xpay retry budget or a streaming-call deadline.
+pub(super) async fn unary_rpc<T>(
+	request: impl Future<Output = Result<T, tonic::Status>>,
+) -> Result<T, tonic::Status> {
+	tokio::time::timeout(Duration::from_secs(10), request).await.unwrap_or_else(|_| {
+		Err(tonic::Status::deadline_exceeded("native unary RPC timed out; outcome remains unknown"))
+	})
+}
 
 /// Cheap, cloneable command handle to a running node.
 ///
@@ -124,7 +138,7 @@ impl ClnNodeInfo {
 		let mut rpc = self.config.build_grpc_client().await.context("failed to connect rpc")?;
 		let hold_rpc = self.config.build_hold_client().await.context("failed to connect hold rpc")?;
 
-		let info = rpc.getinfo(cln_rpc::GetinfoRequest {}).await
+		let info = unary_rpc(rpc.getinfo(cln_rpc::GetinfoRequest {})).await
 			.context("failed to get info from rpc")?
 			.into_inner();
 
@@ -153,7 +167,6 @@ impl ClnNodeInfo {
 			sync_manager.clone(),
 			mailbox_manager.clone(),
 			payment_guards.clone(),
-			expected_network,
 		).await.context("failed to start ClnHold")?;
 
 		let xpay = ClnXpay::start(
@@ -162,12 +175,13 @@ impl ClnNodeInfo {
 			db.clone(),
 			payment_update_tx.clone(),
 			id,
+			pubkey,
+			expected_network,
 			rpc.clone(),
 			xpay_config.clone(),
 			settler.clone(),
 			mailbox_manager.clone(),
 			payment_guards.clone(),
-			expected_network,
 		).await.context("failed to start ClnXpay")?;
 
 		let online = ClnNodeOnlineState {

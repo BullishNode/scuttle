@@ -191,7 +191,7 @@ impl Wallet {
 		}
 
 		check_delivery(address.delivery())?;
-		address.owner_link(ark_info.mailbox_pubkey)
+		address.owner_link(network, ark_info.mailbox_pubkey)
 			.map_err(|e| ArkoorAddressError::Other(e.to_string()))?
 			.ok_or(ArkoorAddressError::RecipientMustUpdate)?;
 
@@ -313,15 +313,16 @@ impl Wallet {
 		// Lock the action before its checkpoint exists. Otherwise a wallet sync
 		// can pick up the checkpoint and drive it, and this call would skip
 		// driving and return before the payment is done.
-		let guard = self.inner.lock_manager.try_lock(&action_id).await
+		let mut checkpoint = self.try_lock_action::<ArkoorSend>(&action_id).await?
 			.context("arkoor send already in progress")?;
 
 		// Persist the action before driving it, so a crash between this point
-		// and `drive_action` leaves a checkpoint to resume from. The first step
-		// locks the inputs, so no vtxo is ever locked without a checkpoint row.
-		self.inner.db.upsert_wallet_action_checkpoint(&action.id, &action.clone().into()).await?;
+		// and `drive_checkpoint` leaves a checkpoint to resume from. The first
+		// step locks the inputs, so no vtxo is ever locked without a checkpoint
+		// row.
+		checkpoint.create(self, action).await?;
 
-		self.drive_action_with_guard(action, DriveMode::UntilDone, guard).await?;
+		self.drive_checkpoint(checkpoint, DriveMode::UntilDone).await?;
 
 		// The checkpoint is deleted once the action is done, but the movement
 		// keeps its action index.
@@ -347,7 +348,7 @@ impl Wallet {
 		info!("Syncing {} pending arkoor sends", pending.len());
 		for send in pending {
 			let id = send.id.clone();
-			if let Err(e) = self.drive_action(send, DriveMode::UntilParkOrDone).await {
+			if let Err(e) = self.drive_action::<ArkoorSend>(&id, DriveMode::UntilParkOrDone).await {
 				warn!("Failed to sync arkoor send {}: {:#}", id, e);
 			}
 		}

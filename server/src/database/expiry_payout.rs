@@ -7,18 +7,61 @@ use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin_ext::TxOutExt;
+use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 
 use super::expiry_chain::ExpiryViewToken;
 use super::expiry_lightning::LightningSourceState;
 use super::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
-use super::ln::LightningHtlcSubscriptionStatus;
+use super::ln::{LightningHtlcSubscription, LightningHtlcSubscriptionStatus};
 use super::expiry_inventory::BackingSnapshot;
 use super::Tx;
-use crate::expiry_readiness::INVENTORY_LIMITS;
+use crate::watchman::readiness::INVENTORY_LIMITS;
 
 pub(crate) const MAX_PAYOUT_VSIZE: usize = 10_000;
+
+pub struct FallbackClaim {
+	pub vtxo_id: VtxoId,
+	pub source_vtxo_ids: BTreeSet<VtxoId>,
+	pub allocation_id: u64,
+	pub owner_mailbox: PublicKey,
+	pub gross: Amount,
+	pub fee: Amount,
+	pub payout: Amount,
+	pub forfeited: Amount,
+	pub transaction_id: Option<Txid>,
+	pub output_index: Option<u32>,
+	pub confirmed_block: Option<BlockRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackOutcome {
+	Pending,
+	Spent,
+	Forfeited,
+}
+
+/// A known source cannot retire because only its first paid portion was
+/// returned. All of its principal must be covered by canonical decisions.
+fn fallback_outcome<'a>(principal: Amount, claims: impl IntoIterator<Item = &'a FallbackClaim>)
+	-> anyhow::Result<Option<FallbackOutcome>>
+{
+	let mut covered = Amount::ZERO;
+	let mut pending = false;
+	let mut paid = false;
+	let mut any = false;
+	for claim in claims {
+		any = true;
+		covered = covered.checked_add(claim.gross).context("fallback source coverage overflow")?;
+		pending |= claim.confirmed_block.is_none();
+		paid |= claim.payout > Amount::ZERO;
+	}
+	ensure!(covered <= principal, "fallback decisions exceed their known source");
+	Ok(if !any { None }
+		else if pending || covered != principal { Some(FallbackOutcome::Pending) }
+		else if paid { Some(FallbackOutcome::Spent) }
+		else { Some(FallbackOutcome::Forfeited) })
+}
 
 fn receive_timeout_allowed(
 	status: LightningHtlcSubscriptionStatus,
@@ -40,6 +83,12 @@ struct SplitRecoveryPaths {
 	rows: BTreeSet<usize>,
 	transactions: BTreeSet<Txid>,
 	keys: BTreeSet<PublicKey>,
+}
+
+fn retained_server_recovery(vtxo: &ServerVtxo) -> bool {
+	matches!(vtxo.policy(), ServerVtxoPolicy::ServerOwned | ServerVtxoPolicy::Expiry(_)
+		| ServerVtxoPolicy::Checkpoint(_) | ServerVtxoPolicy::HarkLeaf(_) | ServerVtxoPolicy::HarkLeaf_v0(_)
+		| ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcRecv(_) | VtxoPolicy::ServerHtlcRecv_v0(_)))
 }
 
 /// A signed next transaction alone is insufficient. For example, a board's
@@ -68,23 +117,17 @@ fn split_recovery_paths(
 			return Ok(None);
 		}
 		if point != root.point() {
-			match vtxo.policy() {
-				ServerVtxoPolicy::ServerOwned | ServerVtxoPolicy::Expiry(_)
-					| ServerVtxoPolicy::Checkpoint(_) | ServerVtxoPolicy::HarkLeaf(_)
-					| ServerVtxoPolicy::HarkLeaf_v0(_) => continue,
-				// Receive contracts retain the server's timeout signature path.
-				// Send contracts instead refund to the user's key; an unknown
-				// preimage cannot be substituted for a server recovery path.
-				ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcRecv(_)
-					| VtxoPolicy::ServerHtlcRecv_v0(_)) => continue,
-				ServerVtxoPolicy::User(VtxoPolicy::Pubkey(policy)) if fact.state.oor_spent_txid.is_none() => {
+			// These exact policy kinds also delimit the metadata-only recovery
+			// inventory. Every decoded policy is validated before trusting it.
+			if retained_server_recovery(vtxo) { continue; }
+			if let ServerVtxoPolicy::User(VtxoPolicy::Pubkey(policy)) = vtxo.policy() {
+				if fact.state.oor_spent_txid.is_none() {
 					if policy.user_pubkey == root.server_pubkey() { continue; }
 					if owned.contains(&policy.user_pubkey) {
 						keys.insert(policy.user_pubkey);
 						continue;
 					}
-				},
-				_ => {},
+				}
 			}
 		}
 		let Some(next) = fact.state.oor_spent_txid.and_then(|id| signed.get(&id)) else { return Ok(None); };
@@ -113,6 +156,209 @@ pub struct PendingExpiryPayout {
 }
 
 impl Tx<'_> {
+	/// Follow only immutable registered OOR edges. The stage resolver below
+	/// still decides whether a descendant is actually this input owner's right;
+	/// sharing a transaction or a mailbox is not sufficient.
+	async fn source_fallback_claims(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
+		if ids.is_empty() { return Ok(BTreeMap::new()); }
+		let raw = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+		let rows = self.query("WITH RECURSIVE branch AS (
+			SELECT vtxo_id,oor_spent_txid,spent_in_round,offboarded_in FROM vtxo WHERE vtxo_id=ANY($1)
+			UNION
+			SELECT v.vtxo_id,v.oor_spent_txid,v.spent_in_round,v.offboarded_in
+			FROM vtxo v JOIN branch p ON v.vtxo_txid=p.oor_spent_txid
+			WHERE p.spent_in_round IS NULL AND p.offboarded_in IS NULL
+		) SELECT vtxo_id FROM branch", &[&raw]).await?;
+		let mut candidates = ids.iter().copied().collect::<BTreeSet<_>>();
+		for row in rows { candidates.insert(row.get::<_, &str>("vtxo_id").parse()?); }
+		self.fallback_claims(&candidates.into_iter().collect::<Vec<_>>()).await
+	}
+
+	/// Aggregate direct and stage-selected input-owner portions onto the
+	/// authenticated coin identity. Keep birth ownership separate from payee.
+	pub(crate) async fn fallback_outcomes(&self, ids: &[VtxoId])
+		-> anyhow::Result<BTreeMap<VtxoId, FallbackOutcome>>
+	{
+		let claims = self.source_fallback_claims(ids).await?;
+		let sources = self.get_existing_server_vtxos_by_id(ids).await?;
+		let owners = self.coin_owner_mailboxes(ids).await?;
+		let mut outcomes = BTreeMap::new();
+		for (id, source) in sources {
+			let Some(owner) = owners.get(&id) else { continue; };
+			let matching = claims.values().filter(|claim|
+				claim.owner_mailbox == *owner && claim.source_vtxo_ids.contains(&id));
+			if let Some(outcome) = fallback_outcome(source.vtxo.amount(), matching)? {
+				outcomes.insert(id, outcome);
+			}
+		}
+		Ok(outcomes)
+	}
+
+	/// A collected receive can have no final coin row. Use its actual grants
+	/// and admitted destination bindings, not the provider's grant ownership.
+	/// The public hash-only response receives an outcome, never these keys.
+	pub(crate) async fn receive_fallback_outcome(&self, sub: &LightningHtlcSubscription)
+		-> anyhow::Result<Option<FallbackOutcome>>
+	{
+		let rows = self.query("SELECT v.vtxo_id,v.amount,c.output_vtxo_id,c.output_vtxo
+			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id AND h.direction='outgoing'
+			JOIN lightning_htlc_subscription s ON s.id=v.lightning_htlc_subscription_id AND s.payment_hash=h.payment_hash
+			LEFT JOIN expiry_lightning_receive_claim c ON c.source_vtxo_id=v.vtxo_id
+				AND c.subscription_id=s.id AND c.payment_hash=s.payment_hash
+			WHERE s.id=$1 AND s.payment_hash=$2 ORDER BY v.vtxo_id",
+			&[&sub.id, &sub.payment_hash.to_string()]).await?;
+		let grants = rows.iter().map(|row| row.get::<_, &str>("vtxo_id").parse())
+			.collect::<Result<BTreeSet<VtxoId>, _>>()?;
+		ensure!(grants == sub.htlc_vtxos.iter().copied().collect(), "receive grant identities differ from subscription");
+		let mut principal = Amount::ZERO;
+		let mut destinations = BTreeMap::new();
+		let mut ids = grants.iter().copied().collect::<Vec<_>>();
+		for row in rows {
+			let source: VtxoId = row.get::<_, &str>("vtxo_id").parse()?;
+			let amount = Amount::from_sat(u64::try_from(row.get::<_, i64>("amount"))?);
+			principal = principal.checked_add(amount).context("receive grant amount overflow")?;
+			let Some(raw) = row.get::<_, Option<&[u8]>>("output_vtxo") else { continue; };
+			let output = ark::Vtxo::<ark::vtxo::Full>::deserialize(raw)?;
+			let output_id: VtxoId = row.get::<_, &str>("output_vtxo_id").parse()?;
+			ensure!(output.id() == output_id
+				&& output.amount() == amount, "receive destination differs from its source");
+			let Some((id, key)) = self.receive_claim_recipient(source).await? else { continue; };
+			ensure!(id == output.id(), "collected receive destination differs");
+			let super::expiry_attribution::Attribution::Owned { mailbox_pk, .. } = self.expiry_owner(key).await? else {
+				bail!("collected receive destination has no admitted mailbox");
+			};
+			destinations.insert(id, mailbox_pk);
+			ids.push(id);
+		}
+		let claims = self.source_fallback_claims(&ids).await?;
+		let matching = claims.values().filter(|claim| destinations.iter().any(|(id, owner)|
+			claim.owner_mailbox == *owner && claim.source_vtxo_ids.contains(id)));
+		fallback_outcome(principal, matching)
+	}
+
+	/// Select the winning economic decision before filtering for customer claims.
+	/// The receipt describes that decision; it does not promote a pending parent
+	/// or replace the wallet's independent canonical-chain confirmation check.
+	pub async fn fallback_claims(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
+		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+		let rows = self.query("SELECT c.vtxo_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
+			c.payout_sat,c.forfeited_sat,a.sweep_txid,
+			CASE WHEN a.status='confirmed' AND NOT cv.invalid
+				AND cv.processed_height >= a.confirmed_height+5
+				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
+				THEN a.confirmed_height END AS confirmed_height,
+			CASE WHEN a.status='confirmed' AND NOT cv.invalid
+				AND cv.processed_height >= a.confirmed_height+5
+				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
+				THEN a.confirmed_hash END AS confirmed_hash,p.output_index
+			FROM (SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
+				c.payout_sat,c.forfeited_sat,c.spk,c.disposition FROM expiry_entitlement e
+				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
+				JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1)
+				ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.active DESC,c.allocation_id DESC) c
+			JOIN expiry_allocation a ON a.id=c.allocation_id
+			CROSS JOIN expiry_chain_view cv
+			LEFT JOIN expiry_allocation_payout p ON p.allocation_id=c.allocation_id AND p.spk=c.spk
+			WHERE c.disposition='customer'", &[&ids]).await?;
+		let mut claims: BTreeMap<VtxoId, FallbackClaim> = rows.into_iter().map(|row| {
+			let height: Option<i64> = row.get("confirmed_height");
+			let hash: Option<&str> = row.get("confirmed_hash");
+			let confirmed_block = match (height, hash) {
+				(Some(height), Some(hash)) => Some(BlockRef { height: BlockHeight::new(u32::try_from(height)?), hash: hash.parse()? }),
+				(None, None) => None,
+				_ => bail!("incomplete fallback confirmation receipt"),
+			};
+			let claim = FallbackClaim {
+				vtxo_id: row.get::<_, &str>("vtxo_id").parse()?,
+				source_vtxo_ids: BTreeSet::new(),
+				allocation_id: u64::try_from(row.get::<_, i64>("allocation_id"))?,
+				owner_mailbox: row.get::<_, &str>("owner_mailbox").parse()?,
+				gross: Amount::from_sat(u64::try_from(row.get::<_, i64>("gross_sat"))?),
+				fee: Amount::from_sat(u64::try_from(row.get::<_, i64>("fee_sat"))?),
+				payout: Amount::from_sat(u64::try_from(row.get::<_, i64>("payout_sat"))?),
+				forfeited: Amount::from_sat(u64::try_from(row.get::<_, i64>("forfeited_sat"))?),
+				transaction_id: row.get::<_, Option<&str>>("sweep_txid").map(str::parse).transpose()?,
+				output_index: row.get::<_, Option<i32>>("output_index").map(u32::try_from).transpose()?,
+				confirmed_block,
+			};
+			ensure!(claim.fee.checked_add(claim.payout).and_then(|sum| sum.checked_add(claim.forfeited)) == Some(claim.gross),
+				"fallback receipt does not conserve its source");
+			ensure!(claim.payout == Amount::ZERO || claim.output_index.is_some(), "fallback payout has no allocated output");
+			Ok((row.get::<_, &str>("vtxo_id").parse()?, claim))
+		}).collect::<anyhow::Result<_>>()?;
+		for claim in claims.values_mut() {
+			claim.source_vtxo_ids = self.fallback_claim_sources(claim).await?;
+		}
+		Ok(claims)
+	}
+
+	/// A receipt belongs to the stage-selected mailbox. Birth ownership is
+	/// only one possible source alias: a provisional recipient must not gain
+	/// its input owner's refund, and a collected receive grant belongs to its
+	/// admitted claimant even if the final output was never inserted.
+	async fn fallback_claim_sources(&self, claim: &FallbackClaim) -> anyhow::Result<BTreeSet<VtxoId>> {
+		let mut sources = BTreeSet::new();
+		if self.coin_owner_mailboxes(&[claim.vtxo_id]).await?.get(&claim.vtxo_id) == Some(&claim.owner_mailbox) {
+			sources.insert(claim.vtxo_id);
+		}
+		let row = self.query_one("SELECT irreversible_facts::TEXT FROM expiry_entitlement WHERE vtxo_id=$1",
+			&[&claim.vtxo_id.to_string()]).await?;
+		let facts: serde_json::Value = serde_json::from_str(row.get(0))?;
+		match facts.get("kind").and_then(serde_json::Value::as_str) {
+			Some("lightning_receive_claim") => {
+				let (output, key) = self.receive_claim_recipient(claim.vtxo_id).await?
+					.context("committed receive receipt has no collected claim")?;
+				ensure!(matches!(self.expiry_owner(key).await?, super::expiry_attribution::Attribution::Owned { mailbox_pk, .. }
+					if mailbox_pk == claim.owner_mailbox), "receive receipt differs from its admitted claimant");
+				sources.insert(output);
+			},
+			Some("input_owner") => {
+				let mut current = self.get_server_vtxo_by_id(claim.vtxo_id).await?.vtxo;
+				let mut seen = BTreeSet::from([current.id()]);
+				loop {
+					let last = current.transactions().last().context("input-owner receipt has no source transaction")?;
+					let [input] = last.tx.input.as_slice() else { bail!("input-owner receipt is not a single-input transition"); };
+					let parent = VtxoId::from(input.previous_output);
+					ensure!(seen.insert(parent), "input-owner receipt source cycle");
+					ensure!(self.query_opt("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 AND oor_spent_txid=$2",
+						&[&parent.to_string(), &current.point().txid.to_string()]).await?.is_some(),
+						"input-owner receipt lacks its immutable source spend");
+					current = self.get_server_vtxo_by_id(parent).await?.vtxo;
+					match current.policy() {
+						ServerVtxoPolicy::Checkpoint(_) => continue,
+						ServerVtxoPolicy::User(_) => {
+							if self.coin_owner_mailboxes(&[parent]).await?.get(&parent) == Some(&claim.owner_mailbox) {
+								sources.insert(parent);
+							}
+							break;
+						},
+						_ => bail!("input-owner receipt has an unsupported source policy"),
+					}
+				}
+			},
+			_ => {},
+		}
+		Ok(sources)
+	}
+
+	/// Independent receipt pagination cannot be hidden behind a mailbox
+	/// message checkpoint, including for an empty-store seed restore.
+	pub async fn mailbox_fallback_claims(&self, mailbox: PublicKey, cursor: Option<VtxoId>, limit: usize)
+		-> anyhow::Result<Vec<FallbackClaim>>
+	{
+		let cursor = cursor.map(|id| id.to_string());
+		let rows = self.query("SELECT w.vtxo_id FROM
+			(SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,c.owner_mailbox,c.disposition
+			FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
+			JOIN expiry_allocation a ON a.id=c.allocation_id
+			ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.active DESC,c.allocation_id DESC) w
+			WHERE w.disposition='customer' AND w.owner_mailbox=$1 AND ($2::TEXT IS NULL OR w.vtxo_id>$2)
+			ORDER BY w.vtxo_id LIMIT $3", &[&mailbox.to_string(), &cursor, &i64::try_from(limit)?]).await?;
+		let ids = rows.iter().map(|row| row.get::<_, &str>(0).parse()).collect::<Result<Vec<VtxoId>, _>>()?;
+		let mut claims = self.fallback_claims(&ids).await?;
+		ids.into_iter().map(|id| claims.remove(&id).context("mailbox receipt winner changed")).collect()
+	}
+
 	/// Select the winning allocation before matching its actual customer. An
 	/// unregistered change output can use a fresh key in the same immutable
 	/// mailbox as its input owner; a recipient in another mailbox cannot.
@@ -127,7 +373,7 @@ impl Tx<'_> {
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 				JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
 				ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.active DESC,c.allocation_id DESC \
-			) c ON c.vtxo_id=q.vtxo_id LEFT JOIN expiry_owner_key k ON k.user_pubkey=q.user_pubkey \
+			) c ON c.vtxo_id=q.vtxo_id LEFT JOIN owner_key k ON k.user_pubkey=q.user_pubkey \
 			WHERE c.disposition='customer' AND (c.user_pubkey=q.user_pubkey OR c.owner_mailbox=k.mailbox_pk)",
 			&[&ids,&keys]).await?.into_iter().map(|row| Ok(row.get::<_, &str>("vtxo_id").parse()?)).collect()
 	}
@@ -205,8 +451,9 @@ impl Tx<'_> {
 		// Prepare without coin or chain-view locks. Only the short recheck below
 		// serializes against a new obligation, a key drop or a changed chain view.
 		let limits = INVENTORY_LIMITS;
-		let snapshot = self.backing_snapshot(std::slice::from_ref(root), limits).await?;
-		let txids = snapshot.regular.iter().filter_map(|f| f.state.oor_spent_txid)
+		let snapshot = self.backing_recovery_snapshot(root, limits).await?;
+		let txids = snapshot.regular.iter().filter(|f| f.state.vtxo_id == root.id() || !retained_server_recovery(&f.state.vtxo))
+			.filter_map(|f| f.state.oor_spent_txid)
 			.map(|id| id.to_string()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
 		// Bound the returned bytes before loading transaction blobs. This is a
 		// single statement, so a concurrent registration cannot change its size
@@ -276,7 +523,7 @@ impl Tx<'_> {
 		let keys = paths.keys.iter().map(ToString::to_string).collect::<Vec<_>>();
 		let locked_keys = self.query("SELECT pubkey FROM ephemeral_tweak WHERE pubkey=ANY($1) ORDER BY pubkey FOR SHARE", &[&keys]).await?;
 		ensure!(locked_keys.len() == keys.len(), "split recovery key was dropped during preparation");
-		ensure!(root.expiry_height() <= view.captaind.height && root.expiry_height() <= view.watchmand.height,
+		ensure!(root.expiry_height() <= view.processed.height,
 			"expiry split backing is not mature");
 		let row = self.query_one("SELECT oor_spent_txid FROM vtxo WHERE vtxo_id=$1", &[&root.id().to_string()]).await?;
 		let Some(txid) = row.get::<_, Option<&str>>("oor_spent_txid") else { return Ok(false); };
@@ -369,7 +616,26 @@ impl Tx<'_> {
 	/// keep these locks through broadcast, including when the root is not itself
 	/// one of the economic customer terminals.
 	pub async fn lock_unallocated_watchman_inputs(&self, ids: &[ark::VtxoId]) -> anyhow::Result<()> {
-		super::expiry_guard::guard_obligation_changes(self, ids).await
+		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
+		// Physical reservations survive while pending/confirmed. An operator
+		// entitlement stays reserved until all its allocations have conflicted.
+		// Customer entitlements remain irreversible even across a conflict;
+		// the off-chain obligation guard retains its separate stronger fence.
+		if let Some(row) = self.query_opt("SELECT vtxo_id FROM ( \
+			SELECT i.vtxo_id FROM expiry_allocation_input i JOIN expiry_allocation a ON a.id=i.allocation_id \
+				WHERE i.vtxo_id=ANY($1) AND a.status<>'conflicted' \
+			UNION SELECT e.vtxo_id FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1) AND ( \
+				e.irreversible_facts ? 'customer_key' \
+				OR NOT EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id) \
+				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation a ON a.id=c.allocation_id \
+					WHERE c.entitlement_id=e.id AND a.status<>'conflicted') \
+				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND c.disposition='customer') \
+				OR EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id))) fenced \
+			ORDER BY vtxo_id LIMIT 1", &[&ids]).await? {
+			return Err(crate::error::FallbackRefusal::DecidedForFallback(row.get::<_, &str>("vtxo_id").parse()?).into());
+		}
+		Ok(())
 	}
 }
 
@@ -386,6 +652,36 @@ mod tests {
 	use crate::database::expiry_inventory::BackingVtxoFact;
 	use LightningHtlcSubscriptionStatus::{Canceled, Created, Accepted, HtlcsReady, Settled};
 	use HtlcResolution::{Fulfilled, Revoked};
+	use bitcoin::hashes::Hash;
+
+	#[test]
+	fn source_outcome_requires_complete_canonical_coverage() {
+		let key = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[7;32]).unwrap().public_key();
+		let mut first = FallbackClaim {
+			vtxo_id: ark::test_util::VTXO_VECTORS.board_vtxo.id(), source_vtxo_ids: BTreeSet::new(),
+			allocation_id: 1, owner_mailbox: key, gross: Amount::from_sat(40_000),
+			fee: Amount::from_sat(1_000), payout: Amount::from_sat(39_000), forfeited: Amount::ZERO,
+			transaction_id: None, output_index: Some(0), confirmed_block: None,
+		};
+		let principal = Amount::from_sat(100_000);
+		assert_eq!(fallback_outcome(principal, []).unwrap(), None);
+		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
+		first.confirmed_block = Some(BlockRef { height: BlockHeight::new(1), hash: bitcoin::BlockHash::all_zeros() });
+		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
+		let mut second = FallbackClaim {
+			vtxo_id: first.vtxo_id, source_vtxo_ids: BTreeSet::new(), allocation_id: 2, owner_mailbox: key,
+			gross: Amount::from_sat(60_000), fee: Amount::from_sat(1_000), payout: Amount::ZERO,
+			forfeited: Amount::from_sat(59_000), transaction_id: None, output_index: None, confirmed_block: None,
+		};
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
+		second.confirmed_block = first.confirmed_block;
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Spent));
+		first.payout = Amount::ZERO; first.forfeited = Amount::from_sat(39_000);
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Forfeited));
+		assert!(fallback_outcome(Amount::from_sat(99_999), [&first, &second]).is_err());
+		first.confirmed_block = None;
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
+	}
 
 	#[test]
 	fn receive_timeout_keeps_collected_and_inflight_grants() {

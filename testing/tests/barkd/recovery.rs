@@ -33,32 +33,6 @@ fn partition_recovered(vtxos: Vec<WalletVtxoInfo>) -> (Vec<WalletVtxoInfo>, Vec<
 	(spendable, spent)
 }
 
-async fn assert_recovered_balance_before_spend(recovered: &Barkd, spend_amount: Amount) {
-	let balance = recovered.bark_balance().await;
-	assert_eq!([
-		balance.spendable, balance.needs_refresh, balance.awaiting_settlement,
-		balance.pending_board, balance.pending_in_round, balance.pending_arkoor_send,
-		balance.pending_offboard, balance.pending_lightning_send,
-		balance.claimable_lightning_receive, balance.pending_exit,
-	], [
-		spend_amount, Amount::ZERO, Amount::ZERO, Amount::ZERO, Amount::ZERO,
-		Amount::ZERO, Amount::ZERO, Amount::ZERO, Amount::ZERO, Amount::ZERO,
-	]);
-	assert!(recovered.get_all_exit_status(None, None).await.is_empty(),
-		"recovery must not create an exit intent for the historical round ancestor");
-}
-
-async fn assert_recovered_balance_after_spend(recovered: &Barkd) {
-	let balance = recovered.bark_balance().await;
-	assert_eq!([
-		balance.spendable, balance.needs_refresh, balance.awaiting_settlement,
-		balance.pending_board, balance.pending_in_round, balance.pending_arkoor_send,
-		balance.pending_offboard, balance.pending_lightning_send,
-		balance.claimable_lightning_receive, balance.pending_exit,
-	], [Amount::ZERO; 10], "the retained historical body must not leave any positive balance");
-	assert!(recovered.get_all_exit_status(None, None).await.is_empty(),
-		"the completed payment must not create an exit intent for the historical round ancestor");
-}
 
 /// Wallet recovery from seed.
 ///
@@ -235,6 +209,49 @@ async fn recovered_wallet_finds_scheduled_delegated_refresh_output() {
 	// Spend recovered VTXOs in a payment
 	let recipient = ctx.barkd("recipient", &srv).create().await;
 	recovered.send(&recipient.ark_address().await, sat(50_000)).await;
+}
+
+/// A wallet restored from seed proves with its mailbox key that a delegated
+/// participation is its own, so it recovers even when the server requires it.
+#[tokio::test]
+async fn recovered_wallet_finds_delegated_refresh_with_status_attestation_required() {
+	require_bark_version!(> "0.8.0");
+
+	let ctx = TestContext::new(
+		"barkd/recovered_wallet_finds_delegated_refresh_with_status_attestation_required",
+	).await;
+	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
+		cfg.round_status_attestation_required = true;
+	}).create().await;
+
+	let barkd = ctx.barkd("bark", &srv).boarded(sat(100_000)).expose_mnemonic().create().await;
+	let board_id = barkd.vtxos(None).await[0].vtxo.id;
+	let mnemonic = barkd.mnemonic().await;
+
+	let tip = ctx.bitcoind().tip_watcher().tip().height;
+	let delay = BlockDelta::new(6);
+	let scheduled_height = tip + delay;
+	barkd.refresh_delegated(vec![board_id.to_string()], Some(scheduled_height.to_u32())).await;
+	barkd.stop().await.expect("failed to stop barkd");
+
+	let mut log_round_finished = srv.subscribe_log::<RoundFinished>();
+	ctx.generate_blocks(delay.to_u32()).await;
+	srv.wait_for_sync_height(scheduled_height).await;
+	srv.trigger_round().await;
+	log_round_finished.recv().wait(secs(60)).await
+		.expect("server should complete the scheduled delegated refresh in a round");
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+
+	let recovered = ctx.barkd("bark_recovered", &srv)
+		.mnemonic(mnemonic)
+		.create().await;
+	recovered.onchain_sync().await;
+	recovered.sync().await;
+
+	let after = recovered.vtxos(None).await;
+	assert_eq!(after.len(), 1,
+		"recovered wallet should hold the round-output VTXO, got {:?}", after);
+	assert_ne!(after[0].vtxo.id, board_id);
 }
 
 /// Wallet recovery of a scheduled delegated refresh whose round-output VTXO is
@@ -1028,6 +1045,7 @@ async fn recovered_wallet_skips_unownable_vtxo() {
 			resp.messages.push(MailboxMessage {
 				message: Some(mailbox_message::Message::RecoveryVtxoIds(RecoveryVtxoIdsMessage {
 					vtxo_ids: vec![self.foreign_id.to_bytes().to_vec()],
+					owners: Vec::new(),
 				})),
 				checkpoint: 0,
 			});
@@ -1344,6 +1362,7 @@ async fn recovered_wallet_tolerates_undecodable_vtxo_id() {
 			resp.messages.push(MailboxMessage {
 				message: Some(mailbox_message::Message::RecoveryVtxoIds(RecoveryVtxoIdsMessage {
 					vtxo_ids: vec![vec![0xde, 0xad, 0xbe, 0xef]],
+					owners: Vec::new(),
 				})),
 				checkpoint: 0,
 			});
@@ -1545,3 +1564,5 @@ async fn recovered_wallet_recovery_is_repeatable() {
 			"repeated recovery should rediscover VTXO {:?}", vtxo.vtxo.id);
 	}
 }
+
+include!("../scuttle/barkd/recovery_fallback.rs");

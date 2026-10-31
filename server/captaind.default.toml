@@ -130,6 +130,10 @@ round_forfeit_nonces_timeout = "30s"
 # The time after which we drop offboard sessions and release locked VTXOs
 offboard_session_timeout = "30s"
 
+# The most of the rounds wallet's trusted balance that pending offboard
+# sessions may lock together, in percent
+offboard_max_locked_percent = 25
+
 # How often we check pending offboards: expiring timed-out sessions and
 # retrying the commit and broadcast of signed offboard txs
 offboard_check_interval = "1s"
@@ -182,13 +186,14 @@ htlc_expiry_delta = 40
 # When granting an HTLC-send VTXO, the Server doesn't know the lightning
 # route yet, so it needs this config to be sufficiently high to account
 # for the worst routing scenario.
-htlc_send_expiry_delta = 258
+htlc_send_expiry_delta = 1008
 
 # Maximum CLTV delta server will allow clients to request an
 # invoice generation with.
 max_user_invoice_cltv_delta = 250
 
-# The duration after which a generated invoice will expire.
+# The duration after which a generated invoice will expire, unless the
+# client asks for a shorter one. It is also the longest a client can ask for.
 invoice_expiry = "48h"
 
 # The duration for which the server will hold inbound HTLC(s) while
@@ -201,6 +206,17 @@ receive_htlc_forward_timeout = "3min"
 # provide a VTXO ownership proof, or a lightning receive token
 # when preparing a lightning claim.
 ln_receive_anti_dos_required = false
+
+# Indicates whether the Ark server requires clients to sign with the
+# participation's mailbox key when querying a round participation status.
+# Clients that don't send this attestation can then no longer query their
+# participations, and a participation stored without a mailbox id answers
+# not found, like an unknown unlock hash.
+round_status_attestation_required = false
+
+# Indicates whether the Ark server requires clients to prove ownership
+# of their round inputs when requesting forfeit nonces.
+forfeit_attestation_required = false
 
 # Maximum amount for which the server will issue lightning receive
 # invoices.
@@ -348,13 +364,16 @@ fallback_fee_rate_slow = "4sat/vb"
 ##################
 
 [rpc]
-# Listen address for the public gRPC API
+# Listen address for the public gRPC API.
+# captaind does not rate-limit this API; the reverse proxy in front of it
+# must. See contrib/docs/captaind-deployment.md in the source repository.
 public_address = "127.0.0.1:3535"
 # Listen address for the private admin gRPC API.
 # Unauthenticated by design and as privileged as shell access to this host.
 # Keep it on loopback, or comment it out to not start it.
 admin_address = "127.0.0.1:3536"
-# Listen address for the integration manager gRPC API
+# Listen address for the integration manager gRPC API.
+# Keep it reachable only on a trusted network.
 integration_address = "127.0.0.1:3537"
 
 

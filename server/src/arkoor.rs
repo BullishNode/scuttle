@@ -126,8 +126,7 @@ impl Server {
 		let new_lightning_send = builder.build_unsigned_vtxos()
 			.any(|v| v.policy().as_server_htlc_send().is_some());
 		let inserted = self.db.write(async |t| {
-			owner_links.verify(t, builder.build_unsigned_vtxos().map(|v| v.policy().user_pubkey()),
-				self.mailbox_key.leak_ref(), self.config.network).await?;
+			owner_links.verify_package(t, &builder, self.mailbox_key.leak_ref(), self.config.network).await?;
 			if new_lightning_send {
 				// A retry has already committed all the identical input spends.
 				let states = t.get_user_vtxos_by_id(&source_ids).await?;
@@ -135,7 +134,7 @@ impl Server {
 					crate::database::expiry_guard::guard_new_lightning_inputs(t, &source_ids).await?;
 				}
 			}
-			let inserted = t.execute_vtxo_tree_update(update, Some((self.config.network, self.mailbox_key.leak_ref()))).await?;
+			let inserted = t.execute_vtxo_tree_update(update).await?;
 			htlc_vtxo::set_htlc_vtxo_resolutions(
 				&t, &claimed_htlc_recvs, HtlcResolution::Fulfilled,
 			).await?;

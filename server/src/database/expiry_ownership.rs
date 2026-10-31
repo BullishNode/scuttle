@@ -15,7 +15,7 @@ use ark::vtxo::Full;
 
 use super::expiry_inventory::BackingVtxoFact;
 use super::expiry_lightning::LightningSourceState;
-use super::ln::LightningHtlcSubscriptionStatus;
+use super::ln::{LightningHtlcSubscriptionStatus, SourceSettlement};
 use super::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
 use super::{BlockTable, SpendState, Tx};
 
@@ -56,7 +56,7 @@ pub enum OwnershipEvidence {
 	HtlcChain { payment_hash: PaymentHash, resolution: HtlcResolution, block: BlockRef },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OwnershipProposal {
 	pub id: VtxoId,
 	pub gross: Amount,
@@ -72,6 +72,8 @@ pub struct OwnershipProposal {
 	/// Only a fully validated, expired HTLC settlement can request
 	/// signed progression. Missing ownership or path proof never does.
 	pub needs_chain_progress: bool,
+	/// The write-side readiness pass persists this integrity hold and alarms.
+	pub settlement_integrity_hold: bool,
 }
 
 impl OwnershipProposal {
@@ -81,6 +83,7 @@ impl OwnershipProposal {
 			updated_at: fact.state.updated_at, spend_state: fact.state.spend_state,
 			disposition: OwnershipDisposition::Unresolved(reason), evidence: None,
 			cancellations: Vec::new(), has_stored_preimage: false, needs_chain_progress: false,
+			settlement_integrity_hold: false,
 		}
 	}
 }
@@ -246,6 +249,24 @@ impl Tx<'_> {
 			let htlcs = htlc_vtxo::get_htlc_vtxo_states_by_payment_hash(self, hash).await?;
 			let Some(htlc) = htlcs.iter().find(|h| h.vtxo.vtxo_id == proposal.id) else { return Ok(proposal); };
 			proposal.has_stored_preimage = self.get_htlc_settlement_by_payment_hash(hash).await?.is_some();
+			let source = if htlc.direction() == HtlcDirection::Incoming {
+				let source = self.lightning_source_state(state.vtxo_id, hash).await?;
+				let settlement = self.source_settlement(hash, state.vtxo_id).await?;
+				let inconsistent = match settlement {
+					SourceSettlement::Unknown => Some("Lightning settlement provenance unknown"),
+					SourceSettlement::Funded if source != LightningSourceState::Discharged
+						&& htlc.htlc.resolution() != Some(HtlcResolution::Fulfilled) => Some("Lightning settlement and source status disagree"),
+					SourceSettlement::NotSettled | SourceSettlement::Disjoint if source == LightningSourceState::Discharged
+						=> Some("Lightning settlement does not support source success"),
+					_ => None,
+				};
+				if let Some(reason) = inconsistent {
+					proposal.disposition = OwnershipDisposition::Unresolved(reason);
+					proposal.settlement_integrity_hold = true;
+					return Ok(proposal);
+				}
+				source
+			} else { LightningSourceState::Pending };
 			let expired_contract = htlc.htlc.htlc_expiry <= tip
 				&& watchman_tip.is_some_and(|height| htlc.htlc.htlc_expiry <= height)
 				&& fact.onchain_spent_height.is_none() && fact.onchain_spent_txid.is_none();
@@ -271,9 +292,6 @@ impl Tx<'_> {
 					}
 					return Ok(proposal);
 				}
-				let source = if htlc.direction() == HtlcDirection::Incoming {
-					self.lightning_source_state(state.vtxo_id, hash).await?
-				} else { LightningSourceState::Pending };
 				if source == LightningSourceState::Discharged {
 					proposal.disposition = OwnershipDisposition::Operator;
 					proposal.evidence = Some(OwnershipEvidence::HtlcSourceDischarged { payment_hash: hash });

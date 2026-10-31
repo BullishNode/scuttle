@@ -108,7 +108,7 @@ impl Wallet {
 		info!("Syncing {} pending boards", pending.len());
 		for board in pending {
 			let id = board.id();
-			if let Err(e) = self.drive_action(board, DriveMode::UntilParkOrDone).await {
+			if let Err(e) = self.drive_action::<Board>(&id, DriveMode::UntilParkOrDone).await {
 				warn!("Failed to sync board {}: {:#}", id, e);
 			}
 		}
@@ -260,8 +260,8 @@ impl Wallet {
 			.context("error setting funding details for board")?
 			.generate_user_nonces();
 
-		let cosign_resp = srv.client.request_board_cosign(protos::BoardCosignRequest {
-			owner_proof: Some(OwnerLink::new(ark_info.mailbox_pubkey, self.mailbox_identifier(), &user_keypair)?.into()),
+		let cosign_resp = srv.client.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
+			owner_proof: Some(OwnerLink::new_joint(self.network().await?, ark_info.mailbox_pubkey, &self.mailbox_keypair(), &user_keypair)?.into()),
 			amount: amount.to_sat(),
 			utxo: bitcoin::consensus::serialize(&utxo), //TODO(stevenroose) change to own
 			expiry_height: expiry_height.into(),
@@ -312,11 +312,6 @@ impl Wallet {
 			progress: Progress::Broadcasting { signed_vtxo: vtxo },
 		};
 
-		// Persist the checkpoint before any vtxo lock so a crash between here and
-		// `drive_action` leaves something to resume (the action stores the vtxo
-		// and broadcasts), rather than an orphaned lock.
-		self.inner.db.upsert_wallet_action_checkpoint(&board.id, &board.clone().into()).await?;
-
 		let pending = PendingBoard {
 			funding_tx: board.funding()?.clone(),
 			vtxos: vec![vtxo_id],
@@ -324,10 +319,17 @@ impl Wallet {
 			movement_id,
 		};
 
+		// Persist the checkpoint before any vtxo lock so a crash between here and
+		// `drive_checkpoint` leaves something to resume (the action stores the
+		// vtxo and broadcasts), rather than an orphaned lock.
+		let mut checkpoint = self.try_lock_action::<Board>(&board.id).await?
+			.context("board already in progress")?;
+		checkpoint.create(self, board).await?;
+
 		// The checkpoint above is durable, so the board is accepted: sync will
 		// drive it to completion. The initial drive is best-effort, so don't
 		// propagate its error (a retry would fund a duplicate board).
-		match self.drive_action(board, DriveMode::UntilParkOrDone).await {
+		match self.drive_checkpoint(checkpoint, DriveMode::UntilParkOrDone).await {
 			Ok(()) => info!("Board accepted"),
 			Err(e) => warn!("Initial board drive failed, sync will retry: {:#}", e),
 		}

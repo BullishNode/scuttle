@@ -8,7 +8,8 @@ JUSTFILE_DIR := justfile_directory()
 HOST_TARGET := `rustc -vV | sed -n 's/^host: //p' | sed 's/-linux-gnu$/-linux-musl/'`
 export CAPTAIND_EXEC := env("CAPTAIND_EXEC", CARGO_TARGET / "debug" / "captaind")
 export WATCHMAND_EXEC := env("WATCHMAND_EXEC", CARGO_TARGET / "debug" / "watchmand")
-export BARK_EXEC := env("BARK_EXEC", CARGO_TARGET / "debug" / "bark")
+export BARK_EXEC := env("BARK_EXEC", CARGO_TARGET / "debug" / "bark-legacy")
+export BARK_CLIENT_EXEC := env("BARK_CLIENT_EXEC", CARGO_TARGET / "debug" / "bark-cli")
 export BARKD_EXEC := env("BARKD_EXEC", CARGO_TARGET / "debug" / "barkd")
 export BITCOIND_SNAPSHOT_DIR := JUSTFILE_DIR / "test" / "_bitcoind_snapshot"
 
@@ -164,6 +165,12 @@ test-integration TEST="": ensure-build-bins docker-pull
 		-E 'not binary(tor) and not binary(server-migrations) and not binary(upgrade)' {{TEST}}
 alias int := test-integration
 
+# Scuttle-only financial, ownership, wire and recovery regressions.
+test-integration-scuttle TEST="": ensure-build-bins docker-pull
+	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
+		--test scuttle {{TEST}}
+alias int-scuttle := test-integration-scuttle
+
 # Run the server upgrade/migration tests. Requires OLD_CAPTAIND_EXEC to
 # point at a previous captaind release binary, e.g.:
 #   OLD_CAPTAIND_EXEC=/opt/second/captaind-0.7.0 just int-server-migrations
@@ -196,7 +203,7 @@ alias int-upgrade := test-integration-upgrade
 # run integration tests for bark and barkd test files only
 test-integration-bark: ensure-build-bins docker-pull
 	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
-		--test bark --test barkd
+		--test bark --test barkd --test bark-client
 alias int-bark := test-integration-bark
 
 # Run the integration tests that drive wallet actions (bark, barkd, bark-sdk)
@@ -238,6 +245,10 @@ test-integration-bark-prebuilt: docker-pull
 test-integration-bark-sdk-prebuilt: docker-pull
 	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
 		-E 'binary(=bark-sdk)'
+
+test-integration-bark-client-prebuilt: docker-pull
+	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
+		-E 'binary(=bark-client)'
 
 test-integration-core-prebuilt: docker-pull
 	cargo nextest run --archive-file {{CARGO_TARGET}}/ci/integration-tests.tar.zst \
@@ -398,43 +409,10 @@ generate-bark-rest-client: dump-bark-rest-openapi-schema
 		--artifact-version "$BARK_REST_VERSION" \
 		--additional-properties packageVersion="$BARK_REST_VERSION" \
 		--additional-properties reqwestDefaultFeatures="rustls"
-	# Untagged error enums must try required code+message before message-only errors.
-	python3 - <<'PY_REFUSALS'
-	import json
-	from pathlib import Path
-	import re
-
-	schema = json.loads(Path("{{BARK_OPENAPI_SCHEMA_PATH}}").read_text())
-	responses = [operation["responses"] for path in schema["paths"].values()
-	    for operation in path.values() if isinstance(operation, dict) and "responses" in operation]
-	refusal = {"$ref": "#/components/schemas/FallbackRefusalError"}
-	declared = [response for response in responses
-	    if response.get("409", {}).get("content", {}).get("application/json", {}).get("schema") == refusal]
-	found = changed = 0
-	variant = "    Status409(models::FallbackRefusalError),\n"
-	bad_request = "    Status400(models::BadRequestError),\n"
-	allowed = {bad_request, "    Status404(models::NotFoundError),\n"}
-	def prefer_refusal(match):
-	    global found, changed
-	    header, body, end = match.groups()
-	    if variant not in body:
-	        return match.group(0)
-	    lines = body.splitlines(keepends=True)
-	    assert lines.count(variant) == 1, "unsupported generated refusal variant"
-	    found += 1
-	    index = lines.index(variant)
-	    assert set(lines[:index]) <= allowed, "unsupported error before refusal"
-	    if bad_request in lines[:index]:
-	        lines.insert(0, lines.pop(index))
-	        changed += 1
-	    return header + "".join(lines) + end
-	for path in Path("{{BARK_REST_CLIENT_DIR}}/src/apis").glob("*_api.rs"):
-	    source = path.read_text()
-	    source = re.sub(r"(pub enum \w+Error \{\n)((?:    [^\n]+\n)*)(\})", prefer_refusal, source)
-	    path.write_text(source)
-	assert found == len(declared), "generated refusal count differs from OpenAPI"
-	assert changed == sum("400" in response for response in declared), "generated bad-request shape changed"
-	PY_REFUSALS
+	# reqwest's rustls feature brings the aws-lc backend while bark uses ring;
+	# users of this feature install a ring provider themselves. Added before
+	# cargo add, which resolves the workspace and bark-cli needs the feature.
+	echo 'rustls-no-provider = ["reqwest/rustls-no-provider"]' >> {{BARK_REST_CLIENT_DIR}}/Cargo.toml
 	cargo add --package bark-rest-client --path bark-json
 	cargo add --package bark-rest-client --path bark-rest --no-default-features
 	rm {{BARK_REST_CLIENT_DIR}}/src/models/*.rs
@@ -543,7 +521,10 @@ release-new-version NEW_VERSION: (bump-workspace-versions NEW_VERSION) generate-
 [doc("pre-run every CI recipe so the CI base image ships with a warm build cache")]
 ci-warmup: check build check-fuzz check-release check-bark-as-libs test-doc test-bark-wasm-indexed-db build-bark-wasm build-lib-wasm-release check-lib-arithmetic check-use-bark-as-dependency build-unit-tests-ci build-ci
 
-cachix-push:
+[doc("build the dev shells and all flake packages and push them to the bark cachix cache")]
+cachix-push: cachix-push-shells cachix-push-packages
+
+cachix-push-shells:
 	nix develop .#default  --profile /tmp/bark-shell-dev      -c true
 	nix develop .#build    --profile /tmp/bark-shell-build    -c true
 	nix develop .#ci       --profile /tmp/bark-shell-ci       -c true
@@ -552,6 +533,23 @@ cachix-push:
 	cachix push bark /tmp/bark-shell-build
 	cachix push bark /tmp/bark-shell-ci
 	cachix push bark /tmp/bark-shell-msrv-lib
+
+# Builds and pushes every package of the flake for this system, including
+# the vendored cargo deps, the generated barkd client, the bark-web node
+# modules
+[doc("build every flake package and push it with its build closure to the bark cachix cache")]
+cachix-push-packages:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	system=$(nix eval --raw --impure --expr builtins.currentSystem)
+	for pkg in $(nix eval --json ".#packages.$system" --apply builtins.attrNames | jq -r '.[]')
+	do
+		echo "Building and pushing $pkg"
+		nix build --no-link ".#$pkg"
+		nix-store -qR --include-outputs "$(nix path-info --derivation ".#$pkg")" \
+			| grep -v '\.drv$' \
+			| xargs cachix push bark
+	done
 
 [doc("build a single nix release package and copy its binaries into build/ suffixed with the target triple")]
 _nix-build-collect package target:
@@ -622,6 +620,12 @@ nix-build-server-all:
 
 nix-build-all: nix-build-bark-all nix-build-server-all
 
+# Like nix-build-all, but without the bark cachix cache
+[doc("nix-build-all without the bark cachix cache, to check a release against what the sources produce")]
+nix-build-all-no-cachix:
+	NIX_BUILD_FLAGS="--option substituters https://cache.nixos.org --option accept-flake-config false ${NIX_BUILD_FLAGS:-}" \
+		just nix-build-all
+
 # Regenerates build/SHA256SUMS over all collected artifacts. Removed first so
 # the glob can't pick up a stale copy and hash the file into itself; LC_ALL=C
 # so the ordering doesn't depend on the locale.
@@ -632,3 +636,7 @@ _nix-build-checksums:
 	rm -f SHA256SUMS
 	LC_ALL=C sha256sum * > SHA256SUMS
 	cat SHA256SUMS
+
+# Read-only Git maintenance canary; no application or native test is started.
+fork-canary:
+	python3 contrib/check-scuttle-delta.py

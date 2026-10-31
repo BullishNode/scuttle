@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use bitcoin::secp256k1::{Keypair, PublicKey};
 use bitcoin::Network;
 use ark::{ProtocolEncoding, VtxoPolicy};
+use ark::arkoor::package::ArkoorPackageBuilder;
+use ark::arkoor::state::ServerCanCosign;
 use ark::fallback::OwnerLink;
-use ark::mailbox::MailboxIdentifier;
 use server_rpc::protos;
 
 use crate::database::Tx;
@@ -28,6 +29,9 @@ impl OwnerLinks {
 	}
 
 	pub fn insert_request(&mut self, request: &protos::VtxoRequest) -> anyhow::Result<()> {
+		if request.retired_owner_proof.is_some() {
+			return crate::error::badarg!("retired owner proof field");
+		}
 		let key = VtxoPolicy::deserialize(&request.policy).badarg("invalid destination policy")?.user_pubkey();
 		self.insert_proto(key, request.owner_proof.as_ref())
 	}
@@ -36,6 +40,9 @@ impl OwnerLinks {
 		let mut links = Self::default();
 		for part in parts {
 			for output in part.outputs.iter().chain(&part.isolated_outputs) {
+				if output.retired_owner_proof.is_some() {
+					return crate::error::badarg!("retired owner proof field");
+				}
 				let key = VtxoPolicy::deserialize(&output.policy).badarg("invalid destination policy")?.user_pubkey();
 				links.insert_proto(key, output.owner_proof.as_ref())?;
 			}
@@ -45,7 +52,7 @@ impl OwnerLinks {
 
 	/// Validate every supplied copy, even when several outputs use one key.
 	pub fn check_signatures(
-		&self, keys: impl IntoIterator<Item = PublicKey>, server_mailbox_key: &Keypair,
+		&self, keys: impl IntoIterator<Item = PublicKey>, server_mailbox_key: &Keypair, network: Network,
 	) -> anyhow::Result<BTreeSet<PublicKey>> {
 		let keys = keys.into_iter().collect::<BTreeSet<_>>();
 		for key in self.0.keys() {
@@ -55,8 +62,7 @@ impl OwnerLinks {
 			let copies = self.0.get(key).ok_or(OwnershipRefusal::Required(*key))?;
 			let mut mailbox = None;
 			for link in copies {
-				link.verify(server_mailbox_key.public_key(), *key).map_err(|_| OwnershipRefusal::Invalid(*key))?;
-				let current = MailboxIdentifier::from_blinded(link.blinded_id, *key, server_mailbox_key)
+				let current = link.verify_joint(network, server_mailbox_key, *key)
 					.map_err(|_| OwnershipRefusal::Invalid(*key))?;
 				if mailbox.is_some_and(|previous| previous != current) {
 					return Err(OwnershipRefusal::Conflicting(*key).into());
@@ -72,11 +78,30 @@ impl OwnerLinks {
 		&self, tx: &Tx<'_>, keys: impl IntoIterator<Item = PublicKey>,
 		server_mailbox_key: &Keypair, network: Network,
 	) -> anyhow::Result<()> {
-		let keys = self.check_signatures(keys, server_mailbox_key)?;
+		let keys = self.check_signatures(keys, server_mailbox_key, network)?;
 		for key in keys {
 			let link = self.0.get(&key).and_then(|copies| copies.first()).ok_or(OwnershipRefusal::Required(key))?;
 			tx.verify_owner_link(server_mailbox_key, key, link, network).await?;
 		}
 		Ok(())
 	}
+	/// Every admission and replay uses the same current joint authorization.
+	pub(crate) async fn verify_package(
+		&self, tx: &Tx<'_>, builder: &ArkoorPackageBuilder<ServerCanCosign>,
+		server: &Keypair, network: Network,
+	) -> anyhow::Result<()> {
+		self.verify(tx, builder.build_unsigned_vtxos().map(|v| v.policy().user_pubkey()), server, network).await
+	}
+
+	/// A stored receive grant is returned unchanged; it creates no new rights.
+	pub(crate) async fn verify_existing_grant(
+		&self, tx: &Tx<'_>, user: PublicKey, grant: &[ark::Vtxo<ark::vtxo::Full>],
+		server: &Keypair, network: Network,
+	) -> anyhow::Result<()> {
+		if grant.is_empty() || grant.iter().any(|v| v.policy().user_pubkey() != user) {
+			return Err(OwnershipRefusal::Invalid(user).into());
+		}
+		self.verify(tx, [user], server, network).await
+	}
+
 }

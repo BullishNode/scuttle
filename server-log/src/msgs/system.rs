@@ -1,5 +1,20 @@
 
 
+use ark::VtxoId;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpiryHoldObserved {
+	pub vtxo_id: VtxoId,
+	pub reason: String,
+}
+impl_slog!(ExpiryHoldObserved, WARN, "expiry principal remains held");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpiryHoldDecision {
+	pub vtxo_id: VtxoId,
+}
+impl_slog!(ExpiryHoldDecision, INFO, "expiry decision clears its hold");
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTerminated {}
 impl_slog!(ServerTerminated, INFO, "server terminated: shutdown completed");

@@ -16,7 +16,7 @@ use bitcoind_async_client::Client as BitcoindClient;
 use bitcoind_async_client::traits::Reader;
 use bitcoin_ext::BlockRef;
 
-use crate::database::{BlockTable, Db};
+use crate::database::{BlockTable, Db, Tx};
 use crate::system::RuntimeManager;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -70,7 +70,15 @@ pub trait ChainEventListener: Send + Sync {
 	///
 	/// Reorgs can be of arbitrary depth. Implementations should roll back any
 	/// state that depended on blocks after the fork point.
-	async fn on_reorg(&self, block_ref: BlockRef) -> anyhow::Result<()>;
+	/// Use the supplied rollback transaction for database work: it already
+	/// holds the exclusive validity barrier. Borrowing another pooled
+	/// connection here can deadlock even with a single listener.
+	async fn on_reorg(&self, tx: &Tx<'_>, block_ref: BlockRef) -> anyhow::Result<()>;
+
+	/// Refresh local caches after rollback SQL commits and releases its
+	/// connection, before replacement blocks or completed-view publication.
+	/// Financial rollback belongs in `on_reorg`, not this cache callback.
+	async fn on_reorg_committed(&self, _block_ref: BlockRef) -> anyhow::Result<()> { Ok(()) }
 
 	/// Called only after the entire block-sync cycle and its database tip
 	/// publication succeeded. Equal-tip cycles also notify after a restart.

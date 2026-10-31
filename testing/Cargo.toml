@@ -9,6 +9,10 @@ name = "lock-holder"
 path = "tests/core/lock-holder.rs"
 
 [[test]]
+name = "scuttle"
+path = "tests/scuttle/mod.rs"
+
+[[test]]
 name = "server"
 path = "tests/server/mod.rs"
 
@@ -23,6 +27,10 @@ path = "tests/bark_sdk/mod.rs"
 [[test]]
 name = "barkd"
 path = "tests/barkd/mod.rs"
+
+[[test]]
+name = "bark-client"
+path = "tests/bark_client/mod.rs"
 
 [[test]]
 name = "core"

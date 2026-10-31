@@ -17,6 +17,29 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
+-- Name: cln_hold_status; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.cln_hold_status AS ENUM (
+    'unpaid',
+    'accepted',
+    'paid',
+    'cancelled'
+);
+
+
+--
+-- Name: cln_xpay_status; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.cln_xpay_status AS ENUM (
+    'pending',
+    'success',
+    'fail'
+);
+
+
+--
 -- Name: htlc_direction; Type: TYPE; Schema: public; Owner: -
 --
 
@@ -143,7 +166,17 @@ CREATE TYPE public.wallet_kind AS ENUM (
 CREATE FUNCTION public.integration_api_key_update_trigger() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
+DECLARE
+    new_updated_at integration_api_key.updated_at%TYPE := NEW.updated_at;
 BEGIN
+    -- An update that changes nothing but updated_at is a no-op: don't bump
+    -- updated_at and don't write a history record for it.
+    NEW.updated_at := OLD.updated_at;
+    IF NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN OLD;
+    END IF;
+    NEW.updated_at := new_updated_at;
+
     INSERT INTO integration_api_key_history (
         id, name, api_key, filters, integration_id, expires_at,
         created_at, updated_at, deleted_at
@@ -172,7 +205,17 @@ $$;
 CREATE FUNCTION public.integration_token_config_update_trigger() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
+DECLARE
+    new_updated_at integration_token_config.updated_at%TYPE := NEW.updated_at;
 BEGIN
+    -- An update that changes nothing but updated_at is a no-op: don't bump
+    -- updated_at and don't write a history record for it.
+    NEW.updated_at := OLD.updated_at;
+    IF NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN OLD;
+    END IF;
+    NEW.updated_at := new_updated_at;
+
     INSERT INTO integration_token_config_history (
         id, type, maximum_open_tokens, active_seconds,
         integration_id,
@@ -203,7 +246,17 @@ $$;
 CREATE FUNCTION public.integration_token_update_trigger() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
+DECLARE
+    new_updated_at integration_token.updated_at%TYPE := NEW.updated_at;
 BEGIN
+    -- An update that changes nothing but updated_at is a no-op: don't bump
+    -- updated_at and don't write a history record for it.
+    NEW.updated_at := OLD.updated_at;
+    IF NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN OLD;
+    END IF;
+    NEW.updated_at := new_updated_at;
+
     INSERT INTO integration_token_history (
         id, token, type, status, filters, integration_id,
         expires_at,
@@ -238,7 +291,17 @@ $$;
 CREATE FUNCTION public.lightning_htlc_subscription_update_trigger() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
+DECLARE
+	new_updated_at lightning_htlc_subscription.updated_at%TYPE := NEW.updated_at;
 BEGIN
+	-- An update that changes nothing but updated_at is a no-op: don't bump
+	-- updated_at and don't write a history record for it.
+	NEW.updated_at := OLD.updated_at;
+	IF NEW IS NOT DISTINCT FROM OLD THEN
+		RETURN OLD;
+	END IF;
+	NEW.updated_at := new_updated_at;
+
 	INSERT INTO lightning_htlc_subscription_history (
 		id, lightning_node_id, payment_hash, invoice, final_amount_msat,
 		receiver_mailbox_id, status, accepted_at, user_agent, created_at, updated_at
@@ -267,7 +330,17 @@ $$;
 CREATE FUNCTION public.lightning_invoice_update_trigger() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
+DECLARE
+	new_updated_at lightning_invoice.updated_at%TYPE := NEW.updated_at;
 BEGIN
+	-- An update that changes nothing but updated_at is a no-op: don't bump
+	-- updated_at and don't write a history record for it.
+	NEW.updated_at := OLD.updated_at;
+	IF NEW IS NOT DISTINCT FROM OLD THEN
+		RETURN OLD;
+	END IF;
+	NEW.updated_at := new_updated_at;
+
 	INSERT INTO lightning_invoice_history (
 		id, invoice, payment_hash, final_amount_msat,
 		created_at, updated_at
@@ -296,7 +369,17 @@ $$;
 CREATE FUNCTION public.lightning_node_update_trigger() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
+DECLARE
+    new_updated_at lightning_node.updated_at%TYPE := NEW.updated_at;
 BEGIN
+    -- An update that changes nothing but updated_at is a no-op: don't bump
+    -- updated_at and don't write a history record for it.
+    NEW.updated_at := OLD.updated_at;
+    IF NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN OLD;
+    END IF;
+    NEW.updated_at := new_updated_at;
+
     INSERT INTO lightning_node_history (
         id, pubkey, payment_created_index, payment_updated_index,
         created_at, updated_at
@@ -325,7 +408,17 @@ $$;
 CREATE FUNCTION public.lightning_payment_attempt_update_trigger() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
+DECLARE
+	new_updated_at lightning_payment_attempt.updated_at%TYPE := NEW.updated_at;
 BEGIN
+	-- An update that changes nothing but updated_at is a no-op: don't bump
+	-- updated_at and don't write a history record for it.
+	NEW.updated_at := OLD.updated_at;
+	IF NEW IS NOT DISTINCT FROM OLD THEN
+		RETURN OLD;
+	END IF;
+	NEW.updated_at := new_updated_at;
+
 	INSERT INTO lightning_payment_attempt_history (
 		id, lightning_node_id, payment_hash, amount_msat, final_amount_msat,
 		sender_mailbox_id, status, error,
@@ -413,7 +506,17 @@ $$;
 CREATE FUNCTION public.virtual_transaction_history_trigger() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
+DECLARE
+	new_updated_at virtual_transaction.updated_at%TYPE := NEW.updated_at;
 BEGIN
+	-- An update that changes nothing but updated_at is a no-op: don't bump
+	-- updated_at and don't write a history record for it.
+	NEW.updated_at := OLD.updated_at;
+	IF NEW IS NOT DISTINCT FROM OLD THEN
+		RETURN OLD;
+	END IF;
+	NEW.updated_at := new_updated_at;
+
 	INSERT INTO virtual_transaction_history (
 		txid, signed_tx, is_funding, created_at, updated_at
 	) VALUES (
@@ -455,7 +558,17 @@ $$;
 CREATE FUNCTION public.vtxo_update_trigger() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
+DECLARE
+	new_updated_at vtxo.updated_at%TYPE := NEW.updated_at;
 BEGIN
+	-- An update that changes nothing but updated_at is a no-op: don't bump
+	-- updated_at and don't write a history record for it.
+	NEW.updated_at := OLD.updated_at;
+	IF NEW IS NOT DISTINCT FROM OLD THEN
+		RETURN OLD;
+	END IF;
+	NEW.updated_at := new_updated_at;
+
 	INSERT INTO vtxo_history (
 		id, vtxo_id, vtxo_txid, vtxo, expiry, exit_delta, policy_type, policy,
 		server_pubkey, amount, anchor_point,
@@ -522,6 +635,18 @@ ALTER SEQUENCE public.arkoor_mailbox_id_seq OWNED BY public.arkoor_mailbox.id;
 
 
 --
+-- Name: board_exit; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.board_exit (
+    funding_outpoint text NOT NULL,
+    funding_spk bytea NOT NULL,
+    exit_txid text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: captaind_block; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -542,6 +667,93 @@ CREATE TABLE public.checkpoint_state (
     max_time bigint NOT NULL,
     CONSTRAINT checkpoint_state_type_id_check CHECK ((type_id = 1))
 );
+
+
+--
+-- Name: cln_hold; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.cln_hold (
+    id bigint NOT NULL,
+    lightning_node_id bigint NOT NULL,
+    invoice text NOT NULL,
+    payment_hash text NOT NULL,
+    requested_amount_msat bigint NOT NULL,
+    min_final_cltv_delta integer NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    status public.cln_hold_status DEFAULT 'unpaid'::public.cln_hold_status NOT NULL,
+    accepted_amount_msat bigint,
+    lowest_incoming_htlc_expiry integer,
+    paid_amount_msat bigint,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    accepted_at timestamp with time zone,
+    paid_at timestamp with time zone,
+    cancelled_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT cln_hold_accepted_htlcs_ck CHECK (((status <> 'accepted'::public.cln_hold_status) OR ((accepted_amount_msat IS NOT NULL) AND (lowest_incoming_htlc_expiry IS NOT NULL))))
+);
+
+
+--
+-- Name: cln_hold_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.cln_hold_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: cln_hold_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.cln_hold_id_seq OWNED BY public.cln_hold.id;
+
+
+--
+-- Name: cln_xpay; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.cln_xpay (
+    id bigint NOT NULL,
+    lightning_node_id bigint NOT NULL,
+    payment_amount_msat bigint NOT NULL,
+    max_routing_fee_msat bigint,
+    attempt_expiry timestamp with time zone NOT NULL,
+    partial_msat bigint,
+    htlc_expiry integer,
+    label text,
+    payment_hash text NOT NULL,
+    user_fee_msat bigint,
+    user_agent text,
+    status public.cln_xpay_status DEFAULT 'pending'::public.cln_xpay_status NOT NULL,
+    routing_fee_msat bigint,
+    error_code integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: cln_xpay_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.cln_xpay_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: cln_xpay_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.cln_xpay_id_seq OWNED BY public.cln_xpay.id;
 
 
 --
@@ -685,10 +897,10 @@ CREATE TABLE public.expiry_chain_view (
     id smallint NOT NULL,
     generation bigint DEFAULT 0 NOT NULL,
     invalid boolean DEFAULT true NOT NULL,
-    rebuilt_captaind_height bigint,
-    rebuilt_captaind_hash text,
-    rebuilt_watchmand_height bigint,
-    rebuilt_watchmand_hash text,
+    processed_height bigint,
+    processed_hash text,
+    CONSTRAINT expiry_chain_view_processed_height_check CHECK ((processed_height >= 0)),
+    CONSTRAINT expiry_chain_view_check CHECK (((processed_height IS NULL) = (processed_hash IS NULL))),
     CONSTRAINT expiry_chain_view_generation_check CHECK ((generation >= 0)),
     CONSTRAINT expiry_chain_view_id_check CHECK ((id = 1))
 );
@@ -749,8 +961,13 @@ CREATE TABLE public.expiry_owner_key (
     mailbox_pk text NOT NULL,
     blinded_id text NOT NULL,
     signature text NOT NULL,
+    proof_version smallint DEFAULT 1 NOT NULL,
+    joint_proof text,
     CONSTRAINT expiry_owner_key_blinded_id_check CHECK ((length(blinded_id) = 66)),
-    CONSTRAINT expiry_owner_key_signature_check CHECK ((length(signature) = 128))
+    CONSTRAINT expiry_owner_key_signature_check CHECK ((length(signature) = 128)),
+    CONSTRAINT expiry_owner_key_proof_version_check CHECK ((proof_version = ANY (ARRAY[1, 2]))),
+    CONSTRAINT expiry_owner_key_joint_proof_check CHECK (((joint_proof IS NULL) OR (length(joint_proof) = 326))),
+    CONSTRAINT expiry_owner_key_joint_required CHECK (((proof_version = 1) OR (joint_proof IS NOT NULL)))
 );
 
 
@@ -762,19 +979,6 @@ CREATE TABLE public.expiry_split_request (
     vtxo_id text NOT NULL,
     progress_txid text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
--- Name: expiry_sync_ack; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.expiry_sync_ack (
-    process text NOT NULL,
-    generation bigint NOT NULL,
-    height bigint NOT NULL,
-    hash text NOT NULL,
-    CONSTRAINT expiry_sync_ack_process_check CHECK ((process = ANY (ARRAY['captaind'::text, 'watchmand'::text])))
 );
 
 
@@ -2172,6 +2376,20 @@ ALTER TABLE ONLY public.arkoor_mailbox ALTER COLUMN id SET DEFAULT nextval('publ
 
 
 --
+-- Name: cln_hold id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cln_hold ALTER COLUMN id SET DEFAULT nextval('public.cln_hold_id_seq'::regclass);
+
+
+--
+-- Name: cln_xpay id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cln_xpay ALTER COLUMN id SET DEFAULT nextval('public.cln_xpay_id_seq'::regclass);
+
+
+--
 -- Name: ephemeral_tweak id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -2320,6 +2538,14 @@ ALTER TABLE ONLY public.arkoor_mailbox
 
 
 --
+-- Name: board_exit board_exit_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.board_exit
+    ADD CONSTRAINT board_exit_pkey PRIMARY KEY (funding_outpoint, funding_spk);
+
+
+--
 -- Name: captaind_block captaind_block_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2333,6 +2559,22 @@ ALTER TABLE ONLY public.captaind_block
 
 ALTER TABLE ONLY public.checkpoint_state
     ADD CONSTRAINT checkpoint_state_pkey PRIMARY KEY (type_id);
+
+
+--
+-- Name: cln_hold cln_hold_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cln_hold
+    ADD CONSTRAINT cln_hold_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: cln_xpay cln_xpay_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cln_xpay
+    ADD CONSTRAINT cln_xpay_pkey PRIMARY KEY (id);
 
 
 --
@@ -2469,14 +2711,6 @@ ALTER TABLE ONLY public.expiry_owner_key
 
 ALTER TABLE ONLY public.expiry_split_request
     ADD CONSTRAINT expiry_split_request_pkey PRIMARY KEY (vtxo_id);
-
-
---
--- Name: expiry_sync_ack expiry_sync_ack_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_sync_ack
-    ADD CONSTRAINT expiry_sync_ack_pkey PRIMARY KEY (process);
 
 
 --
@@ -2723,6 +2957,48 @@ CREATE INDEX arkoor_mailbox_pubkey_ix ON public.arkoor_mailbox USING btree (pubk
 --
 
 CREATE UNIQUE INDEX arkoor_mailbox_vtxo_id_uix ON public.arkoor_mailbox USING btree (vtxo_id);
+
+
+--
+-- Name: cln_hold_open_ix; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX cln_hold_open_ix ON public.cln_hold USING btree (lightning_node_id, id) WHERE (status = ANY (ARRAY['unpaid'::public.cln_hold_status, 'accepted'::public.cln_hold_status]));
+
+
+--
+-- Name: cln_hold_payment_hash_ix; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX cln_hold_payment_hash_ix ON public.cln_hold USING btree (payment_hash);
+
+
+--
+-- Name: cln_xpay_label_ix; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX cln_xpay_label_ix ON public.cln_xpay USING btree (label) WHERE (label IS NOT NULL);
+
+
+--
+-- Name: cln_xpay_payment_hash_ix; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX cln_xpay_payment_hash_ix ON public.cln_xpay USING btree (payment_hash);
+
+
+--
+-- Name: cln_xpay_pending_hash_ux; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX cln_xpay_pending_hash_ux ON public.cln_xpay USING btree (payment_hash) WHERE (status = 'pending'::public.cln_xpay_status);
+
+
+--
+-- Name: cln_xpay_pending_ix; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX cln_xpay_pending_ix ON public.cln_xpay USING btree (lightning_node_id, id) WHERE (status = 'pending'::public.cln_xpay_status);
 
 
 --
@@ -3041,10 +3317,10 @@ CREATE INDEX vtxo_spendable_ix ON public.vtxo USING btree (((oor_spent_txid IS N
 
 
 --
--- Name: vtxo_txid_ix; Type: INDEX; Schema: public; Owner: -
+-- Name: vtxo_txid_walk_ix; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX vtxo_txid_ix ON public.vtxo USING btree (vtxo_txid);
+CREATE INDEX vtxo_txid_walk_ix ON public.vtxo USING btree (vtxo_txid) INCLUDE (vtxo_id, oor_spent_txid, spend_state, amount, onchain_spent_txid);
 
 
 --
@@ -3137,6 +3413,22 @@ CREATE TRIGGER vtxo_update BEFORE UPDATE ON public.vtxo FOR EACH ROW EXECUTE FUN
 
 ALTER TABLE ONLY public.arkoor_mailbox
     ADD CONSTRAINT arkoor_mailbox_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(id);
+
+
+--
+-- Name: cln_hold cln_hold_lightning_node_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cln_hold
+    ADD CONSTRAINT cln_hold_lightning_node_id_fkey FOREIGN KEY (lightning_node_id) REFERENCES public.lightning_node(id);
+
+
+--
+-- Name: cln_xpay cln_xpay_lightning_node_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cln_xpay
+    ADD CONSTRAINT cln_xpay_lightning_node_id_fkey FOREIGN KEY (lightning_node_id) REFERENCES public.lightning_node(id);
 
 
 --

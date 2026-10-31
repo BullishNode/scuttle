@@ -43,6 +43,9 @@ impl Subsystem {
 	/// The built-in Lightning send subsystem
 	pub const LIGHTNING_SEND: Subsystem = Subsystem::new("bark.lightning_send");
 
+	/// Canonical expiry payouts, keyed by their allocated entitlement receipt.
+	pub const FALLBACK: Subsystem = Subsystem::new("scuttle.fallback");
+
 	/// The built-in round subsystem
 	pub const ROUND: Subsystem = Subsystem::new("bark.round");
 }

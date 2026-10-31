@@ -1,0 +1,6 @@
+- Rebase Scuttle on Bark 51781ef69.
+  Use upstream payment-attempt isolation, token filters, board-exit binding
+  and offboard capacity checks, forfeit nonce attestations and mnemonic
+  permission checks. Refuse settled-invoice revocation even after an
+  attempt-status regression. Upstream migrations are unchanged.
+  [#2](https://github.com/BullishNode/scuttle/pull/2)

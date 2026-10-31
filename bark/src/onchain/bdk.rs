@@ -163,6 +163,7 @@ impl OnchainWallet {
 		let desc = bdk_wallet::template::Bip86(xpriv, KeychainKind::External);
 
 		let changeset = db.initialize_bdk_wallet().await.context("error reading bdk wallet state")?;
+		#[allow(deprecated)]
 		let wallet_opt = bdk_wallet::Wallet::load()
 			.descriptor(bdk_wallet::KeychainKind::External, Some(desc.clone()))
 			.extract_keys()
@@ -180,9 +181,8 @@ impl OnchainWallet {
 		ret.reserve_fallback_address().await?;
 		Ok(ret)
 	}
-	/// A stable destination the native app can explicitly register with Ark.
-	/// External onchain wallets choose their own destination through the same
-	/// OpenWalletArgs field; the core wallet never derives it from the Ark seed.
+	/// The default mailbox's BIP86 external index-zero destination. External
+	/// mailbox applications must use the corresponding Bitcoin account themselves.
 	pub fn fallback_script(&self) -> ScriptBuf {
 		self.inner.peek_address(KeychainKind::External, 0).address.script_pubkey()
 	}
@@ -262,6 +262,7 @@ impl OnchainWalletTrait for OnchainWallet {
 			trust_witness_utxo: true,
 			..Default::default()
 		};
+		#[allow(deprecated)]
 		let finalized = self.inner.sign(&mut psbt, opts).context("signing error")?;
 		ensure!(finalized, "failed to succesfully sign the tx");
 		let tx = psbt.clone().extract_tx()?;
@@ -427,6 +428,7 @@ impl OnchainWallet {
 			trust_witness_utxo: true,
 			..Default::default()
 		};
+		#[allow(deprecated)]
 		let finalized = self.inner.sign(&mut psbt, opts).context("signing error")?;
 		ensure!(finalized, "failed to succesfully sign the tx");
 		Ok(psbt)
@@ -634,8 +636,36 @@ impl OnchainWallet {
 
 #[cfg(test)]
 mod fallback_tests {
+	use bitcoin::hex::DisplayHex;
+	use bitcoin::secp256k1::Secp256k1;
 	use crate::persist::adaptor::StorageAdaptorWrapper;
 	use super::*;
+
+	#[test]
+	fn bip86_mailbox_mnemonic_vectors_match_native_index_zero() {
+		// Standard public BIP39 test mnemonic, never a wallet-store read.
+		let mnemonic: bip39::Mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".parse().unwrap();
+		let secp = Secp256k1::new();
+		let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!("../../testdata/bip86-mailbox.json")).unwrap();
+		assert_eq!(vectors.len(), 3);
+		for vector in vectors {
+			let network: Network = vector["network"].as_str().unwrap().parse().unwrap();
+			let master = bip32::Xpriv::new_master(network, &mnemonic.to_seed("")).unwrap();
+			let path = [bip32::ChildNumber::from_hardened_idx(86).unwrap(),
+				bip32::ChildNumber::from_hardened_idx(u32::from(network != Network::Bitcoin)).unwrap(),
+				bip32::ChildNumber::from_hardened_idx(0).unwrap(), 0.into(), 0.into()];
+			let mailbox = master.derive_priv(&secp, &path).unwrap().to_keypair(&secp);
+			let sdk_seed = crate::WalletSeed::new_from_mnemonic(network, &mnemonic);
+			assert_eq!(sdk_seed.to_mailbox_keypair().public_key(), mailbox.public_key());
+			let script = ark::fallback::payout_script(mailbox.public_key());
+			let native = BdkWallet::create_single(bdk_wallet::template::Bip86(master, KeychainKind::External))
+				.network(network).create_wallet_no_persist().unwrap();
+			assert_eq!(native.peek_address(KeychainKind::External, 0).address.script_pubkey(), script);
+			assert_eq!(mailbox.public_key().to_string(), vector["mailbox"]);
+			assert_eq!(script.as_bytes()[2..].as_hex().to_string(), vector["output_key"]);
+			assert_eq!(script.to_hex_string(), vector["script"]);
+		}
+	}
 
 	#[tokio::test]
 	async fn fixed_index_zero_remains_reserved_after_reload() {

@@ -1,51 +1,9 @@
-mod expiry_test;
-mod expiry_partial_conflict_reorg;
-mod expiry_failed_swap;
-mod offboard_restart;
-mod expiry_internal_terminal_return;
-mod expiry_view_service;
+#[path = "../scuttle/server/owner_helpers.rs"]
 mod expiry_admission;
-mod expiry_races;
-mod expiry_refresh_completion;
-mod expiry_replacement_transfer;
-mod expiry_operation_races;
-mod expiry_transfer_refresh;
-mod expiry_ownership;
-mod expiry_dispatch;
-mod expiry_lightning_terminal;
-mod expiry_lightning_native_status;
-mod expiry_internal_replan;
-mod expiry_internal_reclaim_reorg;
-mod expiry_internal_partial_terminal;
-mod expiry_internal_batched_terminal;
-mod expiry_internal_reserved_batched_terminal;
-mod expiry_hash_provenance;
-mod expiry_payout_flow;
-mod expiry_split;
-mod expiry_send_claim;
-mod expiry_send_claim_receipts;
-mod expiry_reorg;
-mod expiry_conflict;
-mod expiry_independent_payouts;
-mod lightning_dispatch_reply_loss;
-mod lightning_forwarded_ack;
-mod lightning_forwarded_reopen;
-mod expiry_oversize;
-mod lightning_receive_fallback;
-mod lightning_receive_unmaterialized;
-mod expiry_cold_backup;
-mod lightning_cold_backup;
-mod offboard_reply_restore;
-mod expiry_tiny_payout_grouping;
-mod expiry_dust_later_receipt;
-mod expiry_three_owner_forwarding;
-mod expiry_script_dust_boundaries;
 mod ban;
 mod blocklist;
 mod block_index;
 mod forfeit;
-mod fallback;
-mod expiry_attribution;
 mod lightning;
 mod mailbox;
 mod nursery;
@@ -54,14 +12,15 @@ mod postgres;
 mod postgres_migrations;
 mod recovery;
 mod registration;
+mod round_status_privacy;
 mod settler;
 mod watchman;
-mod watchman_wallet;
 
 use std::iter;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use bitcoin::hashes::Hash;
 use bitcoin::hex::FromHex;
 use bitcoin::{
 	absolute, transaction, Address, Amount, Network, OutPoint, ScriptBuf, Sequence,
@@ -81,14 +40,16 @@ use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::attestations::ArkoorCosignAttestation;
 use ark::attestations::VtxoStatusAttestation;
-use ark::fallback::{FallbackRegistration, OwnerLink};
+use ark::fallback::OwnerLink;
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
-use ark::rounds::{Challenge, RoundAttemptAttestation, RoundSeq};
+use ark::rounds::{Challenge, RoundAttemptAttestation, RoundEvent, RoundSeq};
+use ark::test_util::dummy::{DummyTestVtxoSpec, DUMMY_USER_KEY};
 use ark::tree::signed::builder::SignedTreeBuilder;
 use ark::tree::signed::{LeafVtxoCosignContext, LeafVtxoCosignRequest, UnlockPreimage};
 use ark::vtxo::Full;
 use bark::Wallet;
 use bark_json::primitives::WalletVtxoInfo;
+use server::database::Db;
 use server::secret::Secret;
 use server_log::{FullRound, RoundError, RoundFinished, RoundStarted, RoundUserVtxoAlreadyRegistered};
 use server_rpc::protos::{self};
@@ -1157,6 +1118,47 @@ async fn full_round() {
 	assert!(err.contains("Message arrived late or round was full"), "err: {err}");
 }
 
+/// Oversized cosign packages are refused before the server reads any input.
+#[tokio::test]
+async fn arkoor_caps_inputs_before_loading_vtxos() {
+	let ctx = TestContext::new("server/arkoor_caps_inputs_before_loading_vtxos").await;
+	let srv = ctx.captaind("server").no_vtxo_pool().create().await;
+	let mut rpc = srv.get_public_rpc().await;
+
+	let (_, input) = DummyTestVtxoSpec::default().build();
+	let client = ArkoorPackageBuilder::new_claim_all_with_checkpoints(
+		[input], VtxoPolicy::new_pubkey(DUMMY_USER_KEY.public_key()),
+	).unwrap().generate_user_nonces(&[*DUMMY_USER_KEY]).unwrap();
+	let mut sample: protos::ArkoorPackageCosignRequest = client.cosign_request().into();
+	let part = sample.parts.remove(0);
+	let parts = (0..=server_rpc::MAX_NB_VTXO_IDS).map(|i| {
+		let mut p = part.clone();
+		let id = VtxoId::from(OutPoint::new(Txid::all_zeros(), i as u32));
+		p.input_vtxo_id = id.to_bytes().to_vec();
+		p
+	}).collect::<Vec<_>>();
+
+	// with the vtxo table locked, any lookup of the inputs would hang
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let mut conn = db.raw_conn().await.unwrap();
+	let tx = conn.transaction().await.unwrap();
+	tx.batch_execute("LOCK TABLE vtxo IN ACCESS EXCLUSIVE MODE").await.unwrap();
+
+	let arkoor = tokio::time::timeout(secs(3), rpc.request_arkoor_cosign(
+		protos::ArkoorPackageCosignRequest { parts: parts.clone() },
+	)).await;
+	let ln_send = tokio::time::timeout(secs(3), rpc.request_lightning_pay_htlc_cosign(
+		protos::LightningPayHtlcCosignRequest { parts },
+	)).await;
+	tx.rollback().await.unwrap();
+
+	for res in [arkoor, ln_send] {
+		let err = res.expect("refused before reading any vtxo").unwrap_err();
+		assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+		assert!(err.message().contains("too many parts"), "{err}");
+	}
+}
+
 #[tokio::test]
 async fn double_spend_arkoor() {
 	let ctx = TestContext::new("server/double_spend_arkoor").await;
@@ -1497,7 +1499,7 @@ async fn bad_round_input() {
 	let err = rpc.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: vec![],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
-			vtxo: Some(protos::VtxoRequest {
+			vtxo: Some(protos::VtxoRequest { retired_owner_proof: None,
 				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
@@ -1546,7 +1548,7 @@ async fn bad_round_input() {
 	let err = rpc.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: vec![fake_input],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
-			vtxo: Some(protos::VtxoRequest {
+			vtxo: Some(protos::VtxoRequest { retired_owner_proof: None,
 				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
@@ -1670,7 +1672,7 @@ async fn reject_overlong_board_cosign() {
 	};
 
 	let mut rpc = srv.get_public_rpc().await;
-	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
+	let res = rpc.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
 		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
 		amount: sat(100_000).to_sat(),
 		utxo: OutPoint::null().serialize(),
@@ -1727,7 +1729,7 @@ async fn request_board_cosign_with_funding_tx(
 	let (_sec_nonce, pub_nonce) = musig::nonce_pair(&user_key);
 
 	let mut rpc = srv.get_public_rpc().await;
-	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
+	let res = rpc.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
 		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
 		amount: amount.to_sat(),
 		utxo: utxo.serialize(),
@@ -2315,6 +2317,7 @@ async fn mailbox_post_and_process_with_auth() {
 	let authorization = Some(mailbox_auth.serialize().to_vec());
 
 	let read_mailbox = protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 		authorization,
 		mailbox_id: unblinded_id.clone(),
 		checkpoint: 0,
@@ -2355,6 +2358,7 @@ async fn mailbox_post_and_process_with_auth() {
 	let invalid_authorization = Some(invalid_mailbox_auth.serialize().to_vec());
 
 	let incorrect_read_mailbox = protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 		authorization: invalid_authorization,
 		mailbox_id: unblinded_id.clone(),
 		checkpoint: 0,
@@ -2374,6 +2378,7 @@ async fn mailbox_post_and_process_with_auth() {
 	let expired_authorization = Some(expired_mailbox_auth.serialize().to_vec());
 
 	let expired_read_mailbox = protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 		mailbox_id: unblinded_id.clone(),
 		authorization: expired_authorization.clone(),
 		checkpoint: 0,
@@ -2389,6 +2394,7 @@ async fn mailbox_post_and_process_with_auth() {
 
 	// Now we check that the server rejects requests with no authorization
 	let no_auth_read_mailbox = protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 		mailbox_id: unblinded_id.clone(),
 		authorization: None,
 		checkpoint: 0,
@@ -2575,7 +2581,7 @@ async fn test_register_board() {
 		.generate_user_nonces();
 
 	// Request server to cosign the board
-	let cosign_request = protos::BoardCosignRequest {
+	let cosign_request = protos::BoardCosignRequest { retired_owner_proof: None,
 		owner_proof: Some(test_owner_link(&srv, &client_cosign_keypair).await.into()),
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
@@ -2832,86 +2838,151 @@ async fn board_exit_tx_prevents_registration() {
 	assert_eq!(balance, Amount::ZERO, "spendable balance should be zero since board was not registered");
 }
 
-/// Authenticate synthetic database coins through the same signature verifier as issuance.
-async fn register_test_owners(
-	db: &server::database::Db, server_key: &bitcoin::secp256k1::Keypair,
-	mailbox_key: &bitcoin::secp256k1::Keypair, coin_keys: &[bitcoin::secp256k1::Keypair],
-) {
-	let network = bitcoin::Network::Regtest;
-	let spk = bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox_key.x_only_public_key().0, None);
-	let record = FallbackRegistration::new(network, spk, mailbox_key).unwrap();
-	let mailbox = MailboxIdentifier::from_pubkey(mailbox_key.public_key());
-	db.write(async |tx| {
-		tx.set_fallback(mailbox_key.public_key(), &record, network).await?;
-		for key in coin_keys {
-			let link = OwnerLink::new(server_key.public_key(), mailbox, key).unwrap();
-			tx.verify_owner_link(server_key, key.public_key(), &link, network).await?;
-		}
-		Ok(())
-	}).await.unwrap();
+
+#[tokio::test]
+async fn scheduled_height_must_not_poison_round_loading() {
+	let ctx = TestContext::new("server/scheduled_height_round_loading").await;
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		// Run the coordinator's database read in this test, not the daemon.
+		cfg.round_interval = Duration::from_secs(10_000_000);
+		cfg.fees.refresh.base_fee = Amount::ZERO;
+	}).create().await;
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+
+	// No vtxo or signature is needed: with no inputs and outputs nothing is checked,
+	// and u32::MAX would be stored as -1 in the INTEGER column.
+	let err = srv.get_public_rpc().await.submit_round_participation(
+		protos::RoundParticipationRequest {
+			input_vtxos: vec![],
+			vtxo_requests: vec![],
+			unblinded_mailbox_id: None,
+			scheduled_height: Some(u32::MAX),
+		},
+	).await.unwrap_err();
+	assert_eq!(err.code(), tonic::Code::InvalidArgument, "{}", err.message());
+
+	// The same read the round coordinator does at the start of each round.
+	let pending = db.read(async |t| {
+		t.get_all_pending_round_participations(BlockHeight::ZERO).await
+	}).await.expect("a public request must not poison round loading");
+	assert!(pending.is_empty());
 }
 
-fn test_server_mailbox_key() -> &'static bitcoin::secp256k1::Keypair {
-	static KEY: std::sync::OnceLock<bitcoin::secp256k1::Keypair> = std::sync::OnceLock::new();
-	KEY.get_or_init(|| bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[251; 32]).unwrap())
-}
+#[tokio::test]
+async fn confirmed_exit_during_signing_does_not_stop_round_coordinator() {
+	let ctx = TestContext::new("server/confirmed_exit_during_round_signing").await;
+	let srv = ctx.captaind("server").watchmand().cfg(|cfg| {
+		cfg.round_interval = Duration::from_secs(3600);
+		cfg.round_submit_time = Duration::from_secs(2);
+		cfg.round_sign_time = Duration::from_secs(60);
+		cfg.nb_round_nonces = 1;
+	}).funded(btc(1)).create().await;
+	let bark = ctx.bark("participant", &srv).funded(sat(200_000)).create().await;
+	bark.board_and_confirm_and_register(&ctx, sat(100_000)).await;
+	let input_id = bark.vtxo_ids().await[0];
+	let input = bark.raw_vtxo(input_id).await;
+	let wallet = bark.client().await;
+	let (_, input_key) = wallet.pubkey_keypair(&input.user_pubkey()).await
+		.unwrap().expect("participant owns the input");
+	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 
-async fn register_vector_owners(db: &server::database::Db) {
-	// Private keys from the canonical transaction-vector generator.
-	let keys = [
-		"fab9e598081a3e74b2233d470c4ad87bcc285b6912ed929568e62ac0e9409879",
-		"33b6f3ede430a1a53229f55da7117242d8392cbfc64a57249ba70731dba71408",
-		"fcc43a4f03356092a945ca1d7218503156bed3f94c2fa224578ce5b158fbf5a6",
-		"0a832e9574070c94b5b078600a18639321c880c830c5ba2f2a96850c7dcc4725",
-		"c0b645b01cac427717a18b30c7c9238dee2b3885f659930144fbe05061ad6166",
-		"ad12595bdbdab56cb61d1f60ccc46ff96b11c5d6fe06ae7ba03d3a5f4347440f",
-	].iter().map(|key| Keypair::from_str(key).unwrap()).collect::<Vec<_>>();
-	let server = test_server_mailbox_key();
-	register_test_owners(db, server, server, &keys).await;
-}
-
-/// Standalone protocol actors authenticate their real key and destination.
-async fn test_owner_link(srv: &Captaind, key: &Keypair) -> OwnerLink {
-	let config = srv.config().postgres.clone();
-	let db = server::database::Db::connect(&config).await.unwrap();
-	let server = srv.mailbox_keypair();
-	register_test_owners(&db, &server, key, &[*key]).await;
-	OwnerLink::new(server.public_key(), MailboxIdentifier::from_pubkey(key.public_key()), key).unwrap()
-}
-
-/// Carry real evidence through hand-built financial requests. Wallet outputs
-/// sign from their keystores; custom actors copy their previously signed link.
-async fn signed_package(
-	srv: &Captaind, wallets: &[&Wallet], mut package: protos::ArkoorPackageCosignRequest,
-) -> protos::ArkoorPackageCosignRequest {
-	let server = srv.ark_info().await.mailbox_pubkey;
-	let config = srv.config().postgres.clone();
-	let db = server::database::Db::connect(&config).await.unwrap();
-	let mut links = std::collections::BTreeMap::new();
-	for output in package.parts.iter().flat_map(|part| part.outputs.iter().chain(&part.isolated_outputs)) {
-		let key = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
-		if links.contains_key(&key) { continue; }
-		let mut link = None;
-		for wallet in wallets {
-			if wallet.pubkey_keypair(&key).await.unwrap().is_some() {
-				link = Some(wallet.owner_link(key).await.unwrap());
-				break;
+	let mut rpc = srv.get_public_rpc().await;
+	let mut admin = srv.get_round_rpc().await;
+	let mut events = rpc.subscribe_rounds(protos::Empty {}).await.unwrap().into_inner();
+	srv.trigger_round().await;
+	let challenge = tokio::time::timeout(Duration::from_secs(10), async {
+		loop {
+			let event = RoundEvent::try_from(events.next().await.unwrap().unwrap()).unwrap();
+			if let RoundEvent::Attempt(attempt) = event {
+				break attempt.challenge;
 			}
 		}
-		if link.is_none() {
-			link = db.read(async |tx| Ok(tx.query_opt("SELECT blinded_id, signature FROM expiry_owner_key WHERE user_pubkey=$1",
-				&[&key.to_string()]).await?.map(|row| OwnerLink {
-					blinded_id: ark::mailbox::BlindedMailboxIdentifier::deserialize_hex(row.get("blinded_id")).unwrap(),
-					signature: row.get::<_, &str>("signature").parse().unwrap(),
-				}))).await.unwrap();
+	}).await.expect("round starts");
+
+	let cosign_key = Keypair::new(&SECP, &mut thread_rng());
+	let (secret_nonce, public_nonce) = musig::nonce_pair(&cosign_key);
+	let request = SignedVtxoRequest {
+		vtxo: VtxoRequest {
+			policy: VtxoPolicy::new_pubkey(input.user_pubkey()),
+			amount: sat(90_000),
+		},
+		cosign_pubkey: cosign_key.public_key(),
+		nonces: vec![public_nonce],
+	};
+	let attestation = RoundAttemptAttestation::new(
+		challenge, input_id, &[request.clone()], &input_key,
+	);
+	let mut request = protos::SignedVtxoRequest::from(request);
+	request.vtxo.as_mut().unwrap().owner_proof = Some(wallet.owner_link(input.user_pubkey()).await.unwrap().into());
+	rpc.submit_payment(protos::SubmitPaymentRequest {
+		input_vtxos: vec![protos::InputVtxo {
+			vtxo_id: input_id.to_bytes().to_vec(),
+			attestation: attestation.serialize(),
+		}],
+		vtxo_requests: vec![request],
+		#[allow(deprecated)]
+		offboard_requests: vec![],
+		unblinded_mailbox_id: None,
+	}).await.expect("unexited input is accepted");
+
+	let proposal = tokio::time::timeout(Duration::from_secs(10), async {
+		loop {
+			let event = RoundEvent::try_from(events.next().await.unwrap().unwrap()).unwrap();
+			if let RoundEvent::VtxoProposal(proposal) = event {
+				break proposal;
+			}
 		}
-		let link = link.unwrap_or_else(|| panic!("hand-built output {key} needs its real signing key"));
-		link.verify(server, key).unwrap();
-		links.insert(key, link);
-	}
-	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		let key = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
-		output.owner_proof = Some(links[&key].into());
-	}
-	package
+	}).await.expect("participant reaches the signing phase");
+	let leaf_idx = proposal.vtxos_spec.vtxos.iter()
+		.position(|v| v.cosign_pubkey == Some(cosign_key.public_key())).unwrap();
+	let tree_point = OutPoint::new(
+		proposal.unsigned_round_tx.compute_txid(),
+		ark::rounds::ROUND_TX_VTXO_TREE_VOUT,
+	);
+	let tree = proposal.vtxos_spec.into_unsigned_tree(tree_point);
+	let signatures = tree.cosign_branch(
+		&proposal.cosign_agg_nonces, leaf_idx, &cosign_key, vec![secret_nonce],
+	).unwrap();
+
+	// The owner can publish its signed exit without the server, so confirm it
+	// before handing over the round signatures.
+	let exit_tx = input.transactions().next().expect("board exit").tx;
+	let child_txid = ctx.broadcast_cpfp(&exit_tx).await;
+	srv.bitcoind().await_transaction(child_txid).await;
+	let height = ctx.generate_blocks(1).await;
+	srv.watchmand().wait_for_sync_height(height).await;
+	let state = db.read(async |t| t.get_user_vtxo_by_id(input_id).await).await.unwrap();
+	assert_eq!(state.confirmed_height, Some(height));
+
+	rpc.provide_vtxo_signatures(protos::VtxoSignaturesRequest {
+		pubkey: cosign_key.public_key().serialize().to_vec(),
+		signatures: signatures.iter().map(|s| s.serialize().to_vec()).collect(),
+	}).await.expect("valid signatures are accepted");
+
+	tokio::time::timeout(Duration::from_secs(10), async {
+		loop {
+			let event = events.next().await.expect("round failure event").unwrap();
+			match RoundEvent::try_from(event).unwrap() {
+				RoundEvent::Failed(_) => break,
+				RoundEvent::Finished(_) => panic!("exited input must not fund a round"),
+				_ => {},
+			}
+		}
+	}).await.expect("invalidated round is rejected");
+	let state = db.read(async |t| t.get_user_vtxo_by_id(input_id).await).await.unwrap();
+	assert!(state.spent_in_round.is_none(), "failed round must roll back");
+
+	// The coordinator must still be able to start another round.
+	let _ = admin.trigger_round(protos::Empty {}).await;
+	let next_attempt = tokio::time::timeout(Duration::from_secs(5), async {
+		while let Some(Ok(event)) = events.next().await {
+			if matches!(RoundEvent::try_from(event), Ok(RoundEvent::Attempt(_))) {
+				return true;
+			}
+		}
+		false
+	}).await.unwrap_or(false);
+	assert!(next_attempt, "a participant's exit must not terminate the round coordinator");
 }
+
+include!("../scuttle/server/mod_fallback.rs");

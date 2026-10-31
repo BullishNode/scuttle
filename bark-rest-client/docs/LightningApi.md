@@ -49,7 +49,7 @@ Name | Type | Description  | Required | Notes
 > models::InvoiceInfo generate_invoice(lightning_invoice_request)
 Create a BOLT11 invoice
 
-Generates a new BOLT11 invoice for the specified amount via the Ark server, creating a pending Lightning receive.
+Generates a new BOLT11 invoice for the specified amount via the Ark server, creating a pending Lightning receive. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.
 
 ### Parameters
 
@@ -79,7 +79,7 @@ Name | Type | Description  | Required | Notes
 > models::InvoiceInfo generate_invoice_for_address(lightning_invoice_for_address_request)
 Create a BOLT11 invoice for an Ark address
 
-Generates a new BOLT11 invoice. When paid, the wallet app claims the Lightning receive and forwards the resulting Ark VTXO to the specified Ark address mailbox. The address must carry a valid signed mailbox link. The server verifies the link and the recipient's immutable fallback registration before it accepts the destination output. Missing or invalid ownership evidence at expiry leaves the bitcoin held; it never makes that bitcoin the provider's or operator's.
+Generates a new BOLT11 invoice. When paid, the wallet app claims the Lightning receive and forwards the resulting Ark VTXO to the specified Ark address mailbox. The address must carry a valid signed mailbox link. The server verifies the link and the recipient's immutable fallback registration before it accepts the destination output. Missing or invalid ownership evidence at expiry leaves the bitcoin held; it never makes that bitcoin the provider's or operator's. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.
 
 ### Parameters
 
@@ -109,7 +109,7 @@ Name | Type | Description  | Required | Notes
 > models::LightningReceiveInfo get_receive_status(identifier)
 Get receive status
 
-Returns the status of a specified Lightning receive, identified by its payment hash, invoice string, or preimage. The response tracks progress through timestamps: `htlc_vtxos` is populated once HTLCs are created by the Ark server, `preimage_revealed_at` records when the preimage was sent, and `finished_at` indicates the receive has settled or been canceled.
+Returns the status of a specified Lightning receive, identified by its payment hash, invoice string, or preimage. `state` tracks its progress and `settled_at` records when it settled. A receive that ended without settling, for example a canceled one, is no longer known and returns 404.
 
 ### Parameters
 

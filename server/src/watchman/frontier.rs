@@ -11,7 +11,7 @@ use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 use ark::vtxo::policy::clause::{HashDelaySignClause, HashDelaySignClause_v0, TapScriptClause};
 use bitcoin_ext::BlockHeight;
 
-use crate::database::Db;
+use crate::database::{Db, Tx};
 use crate::database::htlc_vtxo::{self, HtlcResolution};
 use crate::ln::settler::HtlcSettler;
 use crate::sync::{BlockData, ChainEventListener, RawMempool};
@@ -95,21 +95,26 @@ impl VtxoExitFrontier {
 			// in-memory frontier is rebuilt from the DB, restoring this VTXO entry.
 			// If the HTLC tx gets unconfirmed and re-confirmed in a reorg, settle()
 			// is called again but the DB insert is idempotent (ON CONFLICT DO NOTHING).
-			if let Some(preimage) = try_extract_preimage(&vtxo, witness) {
-				self.htlc_settler.settle(preimage).await
-					.context("failed to record HTLC settlement from on-chain spend")?;
-			}
+			let preimage = try_extract_preimage(&vtxo, witness);
 
 			let chain_resolution = classify_htlc_spend(&vtxo, witness);
-			self.db.write(async |t| {
+			let checkpoint = self.db.write(async |t| {
+				let checkpoint = if let Some(preimage) = preimage {
+					t.store_htlc_settlement_from(preimage,
+						crate::database::ln::HtlcSettlementOrigin::Onchain(vtxo_id)).await?
+				} else { None };
 				t.register_vtxo_spend(vtxo_id, spent_height, spent_txid).await?;
+				t.clear_completed_split_hold(vtxo_id, spent_txid).await?;
 				if let Some(resolution) = chain_resolution {
 					htlc_vtxo::set_htlc_vtxo_chain_resolution(
 						&t, vtxo_id, resolution, spent_height,
 					).await?;
 				}
-				Ok(())
+				Ok(checkpoint)
 			}).await?;
+			if let Some(preimage) = preimage {
+				self.htlc_settler.notify_stored(checkpoint, preimage.compute_payment_hash());
+			}
 
 			if let Some(resolution) = chain_resolution {
 				slog!(HtlcVtxoResolvedOnChain, vtxo_id, height: spent_height,
@@ -324,24 +329,18 @@ impl ChainEventListener for Arc<RwLock<VtxoExitFrontier>> {
 		Ok(())
 	}
 
-	async fn on_reorg(&self, block_ref: bitcoin_ext::BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, tx: &Tx<'_>, block_ref: bitcoin_ext::BlockRef) -> anyhow::Result<()> {
+		tx.reorg_frontier(block_ref.height).await?;
+		htlc_vtxo::clear_htlc_vtxo_chain_resolutions_above(tx, block_ref.height).await?;
+		Ok(())
+	}
+
+	async fn on_reorg_committed(&self, _block_ref: bitcoin_ext::BlockRef) -> anyhow::Result<()> {
+		// No connection is retained while waiting for the cache lock. A full
+		// reload includes newly registered entries as well as restored spends.
 		let mut frontier = self.write().await;
-
-		// Sync any vtxos added to the DB frontier since the last block
-		// (e.g. by finish_round, register_board, vtxopool) so that spend
-		// detection below works correctly for all frontier entries.
-		frontier.sync_new_vtxos_from_db().await?;
-
-		// Rollback all transactions that ocurred above this block
-		frontier.db.write(async |t| {
-			t.reorg_frontier(block_ref.height).await?;
-			htlc_vtxo::clear_htlc_vtxo_chain_resolutions_above(&t, block_ref.height).await?;
-			Ok(())
-		}).await?;
-
-		// Reload in-memory frontier
 		frontier.reload().await?;
-
+		frontier.last_db_sync = chrono::Utc::now();
 		Ok(())
 	}
 

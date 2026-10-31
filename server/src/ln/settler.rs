@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_stream::stream;
 use futures::Stream;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{error, info};
 
 use ark::lightning::{PaymentHash, Preimage};
 
@@ -12,6 +12,8 @@ use crate::database::{Checkpoint, Db};
 use crate::system::RuntimeManager;
 
 const DEFAULT_BATCH_SIZE: usize = 100;
+
+const READ_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub struct Settlement {
 	pub checkpoint: Checkpoint,
@@ -77,13 +79,19 @@ impl HtlcSettler {
 	}
 
 	/// Record a settlement: write preimage to the WAL table, notify watchers.
-	/// If this preimage was already recorded, this is a no-op.
+	/// An observation without an authentic source is retained as unknown.
 	pub async fn settle(&self, preimage: Preimage) -> anyhow::Result<()> {
-		if let Some(checkpoint) = self.db.write(async |t| t.store_htlc_settlement(preimage).await).await? {
-			slog!(HtlcSettled, payment_hash: preimage.compute_payment_hash());
+		let checkpoint = self.db.write(async |t| t.store_htlc_settlement(preimage).await).await?;
+		self.notify_stored(checkpoint, preimage.compute_payment_hash());
+		Ok(())
+	}
+
+	/// Notify only after the caller's provenance/status transaction committed.
+	pub(crate) fn notify_stored(&self, checkpoint: Option<Checkpoint>, hash: PaymentHash) {
+		if let Some(checkpoint) = checkpoint {
+			slog!(HtlcSettled, payment_hash: hash);
 			self.watch.update(checkpoint);
 		}
-		Ok(())
 	}
 
 	/// Check if a payment hash has been settled. Returns the preimage if so.
@@ -122,7 +130,12 @@ impl HtlcSettler {
 					.await
 				{
 					Ok(b) => b,
-					Err(_) => break,
+					Err(e) => {
+						// Ending the stream would stop the hold settler and shut down the server.
+						error!("Failed to read htlc settlements, retrying: {:#}", e);
+						tokio::time::sleep(READ_RETRY_DELAY).await;
+						continue;
+					},
 				};
 
 				for s in &batch {

@@ -26,7 +26,9 @@ use log::{debug, error, info, trace, warn};
 
 use ark::{ArkInfo, ProtocolEncoding, SignedVtxoRequest, Vtxo, VtxoId, VtxoRequest};
 use ark::vtxo::{Full, PubkeyVtxoPolicy, VtxoPolicy};
-use ark::attestations::{DelegatedRoundParticipationAttestation, RoundAttemptAttestation};
+use ark::attestations::{
+	DelegatedRoundParticipationAttestation, ForfeitNoncesAttestation, RoundAttemptAttestation, RoundParticipationStatusAttestation,
+};
 use ark::fees::FeeValidationError;
 use ark::fallback::OwnerLink;
 use ark::forfeit::HashLockedForfeitBundle;
@@ -69,7 +71,7 @@ pub struct RoundParticipation {
 	/// The output VTXOs that we request in the round,
 	/// including change
 	pub outputs: Vec<VtxoRequest>,
-	/// Explicit recipient links, including gifts using a key this wallet holds.
+	/// Explicit recipient authorizations, preserved in pending participation state.
 	pub owner_proofs: BTreeMap<PublicKey, OwnerLink>,
 	/// Optional mailbox identifier for round completion notification
 	#[serde(default, skip_serializing_if = "Option::is_none", with = "ark::encode::serde::opt")]
@@ -259,6 +261,9 @@ impl StoredRoundState {
 		let (mut srv, _) = wallet.require_server().await?;
 		match srv.client.round_participation_status(protos::RoundParticipationStatusRequest {
 			unlock_hash: unlock_hash.to_byte_array().to_vec(),
+			attestation: RoundParticipationStatusAttestation::new(
+				unlock_hash, &wallet.mailbox_keypair(),
+			).serialize(),
 		}).await {
 			Ok(_) => Ok(false),
 			Err(status) if cancelled_before_forfeit(&status, unlock_hash) => {
@@ -513,8 +518,8 @@ impl RoundState {
 	/// Whether every output of this participation pays back into this wallet,
 	/// the only shape [RoundState::try_shrink_participation] can rebuild.
 	async fn is_self_refresh(&self, wallet: &Wallet) -> anyhow::Result<bool> {
-		// A supplied recipient binding can authorize a gift even when we hold
-		// its coin key. Rebuilding it as a self-refresh would redirect that gift.
+		// Preserve supplied recipient bindings even if the local store also knows
+		// a coin key. A self-refresh must not replace the authorized recipient.
 		if !self.participation.owner_proofs.is_empty() { return Ok(false); }
 		for output in self.participation.outputs.iter() {
 			let user_pubkey = match output.policy {
@@ -1313,6 +1318,9 @@ async fn hark_vtxo_swap(
 	if sent_forfeit_sigs {
 		let response = srv.client.round_participation_status(protos::RoundParticipationStatusRequest {
 			unlock_hash: unlock_hash.to_byte_array().to_vec(),
+			attestation: RoundParticipationStatusAttestation::new(
+				unlock_hash, &wallet.mailbox_keypair(),
+			).serialize(),
 		}).await.context("error checking released round material").map_err(HarkForfeitError::Err)?
 			.into_inner();
 		if response.status == protos::RoundParticipationStatus::RoundPartReleased as i32 {
@@ -1354,13 +1362,27 @@ async fn hark_vtxo_swap(
 
 	// then do the forfeit dance
 
+	let mut user_keys = Vec::with_capacity(participation.inputs.len());
+	for input in &participation.inputs {
+		let user_key = wallet.pubkey_keypair(&input.user_pubkey()).await
+			.ok().flatten().with_context(|| format!(
+				"failed to fetch keypair for vtxo user pubkey {}", input.user_pubkey(),
+			)).map_err(HarkForfeitError::Err)?.1;
+		user_keys.push(user_key);
+	}
+
 	// the server caps the number of vtxo ids per nonces request, so for
 	// large participations we request the nonces in chunks
 	let mut server_nonces = Vec::with_capacity(participation.inputs.len());
-	for inputs in participation.inputs.chunks(MAX_NB_FORFEIT_NONCE_IDS) {
+	let chunks = participation.inputs.chunks(MAX_NB_FORFEIT_NONCE_IDS)
+		.zip(user_keys.chunks(MAX_NB_FORFEIT_NONCE_IDS));
+	for (inputs, keys) in chunks {
 		let nonces = srv.client.request_forfeit_nonces(protos::ForfeitNoncesRequest {
 			unlock_hash: unlock_hash.to_byte_array().to_vec(),
 			vtxo_ids: inputs.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
+			attestations: inputs.iter().zip(keys)
+				.map(|(v, key)| ForfeitNoncesAttestation::new(unlock_hash, v.id(), key).serialize())
+				.collect(),
 		}).await
 			.context("request forfeits nonces call failed")
 			.map_err(HarkForfeitError::Err)?
@@ -1380,13 +1402,9 @@ async fn hark_vtxo_swap(
 	}
 
 	let mut forfeit_bundles = Vec::with_capacity(participation.inputs.len());
-	for (input, nonces) in participation.inputs.iter().zip(server_nonces.into_iter()) {
-		let user_key = wallet.pubkey_keypair(&input.user_pubkey()).await
-			.ok().flatten().with_context(|| format!(
-				"failed to fetch keypair for vtxo user pubkey {}", input.user_pubkey(),
-			)).map_err(HarkForfeitError::Err)?.1;
+	for ((input, nonces), user_key) in participation.inputs.iter().zip(server_nonces).zip(&user_keys) {
 		forfeit_bundles.push(HashLockedForfeitBundle::new(
-			input, unlock_hash, &user_key, &nonces,
+			input, unlock_hash, user_key, &nonces,
 		))
 	}
 
@@ -1669,6 +1687,9 @@ async fn progress_delegated(
 
 	let resp = match srv.client.round_participation_status(protos::RoundParticipationStatusRequest {
 		unlock_hash: unlock_hash.to_byte_array().to_vec(),
+		attestation: RoundParticipationStatusAttestation::new(
+			unlock_hash, &wallet.mailbox_keypair(),
+		).serialize(),
 	}).await {
 		Ok(resp) => resp.into_inner(),
 		Err(err) if err.code() == tonic::Code::NotFound => {
@@ -2217,7 +2238,7 @@ impl Wallet {
 		movement_kind: Option<RoundMovement>,
 	) -> anyhow::Result<StoredRoundState> {
 		let (_, info) = self.require_server().await?;
-		self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
+		let links = self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
 			&participation.owner_proofs, info.mailbox_pubkey).await?;
 		let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 
@@ -2275,7 +2296,7 @@ impl Wallet {
 		// the ones it holds when it stores this submission, and they notice
 		// on their next sync.
 		let (_, info) = self.require_server().await?;
-		self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
+		let links = self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
 			&participation.owner_proofs, info.mailbox_pubkey).await?;
 		let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 		self.check_inputs_spendable(&input_ids).await?;
@@ -2358,7 +2379,7 @@ impl Wallet {
 		// Build proto VtxoRequests
 		let vtxo_requests = participation.outputs.iter()
 			.map(|req|
-				protos::VtxoRequest {
+				protos::VtxoRequest { retired_owner_proof: None,
 					owner_proof: Some(links[&req.policy.user_pubkey()].into()),
 					policy: req.policy.serialize(),
 					amount: req.amount.to_sat(),
@@ -2413,6 +2434,9 @@ impl Wallet {
 		let (mut srv, ark_info) = self.require_server().await?;
 		let response = srv.client.round_participation_status(protos::RoundParticipationStatusRequest {
 			unlock_hash: unlock_hash.to_byte_array().to_vec(),
+			attestation: RoundParticipationStatusAttestation::new(
+				unlock_hash, &self.mailbox_keypair(),
+			).serialize(),
 		}).await.context("error fetching released round")?.into_inner();
 		ensure!(response.status == protos::RoundParticipationStatus::RoundPartReleased as i32,
 			"round has not released its outputs");
@@ -2473,27 +2497,22 @@ impl Wallet {
 			complete_released_outputs(self, &mut srv, &participation, &mut outputs, &funding_tx,
 				unlock_hash, &response).await?;
 		}
-		// The replacement is funded by a different tree, so an old wallet backup
-		// must retire its already-owned originals before admitting this output.
-		{
-			let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
-			let claimed = self.operation_input_ids().await?;
-			let mut snapshot = self.inner.db.get_fallback_snapshot().await?;
-			let mut existing = Vec::new();
-			for id in &input_ids {
-				let Some(stored) = self.inner.db.get_wallet_vtxo(*id).await? else { continue; };
-				ensure!(!claimed.contains(id) && !snapshot.adopted_payout_vtxos.contains(id),
-					"released input still belongs to another local operation or payout");
-				if stored.state == (VtxoState::Locked { holder: None }) {
-					ensure!(self.inner.db.retire_vtxo_lock(*id, None).await?,
-						"released input acquired another holder");
-				}
-				snapshot.awaiting_settlement.remove(id);
-				existing.push(*id);
+		// Retire only the exact authenticated participation's originals. No
+		// inferred ancestry or fallback snapshot can release another holder.
+		for id in &input_ids {
+			let Some(stored) = self.inner.db.get_wallet_vtxo(*id).await? else { continue; };
+			ensure!(!self.inner.db.get_fallback_receipts().await?.iter().any(|r| r.vtxo_id == *id),
+				"released input has a committed fallback claim");
+			match stored.state {
+				VtxoState::Locked { holder: None } => {
+					ensure!(self.inner.db.retire_vtxo_lock(*id, None).await?, "released input acquired another holder");
+				},
+				VtxoState::Spendable | VtxoState::Spent => {
+					self.inner.db.update_vtxo_state_checked(*id, VtxoState::Spent,
+						&[VtxoStateKind::Spendable, VtxoStateKind::Spent]).await?;
+				},
+				_ => bail!("released input still belongs to another operation"),
 			}
-			self.inner.db.store_fallback_snapshot(&snapshot).await?;
-			self.inner.db.update_vtxo_states_checked(&existing, VtxoState::Spent,
-				&[VtxoStateKind::Spendable, VtxoStateKind::Spent]).await?;
 		}
 		for output in &outputs { self.inner.db.update_vtxo_witnesses(output).await?; }
 		Ok(outputs.into_iter().find(|output| output.id() == candidate.id()).expect("checked above"))
@@ -2521,6 +2540,9 @@ impl Wallet {
 		let resp = match srv.client.round_participation_status(
 			protos::RoundParticipationStatusRequest {
 				unlock_hash: unlock_hash.to_byte_array().to_vec(),
+				attestation: RoundParticipationStatusAttestation::new(
+					unlock_hash, &self.mailbox_keypair(),
+				).serialize(),
 			},
 		).await {
 			Ok(resp) => resp.into_inner(),

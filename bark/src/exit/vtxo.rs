@@ -14,7 +14,7 @@ use log::{debug, trace};
 
 use ark::{Vtxo, VtxoId};
 use ark::vtxo::{Bare, Full};
-use bitcoin_ext::BlockHeight;
+use bitcoin_ext::{BlockHeight, TxStatus};
 
 use crate::exit::models::{ExitError, ExitState};
 use crate::exit::progress::{ExitStateProgress, ProgressContext, ProgressStep};
@@ -163,6 +163,13 @@ impl ExitVtxo {
 		}
 
 		let vtxo = self.get_vtxo(&*wallet.inner.db).await?;
+		let receipts = wallet.inner.db.get_fallback_receipts().await
+			.map_err(|error| ExitError::InvalidWalletState { error: error.to_string() })?;
+		let observe_only = crate::exit::fallback_blocks_abortable_exit(&self.state, self.id(), &receipts)
+			&& vtxo.state.kind() != crate::vtxo::VtxoStateKind::Spent;
+		if observe_only && matches!(tx_manager.sync_exit_tx(vtxo.point().txid).await?, TxStatus::NotFound) {
+			return Err(ExitError::InvalidWalletState { error: "a committed fallback source cannot progress an abortable exit".into() });
+		}
 		const MAX_ITERATIONS: usize = 100;
 		for _ in 0..MAX_ITERATIONS {
 			let mut context = ProgressContext {
@@ -170,6 +177,7 @@ impl ExitVtxo {
 				exit_txids: self.txids.as_ref().unwrap(),
 				wallet,
 				tx_manager,
+				allow_broadcast: !observe_only,
 			};
 			// Attempt to move to the next state, which may or may not generate a new state
 			if log::log_enabled!(log::Level::Trace) {

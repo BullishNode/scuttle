@@ -1,15 +1,16 @@
 //! Short durable allocation commits for independently ready, same-expiry outputs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
-use bitcoin::{Amount, Network, ScriptBuf, Transaction, TxIn, TxOut, Sequence, Witness};
+use bitcoin::{Amount, ScriptBuf, Transaction, TxIn, TxOut, Sequence, Witness};
 use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
-use bitcoin::secp256k1::{Keypair, PublicKey};
+use bitcoin::secp256k1::PublicKey;
 use chrono::{DateTime, Local};
 
-use ark::ServerVtxo;
+use ark::{ServerVtxo, VtxoId};
+use bitcoin_ext::{BlockDelta, BlockHeight};
 
 use super::expiry_chain::ExpiryViewToken;
 use super::expiry_inventory::{BackingPartitionResidual, BackingSnapshot, BackingSnapshotLimits};
@@ -18,14 +19,32 @@ use super::expiry_payout::MAX_PAYOUT_VSIZE;
 use super::Tx;
 use crate::watchman::settlement::{allocate, CustomerLeaf};
 
+#[derive(Clone)]
 pub struct VerifiedPayee {
 	pub mailbox: PublicKey,
 	pub script: ScriptBuf,
 }
 
+#[derive(Clone)]
 pub struct ReadyCoin {
 	pub ownership: OwnershipProposal,
 	pub payee: Option<VerifiedPayee>,
+}
+
+/// A proven ready customer terminal from this finite preparation pass. It
+/// is only an aggregation hint: allocation still revalidates every decision.
+/// Fields are private so a raw historical/unknown row cannot become a hint.
+pub struct DustCandidate {
+	root: VtxoId,
+	root_updated_at: DateTime<Local>,
+	expiry: BlockHeight,
+	coin: ReadyCoin,
+}
+
+const DUST_AGGREGATION_BLOCKS: BlockDelta = BlockDelta::new(144);
+
+fn dust_aggregation_open(expiry: BlockHeight, processed: BlockHeight) -> bool {
+	processed < expiry + DUST_AGGREGATION_BLOCKS
 }
 
 pub struct ReadyOutput {
@@ -67,6 +86,21 @@ impl ReadyOutput {
 
 	pub fn root(&self) -> &ServerVtxo { &self.snapshot.roots[0] }
 
+	pub(crate) fn source_ids(&self) -> Vec<VtxoId> {
+		let mut ids = self.snapshot.regular.iter().map(|fact| fact.state.vtxo_id).collect::<Vec<_>>();
+		ids.sort_unstable(); ids.dedup();
+		ids
+	}
+
+	pub fn dust_candidates(&self) -> Vec<DustCandidate> {
+		let root = self.snapshot.regular.iter().find(|fact| fact.state.vtxo_id == self.root().id())
+			.expect("proven readiness includes its physical root");
+		self.coins.iter().filter(|coin| coin.payee.is_some()).map(|coin| DustCandidate {
+			root: self.root().id(), root_updated_at: root.state.updated_at,
+			expiry: self.root().expiry_height(), coin: coin.clone(),
+		}).collect()
+	}
+
 	/// No geometric cut supplied by an external caller can bypass the
 	/// partition proof. Signature and settlement proof require separate checks.
 	pub fn prove(
@@ -107,6 +141,8 @@ pub struct CommittedExpiryGroup {
 	pub id: i64,
 	pub inputs: usize,
 	pub dropped: usize,
+	/// Extend pass-wide inclusion only after this transaction commits.
+	pub included: Vec<VtxoId>,
 }
 
 fn evidence_json(evidence: &OwnershipEvidence, preimage: bool) -> serde_json::Value {
@@ -152,8 +188,8 @@ impl Tx<'_> {
 		&self,
 		view: ExpiryViewToken,
 		outputs: Vec<ReadyOutput>,
-		network: Network,
-		server_mailbox_key: &Keypair,
+		frontier: &[DustCandidate],
+		pass_included: &BTreeSet<VtxoId>,
 	) -> anyhow::Result<Option<CommittedExpiryGroup>> {
 		if outputs.is_empty() { return Ok(None); }
 		ensure!(ReadyOutput::group_fits(&outputs.iter().collect::<Vec<_>>())?, "expiry group exceeds version-3 sweep size");
@@ -163,8 +199,7 @@ impl Tx<'_> {
 		// Serialize fee history at this height before locking source rows.
 		// Two-integer advisory keys are separate from the upstream lock keys.
 		self.execute("SELECT pg_advisory_xact_lock($1,$2)", &[&5_i32, &i32::try_from(expiry.to_u32())?]).await?;
-		ensure!(outputs.iter().all(|o| o.root().expiry_height() <= view.captaind.height
-			&& o.root().expiry_height() <= view.watchmand.height), "expiry group is not mature in the completed view");
+		ensure!(outputs.iter().all(|o| o.root().expiry_height() <= view.processed.height), "expiry group is not mature in the completed view");
 		let mut ids = outputs.iter().flat_map(|o| o.snapshot.regular.iter().map(|f| f.state.vtxo_id.to_string())).collect::<Vec<_>>();
 		let participations = outputs.iter().flat_map(|o| o.coins.iter().flat_map(|c| c.ownership.cancellations.iter().copied())).collect::<Vec<_>>();
 		if !participations.is_empty() {
@@ -216,12 +251,12 @@ impl Tx<'_> {
 				let funding = output.funding.iter().find(|t| t.compute_txid() == fact.state.vtxo.chain_anchor().txid)
 					.context("ready coin funding disappeared")?;
 				let current = self.propose_expiry_ownership(
-					fact, funding, view.captaind.height, Some(view.watchmand.height),
+					fact, funding, view.processed.height, Some(view.processed.height),
 				).await?;
 				valid &= current.disposition == coin.ownership.disposition && current.evidence == coin.ownership.evidence
 					&& current.has_stored_preimage == coin.ownership.has_stored_preimage
 					&& current.cancellations == coin.ownership.cancellations;
-				valid &= self.revalidate_expiry_payee(coin, network, server_mailbox_key).await?;
+				valid &= self.revalidate_expiry_payee(coin).await?;
 
 				if let Some(row) = self.query_opt("
 					SELECT e.id,e.gross_sat,
@@ -245,9 +280,12 @@ impl Tx<'_> {
 
 			if valid {
 				let cancellations = output.coins.iter().flat_map(|c| c.ownership.cancellations.iter().copied()).collect::<Vec<_>>();
-				valid = self.cancel_expiry_participations(&cancellations).await?;
+				valid = self.can_cancel_expiry_participations(&cancellations).await?;
 			}
-			if valid { accepted.push(output); } else { dropped += 1; }
+			if valid { accepted.push(output); } else {
+				for coin in &output.coins { self.record_expiry_hold(coin.ownership.id, "decision_revalidation_changed").await?; }
+				dropped += 1;
+			}
 		}
 		if accepted.is_empty() { return Ok(None); }
 		let leaves = accepted.iter().flat_map(|o| &o.coins).filter_map(|c| c.payee.as_ref().map(|payee| CustomerLeaf {
@@ -266,40 +304,31 @@ impl Tx<'_> {
 			)))
 		}).collect::<anyhow::Result<BTreeMap<_, _>>>()?;
 		let mut plan = allocate(leaves, &paid)?;
-		if !plan.forfeits.is_empty() {
-			let anchors = accepted.iter().map(|o| o.root().chain_anchor().to_string()).collect::<Vec<_>>();
-			let included = accepted.iter().flat_map(|o| o.coins.iter().map(|c| c.ownership.id.to_string()))
-				.collect::<Vec<_>>();
-			// Follow only the current branch. Historical successors below a
-			// round or offboard do not create another payout obligation.
-			let undecided = self.query("
-				WITH RECURSIVE current_coin AS (
-					SELECT vtxo_id,anchor_point,oor_spent_txid,spent_in_round,offboarded_in
-					FROM vtxo WHERE vtxo_id=ANY($1) AND expiry=$2
-					UNION
-					SELECT v.vtxo_id,v.anchor_point,v.oor_spent_txid,v.spent_in_round,v.offboarded_in
-					FROM vtxo v JOIN current_coin p ON v.vtxo_txid=p.oor_spent_txid
-					WHERE p.spent_in_round IS NULL AND p.offboarded_in IS NULL
-				)
-				SELECT DISTINCT v.anchor_point FROM current_coin k JOIN vtxo v USING(vtxo_id)
-				WHERE (k.oor_spent_txid IS NULL OR k.spent_in_round IS NOT NULL OR k.offboarded_in IS NOT NULL)
-					AND v.onchain_spent_height IS NULL AND v.onchain_spent_txid IS NULL
-					AND NOT(v.vtxo_id=ANY($3))
-					AND NOT EXISTS(SELECT 1 FROM expiry_entitlement e
-						WHERE e.vtxo_id=v.vtxo_id AND (
-							EXISTS(SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation a ON a.id=c.allocation_id
-								WHERE c.entitlement_id=e.id AND ((c.active AND a.status<>'conflicted') OR a.status='confirmed'))
-							OR EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id)))
-			", &[&anchors, &i32::try_from(expiry.to_u32())?, &included]).await?
-				.into_iter().map(|r| r.get::<_, String>("anchor_point")).collect::<Vec<_>>();
+		if !plan.forfeits.is_empty() && dust_aggregation_open(expiry, view.processed.height) {
 			loop {
 				let count = accepted.len();
+				let mut held = Vec::new();
+				let included = pass_included.iter().copied().chain(accepted.iter()
+					.flat_map(|o| o.coins.iter().map(|c| c.ownership.id))).collect::<BTreeSet<_>>();
+				let scripts = accepted.iter().flat_map(|o| &o.coins)
+					.filter(|coin| plan.forfeits.iter().any(|f| f.id == coin.ownership.id))
+					.filter_map(|coin| coin.payee.as_ref().map(|payee| payee.script.clone())).collect::<BTreeSet<_>>();
+				let mut undecided = BTreeSet::new();
+				for script in scripts {
+					if self.has_decidable_dust_sibling(view, expiry, &script, frontier, &included).await? {
+						undecided.insert(script);
+					}
+				}
 				accepted.retain(|o| {
-					let hold = undecided.contains(&o.root().chain_anchor().to_string())
-						&& o.coins.iter().any(|c| plan.forfeits.iter().any(|f| f.id == c.ownership.id));
-					if hold { dropped += 1; }
+					let hold = o.coins.iter().any(|c| c.payee.as_ref().is_some_and(|payee|
+						undecided.contains(&payee.script)) && plan.forfeits.iter().any(|f| f.id == c.ownership.id));
+					if hold {
+						dropped += 1;
+						held.extend(o.coins.iter().map(|coin| coin.ownership.id));
+					}
 					!hold
 				});
+				for id in held { self.record_expiry_hold(id, "dust_aggregation_pending").await?; }
 				if accepted.is_empty() { return Ok(None); }
 				if accepted.len() == count { break; }
 				let leaves = accepted.iter().flat_map(|o| &o.coins).filter_map(|c| c.payee.as_ref().map(|p| CustomerLeaf {
@@ -307,6 +336,13 @@ impl Tx<'_> {
 				})).collect();
 				plan = allocate(leaves, &paid)?;
 			}
+		}
+		// Final selection precedes every cancellation effect. All candidate
+		// inputs/participations were locked and checked without writes above;
+		// an unexpected change now rolls back the entire decision transaction.
+		for output in &accepted {
+			let cancellations = output.coins.iter().flat_map(|c| c.ownership.cancellations.iter().copied()).collect::<Vec<_>>();
+			ensure!(self.cancel_expiry_participations(&cancellations).await?, "selected expiry cancellation changed under its locks");
 		}
 		let policy = plan.forfeits.iter().chain(plan.recipients.iter().flat_map(|r| &r.leaves))
 			.map(|a| (a.id,a)).collect::<BTreeMap<_, _>>();
@@ -318,6 +354,7 @@ impl Tx<'_> {
 		}
 		for output in &accepted {
 			self.execute("INSERT INTO expiry_allocation_input(allocation_id,vtxo_id) VALUES($1,$2)", &[&id,&output.root().id().to_string()]).await?;
+			self.clear_expiry_hold(output.root().id()).await?;
 			for coin in &output.coins {
 				let proposal = &coin.ownership;
 				let evidence = proposal.evidence.as_ref().context("ready ownership lacks evidence")?;
@@ -380,15 +417,47 @@ impl Tx<'_> {
 						&observed.to_string()
 					]).await?;
 				self.execute("UPDATE vtxo SET spend_state='spent',updated_at=NOW() WHERE vtxo_id=$1", &[&proposal.id.to_string()]).await?;
+				self.clear_expiry_hold(proposal.id).await?;
 			}
 		}
 		let inputs = accepted.len();
-		Ok(Some(CommittedExpiryGroup { id, inputs, dropped }))
+		let included = accepted.iter().flat_map(|output| output.coins.iter().map(|coin| coin.ownership.id)).collect();
+		Ok(Some(CommittedExpiryGroup { id, inputs, dropped, included }))
 	}
 
-	async fn revalidate_expiry_payee(&self, coin: &ReadyCoin, network: Network, server_mailbox_key: &Keypair) -> anyhow::Result<bool> {
-		let OwnershipDisposition::Customer { user_pubkey, .. } = &coin.ownership.disposition else { return Ok(coin.payee.is_none()); };
-		let current = self.expiry_owner(*user_pubkey, network, server_mailbox_key).await?;
+	/// Only a same-script customer that was actually ready in this pass can
+	/// delay dust. Exposed leaves, unresolved siblings, historical descendants
+	/// and already committed groups are not aggregation opportunities.
+	async fn has_decidable_dust_sibling(
+		&self, view: ExpiryViewToken, expiry: BlockHeight, script: &ScriptBuf,
+		frontier: &[DustCandidate], included: &BTreeSet<VtxoId>,
+	) -> anyhow::Result<bool> {
+		let tip = i32::try_from(view.processed.height.to_u32())?;
+		for candidate in frontier {
+			let coin = &candidate.coin;
+			if candidate.expiry != expiry || included.contains(&coin.ownership.id)
+				|| !coin.payee.as_ref().is_some_and(|payee| payee.script == *script) { continue; }
+			let current = self.query_opt("SELECT v.vtxo_id FROM vtxo v JOIN vtxo r ON r.vtxo_id=$2 \
+				WHERE v.vtxo_id=$1 AND v.updated_at=$3 AND v.spend_state::TEXT=$4 AND r.updated_at=$5 \
+				AND r.frontier_at IS NOT NULL AND r.confirmed_height<=$6 \
+				AND v.onchain_spent_height IS NULL AND v.onchain_spent_txid IS NULL \
+				AND r.onchain_spent_height IS NULL AND r.onchain_spent_txid IS NULL \
+				AND NOT EXISTS(SELECT 1 FROM expiry_allocation_input i JOIN expiry_allocation a ON a.id=i.allocation_id \
+					WHERE i.vtxo_id=r.vtxo_id AND a.status<>'conflicted') \
+				AND NOT EXISTS(SELECT 1 FROM expiry_entitlement e WHERE e.vtxo_id=v.vtxo_id AND ( \
+					EXISTS(SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation a ON a.id=c.allocation_id \
+						WHERE c.entitlement_id=e.id AND ((c.active AND a.status<>'conflicted') OR a.status='confirmed')) \
+					OR EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id)))",
+				&[&coin.ownership.id.to_string(), &candidate.root.to_string(), &coin.ownership.updated_at,
+					&coin.ownership.spend_state.as_str(), &candidate.root_updated_at, &tip]).await?;
+			if current.is_some() && self.revalidate_expiry_payee(coin).await? { return Ok(true); }
+		}
+		Ok(false)
+	}
+
+	async fn revalidate_expiry_payee(&self, coin: &ReadyCoin) -> anyhow::Result<bool> {
+		let OwnershipDisposition::Customer { .. } = &coin.ownership.disposition else { return Ok(coin.payee.is_none()); };
+		let current = self.derived_expiry_owner(&coin.ownership).await?;
 		Ok(match (&coin.payee,current) {
 			(Some(payee),super::expiry_attribution::Attribution::Owned { mailbox_pk,spk }) =>
 				mailbox_pk == payee.mailbox && spk == payee.script,

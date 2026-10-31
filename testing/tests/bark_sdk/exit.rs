@@ -16,86 +16,6 @@ use ark_testing::util::FutureExt;
 
 // Check every allocation generation and root descendant, including spent payouts.
 // These fallback-only cases separately reject terminal user claims.
-async fn assert_payouts_once(
-	ctx: &TestContext,
-	db: &server::database::Db,
-	anchor: bitcoin::OutPoint,
-	expected: &std::collections::BTreeMap<String, (bitcoin::Amount, bitcoin::ScriptBuf, String, String)>,
-	paid_points: &std::collections::BTreeMap<bitcoin::ScriptBuf, (bitcoin::OutPoint, bitcoin::Amount)>,
-	source_path: &std::collections::BTreeSet<bitcoin::OutPoint>,
-	operator_script: &bitcoin::ScriptBuf,
-	first_height: u64,
-) {
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.owner_mailbox,c.user_pubkey,c.spk,c.disposition, \
-		c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid,a.confirmed_height,a.confirmed_hash,a.sweep_tx \
-		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		JOIN vtxo v ON v.vtxo_id=e.vtxo_id JOIN expiry_allocation a ON a.id=c.allocation_id \
-		WHERE v.anchor_point=$1", &[&anchor.to_string()],
-	).await?)).await.unwrap();
-	let mut canonical_coins = std::collections::BTreeSet::new();
-	let mut parents = std::collections::BTreeMap::new();
-	for row in rows {
-		let Some(bytes) = row.get::<_, Option<Vec<u8>>>("sweep_tx") else { continue; };
-		let signed = bitcoin::consensus::deserialize::<bitcoin::Transaction>(&bytes).unwrap();
-		let txid = signed.compute_txid();
-		let Some(info) = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(txid, None).unwrap() else { continue; };
-		if info.confirmations.unwrap_or(0) == 0 { continue; }
-		assert!(info.confirmations.unwrap() >= 6);
-		assert_eq!(ctx.bitcoind().await_transaction(txid).await, signed);
-		let id = row.get::<_, String>("vtxo_id");
-		let (gross, script, mailbox, key) = expected.get(&id).expect("no other same-root owner may be paid");
-		assert!(canonical_coins.insert(id), "one canonical economic discharge per coin");
-		assert_eq!(row.get::<_, String>("disposition"), "customer");
-		assert_eq!(row.get::<_, Option<String>>("owner_mailbox").as_ref(), Some(mailbox));
-		assert_eq!(row.get::<_, Option<String>>("user_pubkey").as_ref(), Some(key));
-		assert_eq!(row.get::<_, Option<String>>("spk"), Some(script.to_hex_string()));
-		assert_eq!(row.get::<_, i64>("gross_sat"), gross.to_sat() as i64);
-		let fee = gross.to_sat().div_ceil(100).max(1_000);
-		assert_eq!(row.get::<_, i64>("fee_sat"), i64::try_from(fee).unwrap());
-		assert_eq!(row.get::<_, i64>("payout_sat"), i64::try_from(gross.to_sat() - fee).unwrap());
-		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
-		assert_eq!(row.get::<_, Option<String>>("sweep_txid"), Some(txid.to_string()));
-		let block = info.blockhash.unwrap();
-		assert_eq!(row.get::<_, Option<String>>("confirmed_hash"), Some(block.to_string()));
-		assert_eq!(row.get::<_, Option<i64>>("confirmed_height"),
-			Some(i64::try_from(ctx.bitcoind().sync_client().get_block_header_info(&block).unwrap().height).unwrap()));
-		parents.insert(txid, signed);
-	}
-	assert_eq!(canonical_coins, expected.keys().cloned().collect());
-	for signed in parents.values() {
-		assert!(signed.input.iter().all(|input| source_path.contains(&input.previous_output)),
-			"a payout parent must consume actual known backing, never a hidden donor input");
-		for output in &signed.output {
-			assert!(paid_points.contains_key(&output.script_pubkey) || output.script_pubkey == *operator_script
-				|| bitcoin_ext::TxOutExt::is_p2a_fee_anchor(output), "no unrecorded third-party payee");
-		}
-		let mut input_value = sat(0);
-		for input in &signed.input {
-			let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-			input_value += previous.output[input.previous_output.vout as usize].value;
-		}
-		assert_eq!(input_value, signed.output.iter().map(|output| output.value).sum::<bitcoin::Amount>(),
-			"the signed payout parent may not silently charge another miner fee");
-	}
-	let mut transactions = std::collections::BTreeMap::new();
-	let core = ctx.bitcoind().sync_client();
-	for height in first_height + 1..=core.get_block_count().unwrap() {
-		for transaction in core.get_block(&core.get_block_hash(height).unwrap()).unwrap().txdata {
-			transactions.insert(transaction.compute_txid(), transaction);
-		}
-	}
-	for txid in core.get_raw_mempool().unwrap() {
-		transactions.insert(txid, ctx.bitcoind().await_transaction(txid).await);
-	}
-	for (script, (point, net)) in paid_points {
-		let outputs = transactions.iter().flat_map(|(txid, transaction)| transaction.output.iter().enumerate()
-			.filter(|(_, output)| &output.script_pubkey == script)
-			.map(move |(index, output)| (bitcoin::OutPoint::new(*txid, index as u32), output.value)))
-			.collect::<std::collections::BTreeMap<_, _>>();
-		assert_eq!(outputs, std::collections::BTreeMap::from([(*point, *net)]),
-			"the whole post-setup chain and mempool must contain exactly one payout per registered owner");
-	}
-}
 
 fn chain_tip(ctx: &TestContext) -> BlockHeight {
 	let count = ctx.bitcoind().sync_client().get_block_count().expect("block count should succeed");
@@ -182,7 +102,7 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 
 	// Capture the registered owners before the absent-client interval.
 	let first_height = ctx.bitcoind().get_block_count().await;
-	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let operator_script = {
 		let config = wm.config();
 		config.sweep_address.clone().unwrap().require_network(config.network).unwrap().script_pubkey()
@@ -193,9 +113,9 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 		let full = owner.get_full_vtxo(id).await.unwrap();
 		source_path.extend(full.transactions().map(|step|
 			bitcoin::OutPoint::new(step.tx.compute_txid(), step.output_idx as u32)));
-		let destination = owner.fallback_destination().await.unwrap();
+		let destination = owner.fallback_script();
 		let key = owner.get_vtxo_key(id).await.unwrap();
-		assert!(expected.insert(id.to_string(), (gross, destination.spk,
+		assert!(expected.insert(id.to_string(), (gross, destination,
 			owner.mailbox_identifier().as_pubkey().to_string(), key.public_key().to_string())).is_none());
 	}
 	assert_eq!(expected.values().map(|entry| entry.0).sum::<bitcoin::Amount>(), sat(400_000));
@@ -243,10 +163,10 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 	assert!(matches!(shallow, Some(ExitState::Processing(_))),
 		"one-deep customer payout must not end the exit: {:?}", shallow);
 	wallet.sync_fallback_payouts().await.unwrap();
-	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Spendable);
+	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Locked { holder: None });
 	assert!(wallet.awaiting_settlement_vtxos().await.unwrap().contains(&vtxo));
-	let registered = wallet.fallback_destination().await.unwrap();
-	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered.spk).unwrap() as u32;
+	let registered = wallet.fallback_script();
+	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered).unwrap() as u32;
 	assert!(wallet.verify_fallback_output(bitcoin::OutPoint::new(parent.compute_txid(), payout_index)).await.is_err(),
 		"one confirmation cannot discharge the registered payout");
 
@@ -319,7 +239,11 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 		assert!(owner.vtxos().await.unwrap().is_empty());
 		assert!(!owner.awaiting_settlement_vtxos().await.unwrap().contains(&id));
 		let before_refresh = owner.history().await.unwrap();
-		assert!(before_refresh.iter().all(|movement| movement.subsystem.name != "abandon.fallback_payout"));
+		let receipts = before_refresh.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback").collect::<Vec<_>>();
+		assert_eq!(receipts.len(), 1);
+		assert_eq!(receipts[0].status, bark::movement::MovementStatus::Successful);
+		assert_eq!(receipts[0].effective_balance.to_sat(), -(gross.to_sat() as i64));
+		assert_eq!(receipts[0].offchain_fee, fee);
 
 		assert!(owner.refresh_vtxos([id]).await.unwrap().is_none(), "paid principal must not enter another round");
 		owner.sync_fallback_payouts().await.unwrap();
@@ -337,9 +261,9 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 	async {
 		loop {
 			let rebuilt = db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == final_height && view.captaind.hash == final_hash
-					&& view.watchmand == view.captaind && tx.query_one("SELECT COALESCE(NOT invalid AND generation=$1 AND rebuilt_captaind_height=$2 AND rebuilt_captaind_hash=$3 AND rebuilt_watchmand_height=$4 AND rebuilt_watchmand_hash=$5,FALSE) AS rebuilt FROM expiry_chain_view WHERE id=1", &[&view.generation,&i64::from(view.captaind.height),&view.captaind.hash.to_string(),&i64::from(view.watchmand.height),&view.watchmand.hash.to_string()]).await?.get::<_,bool>("rebuilt"))
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == final_height && view.processed.hash == final_hash
+					&& tx.expiry_view_is_current(view).await?)
 			}).await.unwrap();
 			if rebuilt { break; }
 			tokio::time::sleep(Duration::from_millis(100)).await;
@@ -413,7 +337,7 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 
 	// Capture the registered owners before the absent-client interval.
 	let first_height = ctx.bitcoind().get_block_count().await;
-	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let operator_script = {
 		let config = wm.config();
 		config.sweep_address.clone().unwrap().require_network(config.network).unwrap().script_pubkey()
@@ -424,9 +348,9 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 		let full = owner.get_full_vtxo(id).await.unwrap();
 		source_path.extend(full.transactions().map(|step|
 			bitcoin::OutPoint::new(step.tx.compute_txid(), step.output_idx as u32)));
-		let destination = owner.fallback_destination().await.unwrap();
+		let destination = owner.fallback_script();
 		let key = owner.get_vtxo_key(id).await.unwrap();
-		assert!(expected.insert(id.to_string(), (gross, destination.spk,
+		assert!(expected.insert(id.to_string(), (gross, destination,
 			owner.mailbox_identifier().as_pubkey().to_string(), key.public_key().to_string())).is_none());
 	}
 	assert_eq!(expected.values().map(|entry| entry.0).sum::<bitcoin::Amount>(), sat(400_000));
@@ -503,10 +427,10 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 	assert!(matches!(shallow, Some(ExitState::Processing(_))),
 		"one-deep customer payout must not end the exit: {:?}", shallow);
 	receiver.sync_fallback_payouts().await.unwrap();
-	assert_eq!(receiver.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Spendable);
+	assert_eq!(receiver.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Locked { holder: None });
 	assert!(receiver.awaiting_settlement_vtxos().await.unwrap().contains(&vtxo));
-	let registered = receiver.fallback_destination().await.unwrap();
-	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered.spk).unwrap() as u32;
+	let registered = receiver.fallback_script();
+	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered).unwrap() as u32;
 	assert!(receiver.verify_fallback_output(bitcoin::OutPoint::new(parent.compute_txid(), payout_index)).await.is_err(),
 		"one confirmation cannot discharge the registered payout");
 
@@ -579,7 +503,11 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 		assert!(owner.vtxos().await.unwrap().is_empty());
 		assert!(!owner.awaiting_settlement_vtxos().await.unwrap().contains(&id));
 		let before_refresh = owner.history().await.unwrap();
-		assert!(before_refresh.iter().all(|movement| movement.subsystem.name != "abandon.fallback_payout"));
+		let receipts = before_refresh.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback").collect::<Vec<_>>();
+		assert_eq!(receipts.len(), 1);
+		assert_eq!(receipts[0].status, bark::movement::MovementStatus::Successful);
+		assert_eq!(receipts[0].effective_balance.to_sat(), -(gross.to_sat() as i64));
+		assert_eq!(receipts[0].offchain_fee, fee);
 
 		assert!(owner.refresh_vtxos([id]).await.unwrap().is_none(), "paid principal must not enter another round");
 		owner.sync_fallback_payouts().await.unwrap();
@@ -597,9 +525,9 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 	async {
 		loop {
 			let rebuilt = db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == final_height && view.captaind.hash == final_hash
-					&& view.watchmand == view.captaind && tx.query_one("SELECT COALESCE(NOT invalid AND generation=$1 AND rebuilt_captaind_height=$2 AND rebuilt_captaind_hash=$3 AND rebuilt_watchmand_height=$4 AND rebuilt_watchmand_hash=$5,FALSE) AS rebuilt FROM expiry_chain_view WHERE id=1", &[&view.generation,&i64::from(view.captaind.height),&view.captaind.hash.to_string(),&i64::from(view.watchmand.height),&view.watchmand.hash.to_string()]).await?.get::<_,bool>("rebuilt"))
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == final_height && view.processed.hash == final_hash
+					&& tx.expiry_view_is_current(view).await?)
 			}).await.unwrap();
 			if rebuilt { break; }
 			tokio::time::sleep(Duration::from_millis(100)).await;
@@ -676,3 +604,5 @@ async fn finished_exit_does_not_change_on_sync() {
 		}
 	}
 }
+
+include!("../scuttle/bark_sdk/exit_fallback.rs");

@@ -33,7 +33,6 @@ mod intman;
 pub mod ln;
 pub mod nursery;
 mod offboards;
-mod expiry_readiness;
 pub mod owner_proof;
 pub mod recovery;
 mod round;
@@ -47,7 +46,7 @@ use crate::database::htlc_vtxo::{self, HtlcDirection};
 use crate::database::tree::VtxoTreeUpdate;
 pub use crate::intman::{CAPTAIND_API_KEY, CAPTAIND_CLI_API_KEY};
 pub use crate::config::Config;
-pub use crate::error::OwnershipRefusal;
+pub use crate::error::{FallbackRefusal, OwnershipRefusal};
 pub use bark_common::{fs_perms, secret};
 
 use std::collections::HashSet;
@@ -260,7 +259,7 @@ impl Server {
 		fs::create_dir_all(&cfg.data_dir).context("can't create dir")?;
 		fs_perms::harden(&cfg.data_dir, 0o700)?;
 
-		let db = database::Db::create(&cfg.postgres).await?;
+		let db = database::Db::create(&cfg.postgres, cfg.network).await?;
 
 		// Initiate key material.
 		let seed = {
@@ -361,7 +360,7 @@ impl Server {
 		info!("Starting server at {}", cfg.data_dir.display());
 
 		info!("Connecting to db at {}:{}", cfg.postgres.host, cfg.postgres.port);
-		let db = database::Db::connect(&cfg.postgres)
+		let db = database::Db::connect(&cfg.postgres, cfg.network)
 			.await
 			.context("failed to connect to db")?;
 
@@ -423,9 +422,6 @@ impl Server {
 		// Captaind is the only process broadcasting via the nursery, so it
 		// also runs the follow-up.
 		listeners.push(Box::new(tx_nursery.clone()));
-		listeners.push(Box::new(database::expiry_chain::ExpiryChainListener::start(
-			db.clone(), BlockTable::Captaind,
-		).await?));
 
 		let sync_manager = Arc::new(SyncManager::start(
 			rtmgr.clone(),
@@ -479,9 +475,7 @@ impl Server {
 			forfeit_nonces: parking_lot::Mutex::new(TimedEntryMap::new()),
 			vtxos_in_flux: VtxosInFlux::new(),
 			payment_guards,
-			xpub_recovery_queue: tokio::sync::Semaphore::new(
-				cfg.max_concurrent_xpub_recoveries.saturating_add(recovery::XPUB_RECOVERY_QUEUE_SIZE),
-			),
+			xpub_recovery_queue: tokio::sync::Semaphore::new(recovery::XPUB_RECOVERY_QUEUE_SIZE),
 			xpub_recovery_permits: tokio::sync::Semaphore::new(cfg.max_concurrent_xpub_recoveries),
 			config: cfg.clone(),
 			db,
@@ -519,7 +513,6 @@ impl Server {
 		srv.lightning_manager.spawn_hold_settler(srv.clone(), settlement_stream);
 
 		srv.clone().start_offboard_retry_task().await;
-		srv.clone().start_expiry_readiness();
 
 		let srv2 = srv.clone();
 		tokio::spawn(async move {
@@ -759,6 +752,15 @@ impl Server {
 		self.db.write(async |t| owner_links.verify(t, [user_pubkey],
 			self.mailbox_key.leak_ref(), self.config.network).await).await?;
 
+		// Fees and the exit delta can change, so bind the output to one exit
+		// before signing, or two signed exits could spend it.
+		let spk = builder.funding_script_pubkey();
+		let exit_txid = builder.exit_txid();
+		let bound = self.db.write(async |t| t.bind_board_exit(utxo, &spk, exit_txid).await).await?;
+		if bound != exit_txid {
+			return badarg!("board utxo {} is already cosigned for another exit tx", utxo);
+		}
+
 		info!("Cosigning board request for utxo {}", utxo);
 		let resp = builder.server_cosign(self.server_key.leak_ref());
 
@@ -839,13 +841,28 @@ impl Server {
 		// inserted-row count returned by execute_vtxo_tree_update, which makes
 		// the fresh-vs-retry decision atomic with the write rather than
 		// depending on a separate racy pre-read.
+		// The funding root is already spent by the signed board exit. Insert it
+		// in that state, rather than transiently classifying the server-only
+		// Expiry policy as a customer birth at the deferred ownership trigger.
+		let (roots, leaves): (Vec<_>, Vec<_>) = builder.build_server_vtxos().into_iter()
+			.partition(|output| output.id() == VtxoId::from(vtxo.chain_anchor()));
 		let update = VtxoTreeUpdate::new()
 			.upsert_funding_tx(&funding_tx)
 			.upsert_unsigned_tx([builder.exit_txid()])
-			.insert_spendable_vtxos(builder.build_server_vtxos())
+			.insert_oor_spent_vtxos(roots.into_iter().map(|root| (root, builder.exit_txid())))
+			.insert_spendable_vtxos(leaves)
 			.mark_vtxos_oor_spent(builder.spend_info());
+		let spk = builder.funding_script_pubkey();
+		let exit_txid = builder.exit_txid();
 		let inserted = self.db.write(async |t| {
-			let inserted = t.execute_vtxo_tree_update(update, Some((self.config.network, self.mailbox_key.leak_ref()))).await?;
+			// also binds boards cosigned before outputs were bound on cosign
+			let bound = t.bind_board_exit(vtxo.chain_anchor(), &spk, exit_txid).await?;
+			if bound != exit_txid {
+				return badarg!("board utxo {} is already registered with another exit tx",
+					vtxo.chain_anchor(),
+				);
+			}
+			let inserted = t.execute_vtxo_tree_update(update).await?;
 			t.add_funding_vtxos_to_frontier(funding_txid, Some(confirmed_height)).await
 				.context("failed to add board vtxos to frontier")?;
 			Ok(inserted)
@@ -1025,7 +1042,7 @@ impl Server {
 			.provide_signatures(vtxos)
 			.mark_vtxos_registered(registered_ids);
 		self.db.write(async |t| {
-			t.execute_vtxo_tree_update(update, None).await?;
+			t.execute_vtxo_tree_update(update).await?;
 			htlc_vtxo::create_htlc_vtxos(&t, &htlc_sends, HtlcDirection::Incoming).await?;
 			Ok(())
 		}).await?;

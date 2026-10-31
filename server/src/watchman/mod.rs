@@ -12,6 +12,7 @@ mod frontier;
 mod policy;
 mod payout;
 mod recovery;
+pub(crate) mod readiness;
 mod signer;
 pub(crate) mod settlement;
 
@@ -160,6 +161,8 @@ pub struct Watchman {
 	///
 	/// Includes claims, progress txs, and foreign spends (e.g. user exits).
 	mempool_spends: parking_lot::RwLock<HashMap<VtxoId, MempoolSpend>>,
+	/// Finite expiry inventory cursor, owned by this single engine.
+	expiry_cursor: tokio::sync::Mutex<i64>,
 }
 
 impl Watchman {
@@ -187,6 +190,7 @@ impl Watchman {
 			frontier,
 			sync_height,
 			mempool_spends: parking_lot::RwLock::new(HashMap::new()),
+			expiry_cursor: tokio::sync::Mutex::new(0),
 		}
 	}
 
@@ -216,21 +220,11 @@ impl Watchman {
 
 		let mut reaction_timer = tokio::time::interval(self.config.reaction_interval);
 		let mut sweep_timer = tokio::time::interval(self.config.sweep_interval);
-		// A sweep's first tick can precede the second daemon's sync ack.
-		// Readiness also needs a fresh rebuilt token after later blocks or
-		// ledger commits, independently of the configured financial sweep.
-		let mut rebuild_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+		let mut completed = self.sync_height.clone();
 		loop {
 			tokio::select! {
-				_ = rebuild_timer.tick() => {
-					// Probe the exact completed view. Rebuild only when it changed;
-					// the financial sweep still reconstructs before publication.
-					if let Err(error) = self.refresh_expiry_readiness().await {
-						warn!("Error rebuilding expiry readiness: {error:#}");
-					}
-					// The same loop serializes this with sweeps; reset coalesces
-					// slow work instead of accumulating missed timer bursts.
-					rebuild_timer.reset();
+				Ok(()) = completed.changed() => {
+					self.process_sweeps_logged().await;
 				},
 				_ = reaction_timer.tick() => {
 					self.process_reactions_logged().await;
@@ -402,10 +396,6 @@ impl Watchman {
 	/// Sweeps have no deadline, so this runs on the much longer
 	/// [Config::sweep_interval].
 	pub async fn process_sweeps(&self) -> anyhow::Result<()> {
-		// Expired customer backing never reaches upstream's drain-only claim
-		// builder. Only committed financial groups can authorize these spends.
-		let Some(view) = self.rebuild_expiry_state().await? else { return Ok(()); };
-		self.process_expiry_payouts(view).await?;
 		// Confiscated OffboardForfeit outputs are exclusively server-owned.
 		// Their Bare encoding needs no customer genesis or payout allocation.
 		// Use the original native claim: its miner fee comes from operator
@@ -436,26 +426,42 @@ impl Watchman {
 			}
 		}
 		if !claims.is_empty() { self.process_claims(claims).await?; }
+		// Operator-only claims above do not depend on customer view readiness.
+		let Some(view) = self.db.read(async |t| t.expiry_view().await).await? else { return Ok(()); };
+		view.verify(&self.bitcoind).await?;
+		{
+			let mut cursor = self.expiry_cursor.lock().await;
+			*cursor = self.expiry_readiness_pass(view, *cursor).await?;
+		}
+		crate::telemetry::set_expiry_hold_count(self.db.read(async |t| t.expiry_hold_count().await).await?);
+		// Expired customer backing never reaches upstream's drain-only builder.
+		self.process_expiry_payouts(view).await?;
 		let splits = self.db.read(async |t| t.pending_expiry_splits().await).await?;
 		for (txid, root) in splits {
 			view.verify(&self.bitcoind).await?;
 			let ids = [root.id()];
-			// Match the fee-payout path's wallet -> view -> coin lock order.
-			// A reorg invalidation waiting on the view cannot invert it.
-			let mut wallet = self.watchman_wallet.lock().await;
-			if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
-				warn!(vtxo_id = %root.id(), "Expiry splitting needs confirmed usable watchman funds");
-				continue;
-			}
 			let mut fee_rate = self.fee_estimator.regular();
 			self.update_mempool_spend(root.id()).await;
 			if let Some(spend) = self.get_mempool_spend(root.id()) {
+				if spend.txid != txid {
+					warn!(vtxo_id = %root.id(), expected = %txid, actual = %spend.txid,
+						"Expiry progress is pinned by a different spender; retaining its hold");
+					continue;
+				}
 				if spend.fee_rate >= fee_rate { continue; }
 				fee_rate = fee_rate.max(saturating_add_feerates(
 					spend.fee_rate, self.config.incremental_relay_fee
 				));
 			}
 			if let Err(error) = self.db.write(async |t| {
+				// Reorg callbacks also acquire the wallet. Take validity first,
+				// so no wallet holder can wait behind exclusive invalidation.
+				t.lock_valid_expiry_view(view).await?;
+				let mut wallet = self.watchman_wallet.lock().await;
+				if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
+					warn!(vtxo_id = %root.id(), "Expiry splitting needs confirmed usable watchman funds");
+					return Ok(());
+				}
 				// A request may outlive a later refresh, offboard or key drop.
 				// Reprove preservation and retain its sorted path locks through
 				// publication, rather than trusting the old request's txid alone.
@@ -477,8 +483,6 @@ impl Watchman {
 					"Expiry split remains pending");
 			}
 		}
-		// Reconcile financial writes from this sweep before waiting for another timer tick.
-		self.rebuild_expiry_state().await?;
 		Ok(())
 	}
 
