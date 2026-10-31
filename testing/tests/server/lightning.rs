@@ -3625,14 +3625,14 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 		payment_hash: old_hash.to_vec(), amount_sat: 10_000, min_cltv_delta: 8,
 		mailbox_id: None, description: None, expiry_secs: Some(600), claim_destination: None,
 	});
-	server_rpc::RequestExt::set_pver(&mut old_request, server_rpc::pver::PROTOCOL_VERSION_OWNER_PROOF);
-	let refusal = raw.start_lightning_receive(old_request).await.expect_err("protocol6 must not create a fresh invoice");
+	server_rpc::RequestExt::set_pver(&mut old_request, server_rpc::pver::PROTOCOL_VERSION_SCUTTLE - 1);
+	let refusal = raw.start_lightning_receive(old_request).await.expect_err("an older protocol must not create a fresh invoice");
 	assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
-	assert!(refusal.message().contains("Your client version is too old"), "unexpected refusal: {refusal}");
+	assert!(refusal.message().contains("unsupported Scuttle protocol version"), "unexpected refusal: {refusal}");
 	assert_eq!(subscription_count().await, 0);
 	assert!(hold.list(native_request).await.unwrap().into_inner().invoices.is_empty());
-	// The ordinary client below uses protocol7 and keeps the original invoice
-	// creation, same-hash replay and expiry-validation assertions.
+	// The ordinary client below uses the current protocol and keeps the original
+	// invoice creation, same-hash replay and expiry-validation assertions.
 
 	let mut rpc = srv.get_public_rpc().await;
 	let mut start_for = async |payment_hash: PaymentHash, expiry_secs: Option<u64>| {
