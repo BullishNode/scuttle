@@ -33,7 +33,11 @@ impl Tx<'_> {
 				EXISTS(SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation a ON a.id=c.allocation_id \
 					WHERE c.entitlement_id=e.id AND ((c.active AND a.status<>'conflicted') OR a.status='confirmed')) \
 				OR EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id))) \
-			ON CONFLICT(vtxo_id) DO UPDATE SET reason=EXCLUDED.reason,last_seen=NOW() RETURNING vtxo_id",
+			ON CONFLICT(vtxo_id) DO UPDATE SET reason=EXCLUDED.reason,last_seen=NOW() \
+			WHERE EXCLUDED.reason NOT IN ('lightning_request_binding_invalid','lightning_dispatch_unqualified', \
+				'lightning_dispatch_admission_failed','lightning_multiple_dispatches_unresolved') \
+			OR expiry_hold.reason IN ('lightning_request_binding_invalid','lightning_dispatch_unqualified', \
+				'lightning_dispatch_admission_failed','lightning_multiple_dispatches_unresolved') RETURNING vtxo_id",
 			&[&id.to_string(), &reason]).await?;
 		if recorded.is_some() && previous.as_deref() != Some(reason) {
 			slog!(ExpiryHoldObserved, vtxo_id: id, reason: reason.to_owned());
