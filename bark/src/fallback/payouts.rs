@@ -220,8 +220,13 @@ impl Wallet {
 		let metadata = serde_json::to_value(&receipt)?;
 		let current = self.inner.db.get_movement_by_id(movement).await?;
 		let source_ids = local_sources.iter().map(|source| source.id()).collect::<Vec<_>>();
+		// Persisters expose the consumed IDs as a set, not the receipt's key
+		// iteration order. Reordering alone must not rewrite completion times.
+		let same_sources = current.input_vtxos.len() == source_ids.len()
+			&& current.input_vtxos.iter().copied().collect::<BTreeSet<_>>()
+				== source_ids.iter().copied().collect::<BTreeSet<_>>();
 		if current.status != status || current.effective_balance != effective || current.offchain_fee != receipt.fee
-			|| current.input_vtxos != source_ids
+			|| !same_sources
 			|| current.metadata.get("fallback_receipt") != Some(&metadata) {
 			let update = MovementUpdate::new().fee(receipt.fee).effective_balance(effective)
 				.replace_consumed_vtxos(source_ids)
