@@ -384,6 +384,13 @@ async fn ownership_board_refusals_preserve_funding_and_exact_replay() {
 		&[&signed.id().to_string(), &coin.public_key().to_string()]).await?)).await.unwrap();
 	assert_eq!(birth_owner.get::<_, &str>(0), coin.public_key().to_string());
 	assert_eq!(birth_owner.get::<_, &str>(1), link.serialize_hex());
+	let root = db.read(async |tx| Ok(tx.query_one("SELECT v.spend_state::TEXT,v.oor_spent_txid,c.mailbox_pk \
+		FROM vtxo v LEFT JOIN coin_owner c ON c.vtxo_id=v.vtxo_id WHERE v.vtxo_id=$1",
+		&[&outpoint.to_string()]).await?)).await.unwrap();
+	assert_eq!(root.get::<_, &str>("spend_state"), "spent");
+	assert_eq!(root.get::<_, &str>("oor_spent_txid"), exit_txid.to_string());
+	assert_eq!(root.get::<_, Option<&str>>("mailbox_pk"), None,
+		"the internal expiry root is not an additional customer coin");
 	let error = rpc.request_board_cosign(replay).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::InvalidArgument);
 	assert!(error.message().contains(&format!("known as virtual tx: {}", funding_id)), "{error}");
