@@ -203,12 +203,12 @@ async fn restored_finish() {
 	assert!(!ordinary.is_empty());
 	assert!(ordinary.keys().all(|point| point.txid == root.txid && *point != root));
 	assert_eq!(ordinary.values().copied().sum::<Amount>() + coin.amount() + board_fee, sat(200_000));
-	let binding = wallet.fallback_destination().await.unwrap();
+	let binding = wallet.fallback_script();
 	let mailbox = wallet.mailbox_identifier().as_pubkey();
-	binding.verify(Network::Regtest, mailbox).unwrap();
+
 	assert_ark_balance(&wallet, sat(100_000), Amount::ZERO).await;
 	let destination = ctx.bitcoind().get_new_address();
-	assert_ne!(destination.script_pubkey(), binding.spk);
+	assert_ne!(destination.script_pubkey(), binding);
 
 	// Pay an unrelated absent owner to check that expiry payouts still progress.
 	let control = Box::pin(ctx.bark_sdk("control", &srv).funded(sat(40_000)).boarded(sat(20_000))
@@ -219,11 +219,11 @@ async fn restored_finish() {
 	assert_eq!(controls[0].amount(), sat(20_000));
 	let control_id = controls[0].id();
 	let control_expiry = controls[0].expiry_height();
-	let control_binding = control.fallback_destination().await.unwrap();
+	let control_binding = control.fallback_script();
 	let control_mailbox = control.mailbox_identifier().as_pubkey();
 	let control_key = control.get_vtxo_key(control_id).await.unwrap().public_key();
-	assert_ne!(control_binding.spk, binding.spk);
-	assert_ne!(control_binding.spk, destination.script_pubkey());
+	assert_ne!(control_binding, binding);
+	assert_ne!(control_binding, destination.script_pubkey());
 	drop(controls);
 	drop(control);
 	// Original operator backing and the control have distinct expiry groups.
@@ -248,8 +248,8 @@ async fn restored_finish() {
 	}
 	let observation_height = ctx.bitcoind().get_block_count().await;
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
-	let registered = db.read(async |tx| tx.get_fallback(mailbox).await).await.unwrap().unwrap();
-	assert!(registered.same_binding(&binding));
+	let derived = bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None);
+	assert_eq!(derived, binding);
 	let error = wallet.offboard_vtxos([source], destination.clone()).await.unwrap_err();
 	assert!(format!("{error:#}").contains(LOST_REPLY));
 	assert_eq!(gate.prepares.load(Ordering::SeqCst), 1);
@@ -310,17 +310,17 @@ async fn restored_finish() {
 	let restored_change = onchain.read().await.inner.list_unspent()
 		.map(|output| (output.outpoint, output.txout.value)).collect::<BTreeMap<_, _>>();
 	assert_eq!(restored_change, ordinary, "restoration must load the existing BDK state, never a newly empty wallet");
-	assert_eq!(onchain.read().await.fallback_script(), binding.spk);
+	assert_eq!(onchain.read().await.fallback_script(), binding);
 	let restored = Box::pin(Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &seed), config,
 		OpenWalletArgs { datadir: Some(restored_dir.clone()), persister: Some(persister),
-			onchain: Some(onchain.clone()), fallback_spk: Some(binding.spk.clone()),
+			onchain: Some(onchain.clone()),
 			lock_manager: Some(Box::new(MemoryLockManager::new())),
 			create_if_not_exists: false, run_daemon: false, ..Default::default() })).await.unwrap();
 	assert_eq!(restored.pending_offboards().await.unwrap(), vec![prepared.clone()]);
-	let rebound = restored.fallback_destination().await.unwrap();
-	rebound.verify(Network::Regtest, restored.mailbox_identifier().as_pubkey()).unwrap();
+	let rebound = restored.fallback_script();
+
 	assert_eq!(restored.mailbox_identifier().as_pubkey(), mailbox);
-	assert!(rebound.same_binding(&binding));
+	assert_eq!(rebound, binding);
 	assert_ark_balance(&restored, Amount::ZERO, sat(100_000)).await;
 
 	// This is the only post-restore drive before asserting chain adoption. Its
@@ -397,7 +397,7 @@ async fn restored_finish() {
 				if core.custom_get_raw_transaction_info(parent.compute_txid(), None).unwrap().is_none() { continue; }
 				assert_eq!(row.get::<_, Option<String>>("owner_mailbox"), Some(control_mailbox.to_string()));
 				assert_eq!(row.get::<_, Option<String>>("user_pubkey"), Some(control_key.to_string()));
-				assert_eq!(row.get::<_, Option<String>>("spk"), Some(control_binding.spk.to_hex_string()));
+				assert_eq!(row.get::<_, Option<String>>("spk"), Some(control_binding.to_hex_string()));
 				assert_eq!(row.get::<_, i64>("gross_sat"), 20_000);
 				assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
 				assert_eq!(row.get::<_, i64>("payout_sat"), 19_000);
@@ -425,14 +425,14 @@ async fn restored_finish() {
 	assert_eq!(deserialize::<Transaction>(row.get("sweep_tx")).unwrap(), control_parent);
 	assert_eq!(row.get::<_, Option<String>>("owner_mailbox"), Some(control_mailbox.to_string()));
 	assert_eq!(row.get::<_, Option<String>>("user_pubkey"), Some(control_key.to_string()));
-	assert_eq!(row.get::<_, Option<String>>("spk"), Some(control_binding.spk.to_hex_string()));
+	assert_eq!(row.get::<_, Option<String>>("spk"), Some(control_binding.to_hex_string()));
 	assert_eq!(row.get::<_, i64>("gross_sat"), 20_000);
 	assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
 	assert_eq!(row.get::<_, i64>("payout_sat"), 19_000);
 	assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
 	assert_eq!(row.get::<_, Option<String>>("sweep_txid"), Some(control_txid.to_string()));
 	assert_eq!(row.get::<_, Option<String>>("confirmed_hash"), Some(control_hash.to_string()));
-	let control_outputs = control_parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == control_binding.spk).collect::<Vec<_>>();
+	let control_outputs = control_parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == control_binding).collect::<Vec<_>>();
 	assert_eq!(control_outputs.len(), 1);
 	assert_eq!(control_outputs[0].1.value, sat(19_000));
 	let control_payout = OutPoint::new(control_txid, control_outputs[0].0 as u32);
@@ -490,10 +490,10 @@ async fn restored_finish() {
 	let mut control_paid = BTreeMap::new();
 	for (id, transaction) in &transactions {
 		for (index, output) in transaction.output.iter().enumerate() {
-			assert_ne!(output.script_pubkey, binding.spk, "a restored offboard cannot gain an extra original fallback payment");
+			assert_ne!(output.script_pubkey, binding, "a restored offboard cannot gain an extra original fallback payment");
 			let point = OutPoint::new(*id, index as u32);
 			if output.script_pubkey == destination.script_pubkey() { paid.insert(point, output.value); }
-			if output.script_pubkey == control_binding.spk { control_paid.insert(point, output.value); }
+			if output.script_pubkey == control_binding { control_paid.insert(point, output.value); }
 		}
 	}
 	assert_eq!(paid, BTreeMap::from([(payout, prepared.onchain_output_amount)]));
@@ -504,7 +504,7 @@ async fn restored_finish() {
 		assert_eq!(output.script_pub_key.script().unwrap(), board.output[point.vout as usize].script_pubkey);
 	}
 	for (point, amount, script) in [(payout, prepared.onchain_output_amount, destination.script_pubkey()),
-		(control_payout, sat(19_000), control_binding.spk.clone())] {
+		(control_payout, sat(19_000), control_binding.clone())] {
 		let output = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
 		assert!(output.confirmations >= 6);
 		assert_eq!(output.value, amount);

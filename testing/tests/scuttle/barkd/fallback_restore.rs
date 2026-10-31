@@ -24,11 +24,11 @@ async fn fallback_payout_history_and_seed_restore() {
 	let barkd = ctx.barkd("wallet", &srv).mnemonic(mnemonic.clone())
 		.cfg(|cfg| cfg.daemon_manual_sync = true).funded(sat(200_000)).create().await;
 	let config = barkd.client_config();
-	let registration: bark_json::web::FallbackRegistrationInfo = config.client
+	let registration: bark_json::web::FallbackInfo = config.client
 		.get(format!("{}/api/v1/wallet/fallback", config.base_path)).send().await.unwrap()
 		.error_for_status().unwrap().json().await.unwrap();
-	assert!(registration.registered);
-	let address = Address::from_str(registration.payout_address.as_ref().unwrap()).unwrap()
+
+	let address = Address::from_str(&registration.payout_address).unwrap()
 		.require_network(Network::Regtest).unwrap();
 	let script = address.script_pubkey();
 	assert!(script.is_p2tr(), "the released daemon must use its native BIP86 wallet");
@@ -145,10 +145,10 @@ async fn fallback_payout_history_and_seed_restore() {
 	restored.sync().await;
 	restored.onchain_sync().await;
 	let restored_config = restored.client_config();
-	let restored_registration: bark_json::web::FallbackRegistrationInfo = restored_config.client
+	let restored_registration: bark_json::web::FallbackInfo = restored_config.client
 		.get(format!("{}/api/v1/wallet/fallback", restored_config.base_path)).send().await.unwrap()
 		.error_for_status().unwrap().json().await.unwrap();
-	assert!(restored_registration.registered);
+
 	assert_eq!(restored_registration.payout_address, registration.payout_address);
 	let restored_payouts = restored.onchain_utxos().await.into_iter().filter(|utxo| utxo.outpoint == point).collect::<Vec<_>>();
 	assert_eq!(restored_payouts.len(), 1);

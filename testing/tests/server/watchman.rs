@@ -701,7 +701,7 @@ async fn watchman_confirmed_outpoints(watchman: &Watchmand) -> BTreeSet<OutPoint
 
 async fn check_receive_seed_custody(
 	ctx: &TestContext, srv: &ark_testing::Captaind,
-	wallet: &bark::Wallet, oldest: &ark::Vtxo<ark::vtxo::Bare>, destination: &ark::fallback::FallbackRegistration,
+	wallet: &bark::Wallet, oldest: &ark::Vtxo<ark::vtxo::Bare>, destination: &bitcoin::ScriptBuf,
 	payout: OutPoint, remaining: &BTreeMap<String, ark::Vtxo>,
 ) {
 	fallback::check_receive_seed_custody(ctx, srv, wallet, oldest, destination, payout, remaining).await

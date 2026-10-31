@@ -412,6 +412,19 @@ impl MovementManager {
 		self.unload_movement_from_cache(id).await
 	}
 
+	/// Reverse a canonical receipt's terminal history after a reorg. The
+	/// caller must retain its original identity and independently prove that
+	/// the former receipt no longer has the required canonical depth.
+	pub(crate) async fn reopen_movement(&self, id: MovementId, update: MovementUpdate) -> Result<(), MovementError> {
+		let mut guard = self.get_cached_movement(id).await?;
+		update.apply_to(&mut *guard, chrono::Local::now());
+		guard.status = MovementStatus::Pending;
+		guard.time.completed_at = None;
+		self.db.update_movement(&guard).await.map_err(|e| MovementError::PersisterError { id, e })?;
+		self.notifications.dispatch_movement_updated(guard.clone());
+		Ok(())
+	}
+
 	async fn get_cached_movement(
 		&self,
 		id: MovementId,

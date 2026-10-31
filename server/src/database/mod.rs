@@ -8,7 +8,6 @@ mod embedded {
 	}
 }
 
-pub mod fallback;
 pub mod expiry_attribution;
 pub(crate) mod expiry_guard;
 pub mod expiry_inventory;
@@ -184,7 +183,9 @@ impl Db {
 		let legacy: bool = conn.query_one(
 			"SELECT to_regclass('scuttle.refinery_schema_history') IS NOT NULL \
 			 OR to_regclass('public.fallback_record') IS NOT NULL \
-			 OR to_regclass('public.expiry_owner_key') IS NOT NULL", &[],
+			 OR to_regclass('public.expiry_owner_key') IS NOT NULL \
+			 OR to_regclass('scuttle.fallback_record') IS NOT NULL \
+			 OR to_regclass('scuttle.expiry_owner_key') IS NOT NULL", &[],
 		).await?.get(0);
 		ensure!(!legacy, "existing database is not a fresh Scuttle store; initialization refused");
 		let initialized: bool = conn.query_one(
@@ -200,8 +201,10 @@ impl Db {
 
 		if initialized {
 			let bound: bool = conn.query_one(
-				"SELECT to_regclass('scuttle.fallback_record') IS NOT NULL \
-				 AND to_regclass('public.refinery_schema_history') IS NOT NULL", &[],
+				"SELECT to_regclass('scuttle.coin_owner') IS NOT NULL \
+				 AND to_regclass('public.refinery_schema_history') IS NOT NULL \
+				 AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='customer_coin_owner' \
+				 AND tgrelid=to_regclass('public.vtxo') AND tgdeferrable AND tginitdeferred)", &[],
 			).await?.get(0);
 			ensure!(bound, "incomplete Scuttle schema; use a fresh store");
 		}
@@ -434,12 +437,11 @@ impl<'t> Tx<'t> {
 	pub async fn upsert_vtxos(
 		&self,
 		vtxos: impl IntoIterator<Item = impl Borrow<ServerVtxo<Full>>>,
-		owners: Option<(bitcoin::Network, &secp256k1::Keypair)>,
 	) -> anyhow::Result<()> {
 		let vtxos = vtxos.into_iter().map(|v| v.borrow().clone()).collect::<Vec<_>>();
 		let update = tree::VtxoTreeUpdate::new()
 			.insert_spendable_vtxos(vtxos);
-		self.execute_vtxo_tree_update(update, owners).await?;
+		self.execute_vtxo_tree_update(update).await?;
 		Ok(())
 	}
 
@@ -519,9 +521,8 @@ impl<'t> Tx<'t> {
 	pub async fn execute_vtxo_tree_update(
 		&self,
 		update: tree::VtxoTreeUpdate,
-		owners: Option<(bitcoin::Network, &secp256k1::Keypair)>,
 	) -> anyhow::Result<u64> {
-		tree::execute_vtxo_tree_update(self, update, owners).await
+		tree::execute_vtxo_tree_update(self, update).await
 	}
 
 	/// Queries a virtual transaction by txid
@@ -544,15 +545,13 @@ impl<'t> Tx<'t> {
 		mailbox_id: MailboxIdentifier,
 		vtxos: &[Vtxo<Full>],
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.require_registered_mailbox(mailbox_id).await?;
 		if vtxos.is_empty() {
 			return Ok(None);
 		}
-		// Shadow the same-transaction delivery constraint. Registration stays
-		// authoritative until the coordinated fresh-store ownership switch.
+		// Check the complete batch before allocating any message checkpoint.
 		let ids = vtxos.iter().map(|vtxo| vtxo.id()).collect::<Vec<_>>();
 		if !self.delivery_owners_match(&ids, mailbox_id).await? {
-			tracing::debug!("Shadow mailbox delivery has missing or mismatched coin ownership");
+			return crate::error::badarg!("mailbox delivery has missing or mismatched coin ownership");
 		}
 
 		// Acquire advisory lock to serialize all mailbox writes.
@@ -618,7 +617,6 @@ impl<'t> Tx<'t> {
 		checkpoint: Checkpoint,
 		limit: usize,
 	) -> anyhow::Result<Vec<MailboxEntry>> {
-		self.require_registered_mailbox(mailbox_id).await?;
 		let statement = self.prepare(&format!("
 			WITH checkpoints AS (
 				SELECT DISTINCT checkpoint FROM mailbox
@@ -806,7 +804,6 @@ impl<'t> Tx<'t> {
 		mailbox_id: MailboxIdentifier,
 		unlock_hash: UnlockHash,
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.require_registered_mailbox(mailbox_id).await?;
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
@@ -841,7 +838,6 @@ impl<'t> Tx<'t> {
 		payment_hash: &str,
 		amount: Amount,
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.require_registered_mailbox(mailbox_id).await?;
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
@@ -887,7 +883,6 @@ impl<'t> Tx<'t> {
 		preimage: Option<Preimage>,
 		failure: Option<LightningFailureKind>,
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.require_registered_mailbox(mailbox_id).await?;
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
@@ -930,7 +925,6 @@ impl<'t> Tx<'t> {
 		mailbox_id: MailboxIdentifier,
 		vtxo_ids: &[VtxoId],
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.require_registered_mailbox(mailbox_id).await?;
 		if vtxo_ids.is_empty() {
 			return Ok(None);
 		}
@@ -1074,7 +1068,7 @@ impl<'t> Tx<'t> {
 				&forfeit_result.connector_vtxos, SpendState::OffboardConnector
 			)
 			.mark_vtxos_offboard_spent(offboard_triples);
-		tree::execute_vtxo_tree_update(self, update, None).await?;
+		tree::execute_vtxo_tree_update(self, update).await?;
 
 		// register the connector output vtxo directly into the frontier, so
 		// the watchman can sweep it once the input vtxos have expired

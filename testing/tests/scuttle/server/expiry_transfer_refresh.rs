@@ -35,7 +35,7 @@ async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 	control.sync().await;
 	let owner = absent.client().await;
 	let own = owner.get_full_vtxo(own_board.vtxos[0]).await.unwrap();
-	let destination = owner.fallback_destination().await.unwrap();
+	let destination = owner.fallback_script();
 	drop(owner);
 	let sender = control.client().await;
 	let original = sender.get_full_vtxo(sender_board.vtxos[0]).await.unwrap();
@@ -125,7 +125,7 @@ async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 	let mut outputs = Vec::<(Txid, u32)>::new();
 	for parent in parents.values() {
 		assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, *parent);
-		let matching = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination.spk).collect::<Vec<_>>();
+		let matching = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 		assert_eq!(matching.len(), 1);
 		total += matching[0].1.value;
 		outputs.push((parent.compute_txid(), matching[0].0 as u32));
@@ -165,7 +165,7 @@ async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 		let output = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
 		assert!(output.confirmations >= 6);
 		assert_eq!(output.value, expected);
-		assert_eq!(output.script_pub_key.script().unwrap(), destination.spk);
+		assert_eq!(output.script_pub_key.script().unwrap(), destination);
 	}
 	assert_eq!(total + sat(1_000), own.amount() + received.amount());
 

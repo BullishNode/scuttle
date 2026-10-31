@@ -69,7 +69,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 	let pending = client.get_full_vtxo(pending_board.vtxos[0]).await.unwrap();
 	assert_ne!(ready.chain_anchor(), pending.chain_anchor());
 	assert_eq!(ready.expiry_height(), pending.expiry_height());
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	let key = client.get_vtxo_key(&pending).await.unwrap();
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let deadline = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
@@ -132,7 +132,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 	assert!(child.input.iter().any(|input| input.previous_output.txid == parent.compute_txid()),
 		"the actual fee child must sponsor this exact payout parent");
 	let payouts = parent.output.iter().enumerate()
-		.filter(|(_, output)| output.script_pubkey == destination.spk).collect::<Vec<_>>();
+		.filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
 	let (vout, payout) = payouts[0];
 	assert_eq!(payout.value, ready.amount() - sat(1_000));
@@ -152,7 +152,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 		.unwrap().expect("the actual ready payout must be unspent in Core");
 	assert!(output.confirmations >= 6);
 	assert_eq!(output.value, payout.value);
-	assert_eq!(output.script_pub_key.script().unwrap(), destination.spk);
+	assert_eq!(output.script_pub_key.script().unwrap(), destination);
 	assert_pending_root_is_untouched(&ctx, &db, htlc, pending.chain_anchor(), &pending_backing).await;
 	// A fee child observed before mining may have been replaced. Credit only
 	// the unique confirmed sponsor and verify its block and fee against Core.

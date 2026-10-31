@@ -126,7 +126,7 @@ async fn same_hash_sources(cooperative_refund: bool) {
 		return;
 	}
 
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	drop(client);
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	// The paid source and its unused sibling are separate physical trees.
@@ -159,7 +159,7 @@ async fn same_hash_sources(cooperative_refund: bool) {
 		}
 	}).await.expect("unused same-hash grant was not automatically refunded to its offline owner");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	let (index, output) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination.spk).unwrap();
+	let (index, output) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
 	assert_eq!(output.value, sat(99_000));
 	ctx.generate_blocks(6).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);

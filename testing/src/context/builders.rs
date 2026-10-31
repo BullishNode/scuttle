@@ -20,7 +20,7 @@ use tokio::fs;
 use crate::constants::BOARD_CONFIRMATIONS;
 use crate::daemon::barkd::{Barkd, BarkdChainSource};
 use crate::daemon::watchmand::Watchmand;
-use crate::onchain::AppBip84Wallet;
+use crate::onchain::AppBip86Wallet;
 use crate::{Bark, Bitcoind, Captaind, Lightningd, LightningdConfig};
 use crate::util::{poll_interval, FutureExt};
 use super::TestContext;
@@ -539,7 +539,7 @@ pub struct BarkSdkBuilder<'a> {
 	board_amounts: Vec<Amount>,
 	mod_cfg: Option<Box<dyn FnOnce(&mut bark::Config)>>,
 	mnemonic: Option<bip39::Mnemonic>,
-	app_bip84: bool,
+	app_bip86: bool,
 	external_mailbox: Option<bitcoin::secp256k1::Keypair>,
 }
 
@@ -557,7 +557,7 @@ impl<'a> BarkSdkBuilder<'a> {
 			board_amounts: Vec::new(),
 			mod_cfg: None,
 			mnemonic: None,
-			app_bip84: false,
+			app_bip86: false,
 			external_mailbox: None,
 		}
 	}
@@ -576,8 +576,8 @@ impl<'a> BarkSdkBuilder<'a> {
 	}
 
 	/// Attach an application-owned BIP84 wallet instead of the native BIP86 wallet.
-	pub fn app_bip84(mut self) -> Self {
-		self.app_bip84 = true;
+	pub fn app_bip86(mut self) -> Self {
+		self.app_bip86 = true;
 		self
 	}
 
@@ -643,17 +643,15 @@ impl<'a> BarkSdkBuilder<'a> {
 			SqliteClient::open(datadir.join("db.sqlite")).context("opening sqlite db")?,
 		);
 
-		let (onchain, fallback_spk): (Arc<tokio::sync::RwLock<dyn OnchainWalletTrait>>, _) = if self.app_bip84 {
-			let wallet = AppBip84Wallet::load_or_create(
+		let onchain: Arc<tokio::sync::RwLock<dyn OnchainWalletTrait>> = if self.app_bip86 {
+			let wallet = AppBip86Wallet::load_or_create(
 				network, mnemonic.to_seed(""), db.clone(), self.ctx.bitcoind().sync_client(),
-			).await.context("creating application BIP84 wallet")?;
-			let script = wallet.fallback_script();
-			(Arc::new(tokio::sync::RwLock::new(wallet)), script)
+			).await.context("creating application BIP86 wallet")?;
+			Arc::new(tokio::sync::RwLock::new(wallet))
 		} else {
 			let wallet = OnchainWallet::load_or_create(network, mnemonic.to_seed(""), db.clone())
 				.await.context("creating onchain wallet")?;
-			let script = wallet.fallback_script();
-			(Arc::new(tokio::sync::RwLock::new(wallet)), script)
+			Arc::new(tokio::sync::RwLock::new(wallet))
 		};
 
 		let seed = WalletSeed::new_from_mnemonic(network, &mnemonic);
@@ -662,7 +660,6 @@ impl<'a> BarkSdkBuilder<'a> {
 			persister: Some(db),
 			create_if_not_exists: true,
 			onchain: Some(onchain.clone()),
-			fallback_spk: Some(fallback_spk),
 			..Default::default()
 		}).await.context("creating bark wallet")?;
 

@@ -63,8 +63,7 @@ macro_rules! bark_persister_tests {
 		$crate::persist::test_suite::bark_persister_tests!(@tests $setup,
 			test_init_and_read_properties,
 			test_external_mailbox_public_identity_roundtrip,
-			test_fallback_record_is_immutable,
-			test_pending_fallback_record_never_authorizes_registration,
+			test_fallback_receipt_binding_is_immutable,
 			test_set_server_pubkey,
 			test_set_server_mailbox_pubkey,
 
@@ -132,7 +131,7 @@ fn test_properties() -> WalletProperties {
 		fingerprint: Fingerprint::default(),
 		server_pubkey: None,
 		server_mailbox_pubkey: None,
-		external_mailbox: None,
+		mailbox_identity: crate::MailboxIdentity { network: Network::Regtest, public_key: test_pubkey() },
 	}
 }
 
@@ -312,11 +311,11 @@ pub async fn test_external_mailbox_public_identity_roundtrip(db: &impl BarkPersi
 	let key = if key.serialize()[0] == 3 { key } else { key.negate(&secp) };
 	assert_eq!(key.serialize()[0], 3);
 	let mut props = test_properties();
-	props.external_mailbox = Some(crate::ExternalMailboxIdentity { network: props.network, public_key: key });
+	props.mailbox_identity = crate::MailboxIdentity { network: props.network, public_key: key };
 	db.init_wallet(&props).await.expect("init external mailbox identity");
 	let read = db.read_properties().await.unwrap().unwrap();
 	assert_eq!(read, props);
-	assert_eq!(read.external_mailbox.unwrap().public_key.serialize(), key.serialize());
+	assert_eq!(read.mailbox_identity.public_key.serialize(), key.serialize());
 }
 
 pub async fn test_set_server_pubkey(db: &impl BarkPersister) {
@@ -836,8 +835,7 @@ pub async fn test_store_and_get_round_state(db: &impl BarkPersister) {
 	let server = Keypair::from_seckey_slice(&ark::SECP, &[17; 32]).unwrap();
 	let recipient = Keypair::from_seckey_slice(&ark::SECP, &[18; 32]).unwrap();
 	let coin = VTXO_VECTORS.arkoor3_user_key;
-	let link = ark::fallback::OwnerLink::new(server.public_key(),
-		ark::mailbox::MailboxIdentifier::from_pubkey(recipient.public_key()), &coin).unwrap();
+	let link = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &recipient, &coin).unwrap();
 	state.participation.outputs.push(ark::VtxoRequest {
 		amount: Amount::from_sat(1_000), policy: ark::VtxoPolicy::new_pubkey(coin.public_key()),
 	});
@@ -1222,39 +1220,26 @@ pub async fn test_exit_child_tx_roundtrip(db: &impl BarkPersister) {
 	);
 }
 
-/// Canonical signatures may change, but the registered destination may not.
-pub async fn test_fallback_record_is_immutable(db: &impl BarkPersister) {
+/// Receipt updates may revisit confirmation, but cannot move a source to a
+/// different mailbox or invent a larger attributable balance.
+pub async fn test_fallback_receipt_binding_is_immutable(db: &impl BarkPersister) {
 	let mailbox = Keypair::from_seckey_slice(&ark::SECP, &[7; 32]).unwrap();
-	let spk = ScriptBuf::from_hex("00141111111111111111111111111111111111111111").unwrap();
-	let record = ark::fallback::FallbackRegistration::new(Network::Regtest, spk.clone(), &mailbox).unwrap();
-	assert!(db.get_fallback_record().await.unwrap().is_none());
-	db.store_fallback_record(&record).await.unwrap();
-	let resigned = ark::fallback::FallbackRegistration::new(Network::Regtest, spk, &mailbox).unwrap();
-	db.store_fallback_record(&resigned).await.unwrap();
-	assert_eq!(db.get_fallback_record().await.unwrap().unwrap(), resigned);
-	let alternate = ScriptBuf::from_hex("00142222222222222222222222222222222222222222").unwrap();
-	let changed = ark::fallback::FallbackRegistration::new(Network::Regtest, alternate, &mailbox).unwrap();
-	assert!(db.store_fallback_record(&changed).await.is_err());
-	assert_eq!(db.get_fallback_record().await.unwrap().unwrap(), resigned);
-}
-
-/// Local signatures reserve the identity but cannot acknowledge a server write.
-pub async fn test_pending_fallback_record_never_authorizes_registration(db: &impl BarkPersister) {
-	let mailbox = Keypair::from_seckey_slice(&ark::SECP, &[7; 32]).unwrap();
-	let script = ScriptBuf::from_hex("00141111111111111111111111111111111111111111").unwrap();
-	let record = ark::fallback::FallbackRegistration::new(Network::Regtest, script, &mailbox).unwrap();
-	db.store_pending_fallback_record(&record).await.unwrap();
-	assert!(db.get_fallback_record().await.unwrap().is_none());
-	assert_eq!(db.get_pending_fallback_record().await.unwrap(), Some(record.clone()));
-	let alternate = ScriptBuf::from_hex("00142222222222222222222222222222222222222222").unwrap();
-	let changed = ark::fallback::FallbackRegistration::new(Network::Regtest, alternate, &mailbox).unwrap();
-	assert!(db.store_pending_fallback_record(&changed).await.is_err());
-	assert!(db.store_fallback_record(&changed).await.is_err());
-	assert!(db.get_fallback_record().await.unwrap().is_none());
-	db.store_fallback_record(&record).await.unwrap();
-	assert_eq!(db.get_fallback_record().await.unwrap(), Some(record.clone()));
-	assert!(db.get_pending_fallback_record().await.unwrap().is_none());
-	db.store_pending_fallback_record(&record).await.unwrap();
-	assert_eq!(db.get_fallback_record().await.unwrap(), Some(record));
-	assert!(db.get_pending_fallback_record().await.unwrap().is_none());
+	let receipt = crate::FallbackReceipt {
+		vtxo_id: ark::test_util::VTXO_VECTORS.board_vtxo.id(),
+		source_vtxo_ids: std::collections::BTreeSet::from([ark::test_util::VTXO_VECTORS.board_vtxo.id()]), allocation_id: 1,
+		owner_mailbox: mailbox.public_key(), gross: Amount::from_sat(10_000),
+		fee: Amount::from_sat(1_000), payout: Amount::from_sat(9_000), forfeited: Amount::ZERO,
+		transaction_id: None, output_index: Some(0), confirmed_block: None, retired_block: None,
+	};
+	assert!(db.get_fallback_receipts().await.unwrap().is_empty());
+	db.store_fallback_receipt(&receipt).await.unwrap();
+	assert_eq!(db.get_fallback_receipts().await.unwrap(), vec![receipt.clone()]);
+	let mut changed = receipt.clone();
+	changed.owner_mailbox = Keypair::from_seckey_slice(&ark::SECP, &[8; 32]).unwrap().public_key();
+	assert!(db.store_fallback_receipt(&changed).await.is_err());
+	changed = receipt.clone(); changed.gross += Amount::ONE_SAT;
+	assert!(db.store_fallback_receipt(&changed).await.is_err());
+	changed = receipt.clone(); changed.source_vtxo_ids.clear();
+	assert!(db.store_fallback_receipt(&changed).await.is_err());
+	assert_eq!(db.get_fallback_receipts().await.unwrap(), vec![receipt]);
 }

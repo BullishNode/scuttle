@@ -121,7 +121,7 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 	assert_ne!(PaymentHash::from(&invoices[0]), PaymentHash::from(&invoices[1]));
 	let recipient_keys = [recipient.new_address().await.unwrap().policy().user_pubkey(),
 		recipient.new_address().await.unwrap().policy().user_pubkey()];
-	let recipient_destination = recipient.fallback_destination().await.unwrap();
+	let recipient_destination = recipient.fallback_script();
 	let sender = create_wallet(ctx.bark_sdk("absent-sender", &srv).boarded(sat(200_000))
 		.cfg(|cfg| {
 			cfg.daemon_manual_sync = true;
@@ -130,8 +130,8 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 	let original = sender.spendable_vtxos().await.unwrap().remove(0);
 	let original_body = sender.get_full_vtxo(original.id()).await.unwrap();
 	let anchor = original_body.chain_anchor();
-	let destination = sender.fallback_destination().await.unwrap();
-	assert_ne!(destination.spk, recipient_destination.spk);
+	let destination = sender.fallback_script();
+	assert_ne!(destination, recipient_destination);
 	// Normal signed self-payment creates two separately owned100k branches
 	// under this SAME200k board, before the distinct HTLC operations begin.
 	let own_address = sender.new_address().await.unwrap();
@@ -171,7 +171,7 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 			invoice: invoice.to_string(), payment_amount_sat: 90_000,
 			htlc_vtxo_ids: vec![source.to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
 		}).await.unwrap();
-		let response = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+		let response = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 			owner_proof: Some(recipient.owner_link(recipient_key).await.unwrap().into()),
 			payment_hash: hash.to_vec(), user_pubkey: recipient_key.serialize().to_vec(),
 			htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,
@@ -227,7 +227,7 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 			srv.watchmand().wait_for_sync_height(tip).await;
 			tokio::time::sleep(Duration::from_secs(1)).await;
 			if let Some(closures) = super::expiry_lightning_terminal::confirmed_grant_closures(
-				&ctx, &db, &grants, &recipient_destination.spk,
+				&ctx, &db, &grants, &recipient_destination,
 			).await {
 				if closures.values().all(|(_, closed)| closed.checked_add(6).is_some_and(|required| required <= tip.to_u32())) {
 					let hash = ctx.bitcoind().sync_client().get_block_hash(u64::from(tip.to_u32())).unwrap();
@@ -282,7 +282,7 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 	// The refund spends only the shared customer root. Each receive grant
 	// already has a separate funded operator closure six confirmations deep.
 	assert_eq!(old_parent.input.len(),1);
-	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx,&db,&grants,&recipient_destination.spk).await;
+	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx,&db,&grants,&recipient_destination).await;
 	assert!(ctx.bitcoind().sync_client().custom_get_raw_transaction_info(old_parent.compute_txid(), None).unwrap()
 		.is_none_or(|info| info.confirmations.unwrap_or(0) <= 0));
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&anchor.txid, anchor.vout, Some(false)).unwrap().is_some());
@@ -367,8 +367,8 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 	let mut actual_paid = sat(0);
 	for (txid,parent) in &parents {
 		assert_eq!(ctx.bitcoind().await_transaction(*txid).await,*parent);
-		assert!(!parent.output.iter().any(|output| output.script_pubkey==recipient_destination.spk));
-		let payouts = parent.output.iter().filter(|output| output.script_pubkey==destination.spk).collect::<Vec<_>>();
+		assert!(!parent.output.iter().any(|output| output.script_pubkey==recipient_destination));
+		let payouts = parent.output.iter().filter(|output| output.script_pubkey==destination).collect::<Vec<_>>();
 		assert_eq!(payouts.len(),1);
 		actual_paid += payouts[0].value;
 		let mut amount = sat(0);
@@ -381,7 +381,7 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 	assert_eq!(actual_paid,sat(198_000),"the same-expiry 200,000 sat source pays 2,000 sats across all allocations");
 	ctx.generate_blocks(6).await;
 	for (txid,parent) in &parents {
-		let index = parent.output.iter().position(|output| output.script_pubkey==destination.spk).unwrap();
+		let index = parent.output.iter().position(|output| output.script_pubkey==destination).unwrap();
 		assert!(ctx.bitcoind().sync_client().get_tx_out(txid,index as u32,Some(true)).unwrap().unwrap().confirmations>=6);
 	}
 
@@ -464,7 +464,7 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 				let mut by_source = BTreeMap::new();
 				for row in canonical {
 					let parent = deserialize::<Transaction>(row.get("sweep_tx"))?;
-					let index = parent.output.iter().position(|output| output.script_pubkey==destination.spk)
+					let index = parent.output.iter().position(|output| output.script_pubkey==destination)
 						.expect("canonical refund must retain the authenticated destination");
 					ready &= rpc.get_tx_out(&parent.compute_txid(),index as u32,Some(true)).unwrap()
 						.is_some_and(|output| output.confirmations>=6);
@@ -492,8 +492,8 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 	let mut canonical_paid = sat(0);
 	for (txid,parent) in &unique_parents {
 		assert_eq!(ctx.bitcoind().await_transaction(*txid).await,**parent);
-		assert!(!parent.output.iter().any(|output| output.script_pubkey==recipient_destination.spk));
-		let payouts = parent.output.iter().filter(|output| output.script_pubkey==destination.spk).collect::<Vec<_>>();
+		assert!(!parent.output.iter().any(|output| output.script_pubkey==recipient_destination));
+		let payouts = parent.output.iter().filter(|output| output.script_pubkey==destination).collect::<Vec<_>>();
 		assert_eq!(payouts.len(),1);
 		canonical_paid += payouts[0].value;
 		let mut amount = sat(0);

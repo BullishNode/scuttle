@@ -5,6 +5,9 @@
   A restart between the sender and receive commits no longer retries a cancelled
   external hold or repeats the sender's success notification.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
-- Record verified coin-to-mailbox bindings and customer coin births alongside the
-  existing registration state, without changing payout destinations.
+- Derive fallback payouts from admitted joint coin/mailbox bindings and the
+  existing stage-entitlement rules. Authenticated mailbox receipts also discover
+  provisional input-owner and unmaterialized recipient claims.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
+  - **BREAKING:** Registration and legacy-proof dispatch are removed. Use fresh
+    matched stores; registration-era databases are refused before writes.

@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bitcoin::{OutPoint, Transaction};
-use bitcoin::secp256k1::Keypair;
 use bitcoin_ext::BlockHeight;
 use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
 use bitcoind_async_client::traits::Reader;
@@ -43,8 +42,6 @@ impl Tx<'_> {
 		fact: &BackingVtxoFact,
 		funding: &Transaction,
 		view: ExpiryViewToken,
-		network: bitcoin::Network,
-		server_mailbox_key: &Keypair,
 	) -> anyhow::Result<PreparedCoin> {
 		let ownership = self.propose_expiry_ownership(
 			fact,
@@ -53,19 +50,20 @@ impl Tx<'_> {
 			Some(view.watchmand.height),
 		).await?;
 		let payee = match &ownership.disposition {
-			OwnershipDisposition::Customer { user_pubkey } => {
-				// Exercise the new resolution alongside the authoritative registered
-				// destination until the coordinated fresh-store payout switch.
+			OwnershipDisposition::Customer { .. } => {
 				match self.derived_expiry_owner(&ownership).await? {
-					Attribution::Owned { .. } => debug!(vtxo_id = %ownership.id,
-						"Shadow expiry mailbox and Taproot destination resolved"),
-					Attribution::Unresolved => debug!(vtxo_id = %ownership.id,
-						"Shadow expiry ownership remains unresolved"),
-				}
-				match self.expiry_owner(*user_pubkey, network, server_mailbox_key).await? {
-					Attribution::Owned { mailbox_pk, spk } =>
-						Some(VerifiedPayee { mailbox: mailbox_pk, script: spk }),
-					Attribution::Unresolved => return Ok(PreparedCoin::Hold),
+					Attribution::Owned { mailbox_pk, spk } => {
+						self.execute("DELETE FROM expiry_hold WHERE vtxo_id=$1 AND reason=$2",
+							&[&ownership.id.to_string(), &"owner_binding_unresolved"]).await?;
+						Some(VerifiedPayee { mailbox: mailbox_pk, script: spk })
+					},
+					Attribution::Unresolved => {
+						self.execute("INSERT INTO expiry_hold (vtxo_id,reason) VALUES($1,$2)
+							ON CONFLICT(vtxo_id) DO UPDATE SET reason=excluded.reason,last_seen=NOW()",
+							&[&ownership.id.to_string(), &"owner_binding_unresolved"]).await?;
+						warn!(vtxo_id = %ownership.id, "Expiry owner binding is missing or inconsistent; holding principal");
+						return Ok(PreparedCoin::Hold);
+					},
 				}
 			},
 			OwnershipDisposition::Operator => None,
@@ -258,8 +256,6 @@ impl Server {
 						&snapshot.regular[*index],
 						&funding,
 						view,
-						self.config.network,
-						self.mailbox_key.leak_ref(),
 					).await).await.with_context(|| format!(
 						"expiry ownership preparation for terminal {}", snapshot.regular[*index].state.vtxo_id
 					))?;
@@ -315,8 +311,6 @@ impl Server {
 		match self.db.write(async |t| t.commit_expiry_group(
 			view,
 			outputs,
-			self.config.network,
-			self.mailbox_key.leak_ref(),
 		).await).await {
 			Ok(Some(group)) => info!(
 				allocation_id = group.id,

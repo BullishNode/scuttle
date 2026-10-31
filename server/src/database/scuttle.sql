@@ -1,14 +1,5 @@
--- Registration-era relations remain available until the ownership switch.
+-- Initial schema for fresh matched Scuttle stores.
 SET LOCAL search_path TO scuttle, public;
-
--- Initial signature-link schema for fresh fork stores.
-
-CREATE TABLE fallback_record (
-	mailbox_pk TEXT PRIMARY KEY,
-	spk TEXT NOT NULL,
-	mailbox_sig TEXT NOT NULL,
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
 
 CREATE INDEX expiry_vtxo_anchor_point_ix ON vtxo (anchor_point, vtxo_id);
 
@@ -25,17 +16,6 @@ CREATE TABLE expiry_cancelled_participation (
 	participation_id BIGINT PRIMARY KEY,
 	unlock_hash TEXT UNIQUE,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Signed coin links and mailbox registrations are rechecked before payout.
-CREATE TABLE expiry_owner_key (
-	user_pubkey TEXT PRIMARY KEY,
-	mailbox_pk TEXT NOT NULL REFERENCES fallback_record(mailbox_pk),
-	blinded_id TEXT NOT NULL CHECK (length(blinded_id) = 66),
-	signature TEXT NOT NULL CHECK (length(signature) = 128),
-	proof_version SMALLINT NOT NULL DEFAULT 1 CHECK (proof_version IN (1, 2)),
-	joint_proof TEXT CHECK (joint_proof IS NULL OR length(joint_proof) = 326),
-	CHECK (proof_version = 1 OR joint_proof IS NOT NULL)
 );
 
 -- Chain-derived decisions are invalid until both processes acknowledge their
@@ -82,7 +62,7 @@ CREATE TABLE expiry_allocation_input (
 CREATE TABLE expiry_allocation_coin (
 	allocation_id BIGINT NOT NULL REFERENCES expiry_allocation(id),
 	entitlement_id BIGINT NOT NULL REFERENCES expiry_entitlement(id),
-	owner_mailbox TEXT REFERENCES fallback_record(mailbox_pk),
+	owner_mailbox TEXT CHECK (owner_mailbox IS NULL OR length(owner_mailbox) = 66),
 	user_pubkey TEXT,
 	spk TEXT,
 	disposition TEXT NOT NULL CHECK (disposition IN ('customer', 'operator')),
@@ -132,7 +112,7 @@ CREATE TABLE expiry_lightning_receive_claim (
 	output_vtxo BYTEA NOT NULL
 );
 
--- Shadow ownership state. Admission and payout switch in a later source step.
+-- Both signatures are checked once at admission; preserve the first binding.
 CREATE TABLE owner_key (
 	user_pubkey TEXT PRIMARY KEY CHECK (length(user_pubkey) = 66),
 	mailbox_pk TEXT NOT NULL CHECK (length(mailbox_pk) = 66),
@@ -145,8 +125,7 @@ CREATE TABLE coin_owner (
 	mailbox_pk TEXT NOT NULL CHECK (length(mailbox_pk) = 66)
 );
 
--- Installed in shadow mode; the deferred trigger is activated only by the
--- coordinated fresh-store ownership switch, after every birth supplies rows.
+-- Check at commit so the writer can insert the VTXO before its paired row.
 CREATE FUNCTION require_customer_coin_owner() RETURNS TRIGGER
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -160,6 +139,8 @@ BEGIN
 	RETURN NEW;
 END;
 $$;
+CREATE CONSTRAINT TRIGGER customer_coin_owner AFTER INSERT ON public.vtxo
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION scuttle.require_customer_coin_owner();
 
 CREATE TABLE expiry_hold (
 	vtxo_id TEXT PRIMARY KEY REFERENCES public.vtxo(vtxo_id),

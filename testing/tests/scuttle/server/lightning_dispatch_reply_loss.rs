@@ -18,7 +18,7 @@ use ark_testing::{btc, sat, TestContext};
 use ark_testing::constants::BOARD_CONFIRMATIONS;
 use ark_testing::daemon::lightningd::Lightningd;
 use ark_testing::daemon::captaind::Captaind;
-use ark_testing::onchain::AppBip84Wallet;
+use ark_testing::onchain::AppBip86Wallet;
 use bitcoin::{Amount, Network, OutPoint, Transaction};
 use bitcoin::consensus::deserialize;
 use bitcoin::hex::DisplayHex;
@@ -155,7 +155,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool) {
 	wallet.sync().await;
 	assert_eq!((first.vtxos.len(), second.vtxos.len()), (1, 1));
 	let client = wallet.client().await;
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	let preimage = Preimage::random();
 	let hash = preimage.compute_payment_hash();
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
@@ -405,7 +405,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool) {
 		}
 	}).await.expect("the UNUSED same-hash source must automatically refund its absent owner after deadline");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	let payouts = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination.spk)
+	let payouts = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination)
 		.collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
 	let (index, output) = payouts[0];
@@ -423,7 +423,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool) {
 		.unwrap().unwrap();
 	assert!(utxo.confirmations >= 6);
 	assert_eq!(utxo.value, refund_amount);
-	assert_eq!(utxo.script_pub_key.script().unwrap(), destination.spk);
+	assert_eq!(utxo.script_pub_key.script().unwrap(), destination);
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |tx| Ok(tx.query_one("SELECT \
@@ -472,7 +472,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool) {
 		if info.confirmations.unwrap_or(0) == 0 { continue; }
 		assert!(info.confirmations.unwrap() >= 6);
 		assert_eq!(ctx.bitcoind().await_transaction(txid).await, recorded);
-		for (vout, output) in recorded.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination.spk) {
+		for (vout, output) in recorded.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination) {
 			assert!(customer_outputs.insert(OutPoint::new(txid, vout as u32)));
 			customer_total += output.value;
 		}
@@ -502,6 +502,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool) {
 			let mut finished = Vec::new();
 			for page_number in 0..32 {
 				let page = rpc.read_mailbox(protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 					mailbox_id: mailbox.mailbox().serialize(), authorization: Some(mailbox.serialize()), checkpoint,
 				}).await.unwrap().into_inner();
 				for item in page.messages {
@@ -808,6 +809,7 @@ async fn assert_no_success_in_sender_mailbox(
 	let mut finished = 0;
 	for _ in 0..32 {
 		let page = rpc.read_mailbox(protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 			mailbox_id: auth.mailbox().serialize(), authorization: Some(auth.serialize()), checkpoint,
 		}).await.unwrap().into_inner();
 		for message in page.messages {
@@ -830,7 +832,7 @@ async fn assert_no_success_in_sender_mailbox(
 
 async fn reopen_sender(ctx: &TestContext, srv: &Captaind, name: &str, seed: &bip39::Mnemonic) -> Wallet {
 	let db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join(name).join("db.sqlite")).unwrap());
-	let onchain = AppBip84Wallet::load_or_create(Network::Regtest, seed.to_seed(""), db.clone(),
+	let onchain = AppBip86Wallet::load_or_create(Network::Regtest, seed.to_seed(""), db.clone(),
 		ctx.bitcoind().sync_client()).await.unwrap();
 	let script = onchain.fallback_script();
 	let mut config = ctx.bark_default_cfg(srv, Some(ctx.bitcoind()));
@@ -838,8 +840,7 @@ async fn reopen_sender(ctx: &TestContext, srv: &Captaind, name: &str, seed: &bip
 	config.vtxo_refresh_expiry_threshold = BlockDelta::new(4);
 	config.vtxo_exit_margin = BlockDelta::new(2);
 	Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, seed), config,
-		OpenWalletArgs { persister: Some(db), onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
-			fallback_spk: Some(script), run_daemon: false, ..Default::default() }).await.unwrap()
+		OpenWalletArgs { persister: Some(db), onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))), run_daemon: false, ..Default::default() }).await.unwrap()
 }
 
 /// Three real CLN nodes are required: the first receiver permanently cancels
@@ -869,10 +870,10 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 			config.sweep_address.clone().unwrap().require_network(Network::Regtest).unwrap().script_pubkey()
 		};
 		let mnemonic = bip39::Mnemonic::generate(12).unwrap();
-		let old = Box::pin(ctx.bark_sdk("failed-sender", &srv).mnemonic(mnemonic.clone()).app_bip84()
+		let old = Box::pin(ctx.bark_sdk("failed-sender", &srv).mnemonic(mnemonic.clone()).app_bip86()
 			.cfg(|config| { config.daemon_manual_sync = true; config.vtxo_refresh_expiry_threshold=BlockDelta::new(4); config.vtxo_exit_margin=BlockDelta::new(2); }).boarded(sat(100_000)).create()).await;
 		old.stop_daemon_wait().await.unwrap();
-		let destination = old.fallback_destination().await.unwrap();
+		let destination = old.fallback_script();
 		let mailbox = old.mailbox_authorization(chrono::Local::now() + Duration::from_secs(600));
 		let preimage = Preimage::random();
 		let hash = preimage.compute_payment_hash();
@@ -937,11 +938,11 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		}).await.expect("the normal monitor must close the previous failure before a later Ark attempt");
 		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 1).await;
 
-		let later = Box::pin(ctx.bark_sdk("later-sender", &srv).app_bip84()
+		let later = Box::pin(ctx.bark_sdk("later-sender", &srv).app_bip86()
 			.cfg(|config| { config.daemon_manual_sync = true; config.vtxo_refresh_expiry_threshold=BlockDelta::new(4); config.vtxo_exit_margin=BlockDelta::new(2); }).boarded(sat(50_000)).boarded(sat(50_000)).create()).await;
 		later.stop_daemon_wait().await.unwrap();
-		let later_destination = later.fallback_destination().await.unwrap();
-		assert_ne!(later_destination.spk, destination.spk);
+		let later_destination = later.fallback_script();
+		assert_ne!(later_destination, destination);
 		let mut later_hold = later_receiver.hold_client().await;
 		let later_invoice = later_hold.invoice(hold::InvoiceRequest {
 			payment_hash: hash.to_vec(), amount_msat: 100_000_000,
@@ -1050,7 +1051,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 			}
 		}).await.expect("the absent previous failed sender must receive its fallback despite the later payment");
 		ctx.bitcoind().await_transaction(parent.compute_txid()).await;
-		let outputs = parent.output.iter().enumerate().filter(|(_,out)|out.script_pubkey==destination.spk).collect::<Vec<_>>();
+		let outputs = parent.output.iter().enumerate().filter(|(_,out)|out.script_pubkey==destination).collect::<Vec<_>>();
 		assert_eq!(outputs.len(),1); assert_eq!(outputs[0].1.value,sat(99_000));
 		let payout = OutPoint::new(parent.compute_txid(),outputs[0].0 as u32);
 		let confirmed = ctx.generate_blocks(6).await;
@@ -1059,7 +1060,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		let core = ctx.bitcoind().sync_client();
 		let utxo = core.get_tx_out(&payout.txid,payout.vout,Some(true)).unwrap().unwrap();
 		assert!(utxo.confirmations>=6); assert_eq!(utxo.value,sat(99_000));
-		assert_eq!(utxo.script_pub_key.script().unwrap(),destination.spk);
+		assert_eq!(utxo.script_pub_key.script().unwrap(),destination);
 		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 1).await;
 		tokio::time::timeout(Duration::from_secs(30),async {
 			loop {
@@ -1078,11 +1079,11 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 			}
 			assert!(!returned.is_invoice_paid(hash).await.unwrap());
 			let onchain = returned.onchain().unwrap();
-			assert!(onchain.read().await.is_mine(&destination.spk).await.unwrap());
+			assert!(onchain.read().await.is_mine(&destination).await.unwrap());
 			assert!(onchain.read().await.balance().await >= sat(99_000), "the onchain wallet must discover its payout");
 			let received = core.get_tx_out(&payout.txid,payout.vout,Some(true)).unwrap().unwrap();
 			assert_eq!(received.value, sat(99_000));
-			assert_eq!(received.script_pub_key.script().unwrap(), destination.spk);
+			assert_eq!(received.script_pub_key.script().unwrap(), destination);
 			let history = returned.history().await.unwrap();
 			let sends = history.iter().filter(|row|row.subsystem.is_subsystem(Subsystem::LIGHTNING_SEND)).collect::<Vec<_>>();
 			assert_eq!(sends.len(),1); assert_eq!(sends[0].id,old_htlcs.movement_id);
@@ -1113,8 +1114,8 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 				let txid=tx.compute_txid();
 				for (vout,out) in tx.output.iter().enumerate() {
 					let point=OutPoint::new(txid,vout as u32); known.insert(point,out.clone()); terminal.insert(point,out.clone());
-					if out.script_pubkey==destination.spk { customer.insert(point); assert_eq!(out.value,sat(99_000)); }
-					assert_ne!(out.script_pubkey,later_destination.spk,"the paid later source must not get a fallback");
+					if out.script_pubkey==destination { customer.insert(point); assert_eq!(out.value,sat(99_000)); }
+					assert_ne!(out.script_pubkey,later_destination,"the paid later source must not get a fallback");
 				}
 				assert!(graph.insert(txid,tx).is_none()); assert!(graph.len()<=64);
 			}

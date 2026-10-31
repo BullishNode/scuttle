@@ -33,7 +33,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 		.route("/mnemonic", get(mnemonic))
 		.route("/ark-info", get(ark_info))
 		.route("/debug-info", get(debug_info))
-		.route("/fallback", get(fallback_registration))
+		.route("/fallback", get(fallback_destination))
 		.route("/next-round", get(next_round))
 		.route("/addresses/next", post(address))
 		.route("/addresses/index/{index}", get(peek_address))
@@ -68,7 +68,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 		mnemonic,
 		ark_info,
 		debug_info,
-		fallback_registration,
+		fallback_destination,
 		next_round,
 		address,
 		peek_address,
@@ -98,7 +98,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 		bark_json::web::Bip321UriQuery,
 		bark_json::web::Bip321UriResponse,
 		bark_json::web::WalletExistsResponse,
-		bark_json::web::FallbackRegistrationInfo,
+		bark_json::web::FallbackInfo,
 		bark_json::web::WalletDeleteRequest,
 		bark_json::web::WalletDeleteResponse,
 		bark_json::web::ConnectedResponse,
@@ -363,27 +363,23 @@ pub async fn debug_info(
 #[utoipa::path(
 	get,
 	path = "/fallback",
-	summary = "Get fallback registration and payout address",
+	summary = "Get the mailbox-derived Bitcoin fallback address",
 	responses(
-		(status = 200, description = "Authenticated fallback registration, if present", body = bark_json::web::FallbackRegistrationInfo),
+		(status = 200, description = "Mailbox identity and BIP86 payout address", body = bark_json::web::FallbackInfo),
 		(status = 404, description = "No wallet is loaded", body = error::NotFoundError),
-		(status = 500, description = "Registration cannot be authenticated", body = error::InternalServerError)
+		(status = 500, description = "Wallet identity cannot be read", body = error::InternalServerError)
 	),
 	tag = "wallet"
 )]
 #[debug_handler]
-pub async fn fallback_registration(
+pub async fn fallback_destination(
 	State(state): State<Arc<ServerState>>,
-) -> HandlerResult<Json<bark_json::web::FallbackRegistrationInfo>> {
+) -> HandlerResult<Json<bark_json::web::FallbackInfo>> {
 	let wallet = state.require_wallet()?;
-	let registration = wallet.fallback_registration().await?;
-	let payout_address = match registration.as_ref() {
-		Some(record) => Some(bitcoin::Address::from_script(&record.spk, wallet.network().await?)
-			.context("invalid authenticated fallback address")?.to_string()),
-		None => None,
-	};
-	Ok(Json(bark_json::web::FallbackRegistrationInfo {
-		registered: registration.is_some(), payout_address,
+	let payout_address = bitcoin::Address::from_script(&wallet.fallback_script(), wallet.network().await?)
+		.context("invalid mailbox fallback address")?.to_string();
+	Ok(Json(bark_json::web::FallbackInfo {
+		mailbox_public_key: wallet.mailbox_identifier().as_pubkey().to_string(), payout_address,
 	}))
 }
 

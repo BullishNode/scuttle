@@ -17,10 +17,9 @@ async fn recovery_pending_customer_uses_immutable_mailbox_after_allocation_order
 		amount: Amount::from_sat(100_000 + index as u64), fee: Amount::ZERO, user_keypair: *key, ..Default::default()
 	}.build().1).collect::<Vec<_>>();
 	db.write(async |tx| {
-		tx.upsert_vtxos(coins[..5].iter().cloned().map(ServerVtxo::from),
-			Some((bitcoin::Network::Regtest, &srv.mailbox_keypair()))).await?;
+		tx.upsert_vtxos(coins[..5].iter().cloned().map(ServerVtxo::from)).await?;
 		tx.execute_vtxo_tree_update(server::database::tree::VtxoTreeUpdate::new()
-			.insert_unspent_vtxos([ServerVtxo::from(coins[5].clone())], server::database::SpendState::Pool), None).await?;
+			.insert_unspent_vtxos([ServerVtxo::from(coins[5].clone())], server::database::SpendState::Pool)).await?;
 		let ids = coins[..5].iter().map(|coin| coin.id().to_string()).collect::<Vec<_>>();
 		tx.execute("UPDATE vtxo SET spend_state='spent' WHERE vtxo_id=ANY($1)", &[&ids]).await?;
 		Ok(())
@@ -28,7 +27,7 @@ async fn recovery_pending_customer_uses_immutable_mailbox_after_allocation_order
 	let allocation = db.write(async |tx| {
 		let allocation: i64 = tx.query_one("INSERT INTO expiry_allocation(expiry_height,status) \
 			VALUES(1,'pending') RETURNING id", &[]).await?.get("id");
-		let record = tx.get_fallback(mailbox.public_key()).await?.unwrap();
+		let script = bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None);
 		for (index, coin) in coins[..4].iter().enumerate() {
 			let entitlement: i64 = tx.query_one("INSERT INTO expiry_entitlement(vtxo_id,gross_sat) VALUES($1,$2) RETURNING id",
 				&[&coin.id().to_string(), &i64::try_from(coin.amount().to_sat())?]).await?.get("id");
@@ -36,12 +35,16 @@ async fn recovery_pending_customer_uses_immutable_mailbox_after_allocation_order
 				disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,evidence) \
 				VALUES($1,$2,$3,$4,$5,$6,$7,0,$8,0,'{}')", &[
 				&allocation, &entitlement, &mailbox.public_key().to_string(),
-				&keys[0].public_key().to_string(), &record.spk.to_hex_string(),
+				&keys[0].public_key().to_string(), &script.to_hex_string(),
 				&if index == 3 { "operator" } else { "customer" },
 				&i64::try_from(coin.amount().to_sat())?,
 				&if index == 3 { 0_i64 } else { i64::try_from(coin.amount().to_sat())? },
 			]).await?;
 		}
+		tx.execute("INSERT INTO expiry_allocation_payout(allocation_id,output_index,spk,amount_sat)
+			VALUES($1,0,$2,$3)", &[&allocation,&script.to_hex_string(),
+			&i64::try_from(coins[..3].iter().map(|coin| coin.amount()).sum::<Amount>().to_sat())?]).await?;
+
 		Ok(allocation)
 	}).await.unwrap();
 	let expected = [Some(protos::VtxoSpendState::FallbackPending), Some(protos::VtxoSpendState::FallbackPending),

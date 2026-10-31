@@ -861,7 +861,7 @@ impl Server {
 					vtxo.chain_anchor(),
 				);
 			}
-			let inserted = t.execute_vtxo_tree_update(update, Some((self.config.network, self.mailbox_key.leak_ref()))).await?;
+			let inserted = t.execute_vtxo_tree_update(update).await?;
 			t.add_funding_vtxos_to_frontier(funding_txid, Some(confirmed_height)).await
 				.context("failed to add board vtxos to frontier")?;
 			Ok(inserted)
@@ -1041,7 +1041,7 @@ impl Server {
 			.provide_signatures(vtxos)
 			.mark_vtxos_registered(registered_ids);
 		self.db.write(async |t| {
-			t.execute_vtxo_tree_update(update, None).await?;
+			t.execute_vtxo_tree_update(update).await?;
 			htlc_vtxo::create_htlc_vtxos(&t, &htlc_sends, HtlcDirection::Incoming).await?;
 			Ok(())
 		}).await?;

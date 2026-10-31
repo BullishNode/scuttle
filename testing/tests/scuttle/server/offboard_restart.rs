@@ -89,9 +89,9 @@ async fn interrupted_offboard() {
 	let coin = coins[0].clone();
 	let source = coin.id();
 	let root = coin.chain_anchor();
-	let fallback = wallet.fallback_destination().await.unwrap();
+	let fallback = wallet.fallback_script();
 	let address = ctx.bitcoind().get_new_address();
-	assert_ne!(address.script_pubkey(), fallback.spk);
+	assert_ne!(address.script_pubkey(), fallback);
 	// Fund fees before the interruption and the early-payout check. The customer
 	// never funds or drives recovery afterward.
 	let sponsor_address = srv.watchmand().wait_wallet_address().await;
@@ -105,10 +105,9 @@ async fn interrupted_offboard() {
 	let observation_height = ctx.bitcoind().get_block_count().await;
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let mailbox = wallet.mailbox_identifier().as_pubkey();
-	let registered = db.read(async |tx| tx.get_fallback(mailbox).await).await.unwrap().unwrap();
-	registered.verify(bitcoin::Network::Regtest, mailbox).unwrap();
-	assert_eq!(registered.spk, fallback.spk);
-	assert!(registered.same_binding(&fallback));
+	let derived = bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None);
+	assert_eq!(derived, fallback);
+	assert_eq!(derived, fallback);
 	srv.watchmand().stop().await.unwrap();
 	let sender = wallet.clone();
 	let destination = address.clone();
@@ -273,7 +272,7 @@ async fn interrupted_offboard() {
 		let hash = core.get_block_hash(height).unwrap();
 		for transaction in core.get_block(&hash).unwrap().txdata {
 			for (vout, output) in transaction.output.iter().enumerate() {
-				assert_ne!(output.script_pubkey, fallback.spk, "no hidden canonical fallback may coexist with the offboard");
+				assert_ne!(output.script_pubkey, fallback, "no hidden canonical fallback may coexist with the offboard");
 				if output.script_pubkey == address.script_pubkey() {
 					assert_eq!(output.value, prepared.onchain_output_amount);
 					owner_outputs.insert(OutPoint::new(transaction.compute_txid(), vout as u32));
@@ -285,7 +284,7 @@ async fn interrupted_offboard() {
 	for txid in core.get_raw_mempool().unwrap() {
 		let transaction = ctx.bitcoind().await_transaction(txid).await;
 		assert!(transaction.output.iter().all(|output|
-			output.script_pubkey != fallback.spk && output.script_pubkey != address.script_pubkey()),
+			output.script_pubkey != fallback && output.script_pubkey != address.script_pubkey()),
 			"a second customer payment must not remain hidden in the mempool");
 	}
 	assert_eq!(gate.calls.load(Ordering::SeqCst), 1);

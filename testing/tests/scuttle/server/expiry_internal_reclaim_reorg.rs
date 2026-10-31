@@ -198,13 +198,13 @@ async fn reclaim_reorg(when: When) {
 	let invoice = recipient.bolt11_invoice(sat(90_000), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
 	let receiver_key = recipient.new_address().await.unwrap().policy().user_pubkey();
-	let receiver_destination = recipient.fallback_destination().await.unwrap();
+	let receiver_destination = recipient.fallback_script();
 	let sender = ctx.bark("absent-sender", &srv).funded(sat(200_000)).create().await;
 	let ids = sender.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	let client = sender.client().await;
 	let input = client.get_full_vtxo(ids[0]).await.unwrap();
 	let key = client.get_vtxo_key(&input).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let incoming_deadline = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
 	let outgoing_deadline = tip + BlockDelta::new(36);
@@ -224,7 +224,7 @@ async fn reclaim_reorg(when: When) {
 		invoice: invoice.to_string(), payment_amount_sat: 90_000,
 		htlc_vtxo_ids: vec![incoming[0].id().to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
 	}).await.unwrap();
-	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 		owner_proof: Some(recipient.owner_link(receiver_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver_key.serialize().to_vec(),
 		htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,
@@ -250,7 +250,7 @@ async fn reclaim_reorg(when: When) {
 			srv.watchmand().wait_for_sync_height(height).await;
 			tokio::time::sleep(Duration::from_secs(1)).await;
 			let closures = super::expiry_lightning_terminal::confirmed_grant_closures(
-				&ctx, &db, &grants, &receiver_destination.spk,
+				&ctx, &db, &grants, &receiver_destination,
 			).await;
 			let required = closures.as_ref().map(|rows| rows.values().map(|(_, closed)|
 				closed.checked_add(6).unwrap()).max().unwrap());
@@ -449,7 +449,7 @@ async fn reclaim_reorg(when: When) {
 		version: bitcoin::transaction::Version::TWO,
 		lock_time: bitcoin::absolute::LockTime::ZERO,
 		input: Vec::new(),
-		output: vec![TxOut { value: sat(90_000 - 2_000), script_pubkey: receiver_destination.spk.clone() }],
+		output: vec![TxOut { value: sat(90_000 - 2_000), script_pubkey: receiver_destination.clone() }],
 	};
 	let clauses = grants.iter().map(|g| g.policy().as_server_htlc_recv().unwrap()
 		.user_reveals_preimage_clause(g.exit_delta())).collect::<Vec<_>>();
@@ -502,7 +502,7 @@ async fn reclaim_reorg(when: When) {
 		}
 	}
 	let sender_refunded = customer_allocations(&db, &source, "confirmed").await.iter()
-		.any(|(_, tx)| is_confirmed(tx.compute_txid()) && tx.output.iter().any(|o| o.script_pubkey == destination.spk));
+		.any(|(_, tx)| is_confirmed(tx.compute_txid()) && tx.output.iter().any(|o| o.script_pubkey == destination));
 	let receiver_paid = is_confirmed(claim.compute_txid());
 	assert!(!(sender_refunded && receiver_paid),
 		"DOUBLE PAYMENT: the sender's refund and the receiver's preimage claim both confirmed");
@@ -513,7 +513,7 @@ async fn reclaim_reorg(when: When) {
 				JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND c.disposition='customer'",
 				&[&source]).await?.get::<_, i64>(0))).await.unwrap();
 			assert_eq!(sender_decisions, 0, "the receiver's actual collection cannot also authorize a sender refund");
-			let current = assert_canonical_money(&ctx, &destination.spk, &receiver_destination.spk, sat(0), sat(88_000)).await;
+			let current = assert_canonical_money(&ctx, &destination, &receiver_destination, sat(0), sat(88_000)).await;
 			assert_eq!(current.get(&claim.compute_txid()), Some(&claim));
 			assert_eq!(prevouts.iter().map(|output| output.value).sum::<bitcoin::Amount>(), sat(90_000));
 			assert_eq!(claim.output.iter().map(|output| output.value).sum::<bitcoin::Amount>(), sat(88_000));
@@ -522,7 +522,7 @@ async fn reclaim_reorg(when: When) {
 		},
 		When::AfterRefundShallow(_) | When::AfterSignedRefundFive => {
 			assert!(sender_refunded && !receiver_paid, "a supported post-refund fork must actually restore its sender payment");
-			let current = assert_canonical_money(&ctx, &destination.spk, &receiver_destination.spk, sat(99_000), sat(0)).await;
+			let current = assert_canonical_money(&ctx, &destination, &receiver_destination, sat(99_000), sat(0)).await;
 			let (_, parent) = original_refund.as_ref().unwrap();
 			assert_eq!(current.get(&parent.compute_txid()), Some(parent), "the watchman must replay the exact retained parent");
 			assert_eq!(parent.version.0, 3);
@@ -534,7 +534,7 @@ async fn reclaim_reorg(when: When) {
 			let previous = ctx.bitcoind().await_transaction(parent.input[0].previous_output.txid).await;
 			assert_eq!(previous.output[parent.input[0].previous_output.vout as usize].value, sat(100_000));
 			assert_eq!(parent.output.iter().map(|output| output.value).sum::<bitcoin::Amount>(), sat(100_000));
-			assert!(parent.output.iter().all(|output| output.script_pubkey == destination.spk
+			assert!(parent.output.iter().all(|output| output.script_pubkey == destination
 				|| output.script_pubkey == operator_script || output.is_p2a_fee_anchor()),
 				"the refund cannot redirect remaining operator principal to an unexplained third payee");
 			let anchors = parent.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor()).collect::<Vec<_>>();

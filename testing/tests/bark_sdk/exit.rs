@@ -113,9 +113,9 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 		let full = owner.get_full_vtxo(id).await.unwrap();
 		source_path.extend(full.transactions().map(|step|
 			bitcoin::OutPoint::new(step.tx.compute_txid(), step.output_idx as u32)));
-		let destination = owner.fallback_destination().await.unwrap();
+		let destination = owner.fallback_script();
 		let key = owner.get_vtxo_key(id).await.unwrap();
-		assert!(expected.insert(id.to_string(), (gross, destination.spk,
+		assert!(expected.insert(id.to_string(), (gross, destination,
 			owner.mailbox_identifier().as_pubkey().to_string(), key.public_key().to_string())).is_none());
 	}
 	assert_eq!(expected.values().map(|entry| entry.0).sum::<bitcoin::Amount>(), sat(400_000));
@@ -163,10 +163,10 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 	assert!(matches!(shallow, Some(ExitState::Processing(_))),
 		"one-deep customer payout must not end the exit: {:?}", shallow);
 	wallet.sync_fallback_payouts().await.unwrap();
-	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Spendable);
+	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Locked { holder: None });
 	assert!(wallet.awaiting_settlement_vtxos().await.unwrap().contains(&vtxo));
-	let registered = wallet.fallback_destination().await.unwrap();
-	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered.spk).unwrap() as u32;
+	let registered = wallet.fallback_script();
+	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered).unwrap() as u32;
 	assert!(wallet.verify_fallback_output(bitcoin::OutPoint::new(parent.compute_txid(), payout_index)).await.is_err(),
 		"one confirmation cannot discharge the registered payout");
 
@@ -239,7 +239,11 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 		assert!(owner.vtxos().await.unwrap().is_empty());
 		assert!(!owner.awaiting_settlement_vtxos().await.unwrap().contains(&id));
 		let before_refresh = owner.history().await.unwrap();
-		assert!(before_refresh.iter().all(|movement| movement.subsystem.name != "abandon.fallback_payout"));
+		let receipts = before_refresh.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback").collect::<Vec<_>>();
+		assert_eq!(receipts.len(), 1);
+		assert_eq!(receipts[0].status, bark::movement::MovementStatus::Successful);
+		assert_eq!(receipts[0].effective_balance.to_sat(), -(gross.to_sat() as i64));
+		assert_eq!(receipts[0].offchain_fee, fee);
 
 		assert!(owner.refresh_vtxos([id]).await.unwrap().is_none(), "paid principal must not enter another round");
 		owner.sync_fallback_payouts().await.unwrap();
@@ -344,9 +348,9 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 		let full = owner.get_full_vtxo(id).await.unwrap();
 		source_path.extend(full.transactions().map(|step|
 			bitcoin::OutPoint::new(step.tx.compute_txid(), step.output_idx as u32)));
-		let destination = owner.fallback_destination().await.unwrap();
+		let destination = owner.fallback_script();
 		let key = owner.get_vtxo_key(id).await.unwrap();
-		assert!(expected.insert(id.to_string(), (gross, destination.spk,
+		assert!(expected.insert(id.to_string(), (gross, destination,
 			owner.mailbox_identifier().as_pubkey().to_string(), key.public_key().to_string())).is_none());
 	}
 	assert_eq!(expected.values().map(|entry| entry.0).sum::<bitcoin::Amount>(), sat(400_000));
@@ -423,10 +427,10 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 	assert!(matches!(shallow, Some(ExitState::Processing(_))),
 		"one-deep customer payout must not end the exit: {:?}", shallow);
 	receiver.sync_fallback_payouts().await.unwrap();
-	assert_eq!(receiver.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Spendable);
+	assert_eq!(receiver.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Locked { holder: None });
 	assert!(receiver.awaiting_settlement_vtxos().await.unwrap().contains(&vtxo));
-	let registered = receiver.fallback_destination().await.unwrap();
-	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered.spk).unwrap() as u32;
+	let registered = receiver.fallback_script();
+	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered).unwrap() as u32;
 	assert!(receiver.verify_fallback_output(bitcoin::OutPoint::new(parent.compute_txid(), payout_index)).await.is_err(),
 		"one confirmation cannot discharge the registered payout");
 
@@ -499,7 +503,11 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 		assert!(owner.vtxos().await.unwrap().is_empty());
 		assert!(!owner.awaiting_settlement_vtxos().await.unwrap().contains(&id));
 		let before_refresh = owner.history().await.unwrap();
-		assert!(before_refresh.iter().all(|movement| movement.subsystem.name != "abandon.fallback_payout"));
+		let receipts = before_refresh.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback").collect::<Vec<_>>();
+		assert_eq!(receipts.len(), 1);
+		assert_eq!(receipts[0].status, bark::movement::MovementStatus::Successful);
+		assert_eq!(receipts[0].effective_balance.to_sat(), -(gross.to_sat() as i64));
+		assert_eq!(receipts[0].offchain_fee, fee);
 
 		assert!(owner.refresh_vtxos([id]).await.unwrap().is_none(), "paid principal must not enter another round");
 		owner.sync_fallback_payouts().await.unwrap();

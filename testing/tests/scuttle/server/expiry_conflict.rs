@@ -28,7 +28,7 @@ async fn expiry_actual_partial_exit_conflict_regroups_after_restart() {
 	let client = wallet.client().await;
 	let exiting = client.get_full_vtxo(first.vtxos[0]).await.unwrap();
 	let untouched = client.get_full_vtxo(second.vtxos[0]).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	assert_ne!(exiting.chain_anchor(), untouched.chain_anchor());
 	assert_eq!(exiting.expiry_height(), untouched.expiry_height());
 	drop(client);
@@ -52,7 +52,7 @@ async fn expiry_actual_partial_exit_conflict_regroups_after_restart() {
 		}
 	}).await.expect("both ready same-expiry roots must form a real merged decision");
 	assert_eq!(original.input.len(), 2);
-	let payouts = original.output.iter().filter(|o| o.script_pubkey == destination.spk).collect::<Vec<_>>();
+	let payouts = original.output.iter().filter(|o| o.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
 	assert_eq!(payouts[0].value, exiting.amount() + untouched.amount() - sat(2_000));
 	assert!(ctx.bitcoind().sync_client().get_mempool_entry(&original.compute_txid()).is_err(),
@@ -108,7 +108,7 @@ async fn expiry_actual_partial_exit_conflict_regroups_after_restart() {
 	}).await.expect("the unaffected root must regroup and pay without the exiting root");
 	assert_eq!(replacement.input.len(), 1);
 	assert_eq!(replacement.input[0].previous_output, untouched.chain_anchor());
-	assert_eq!(replacement.output.iter().find(|o| o.script_pubkey == destination.spk).unwrap().value,
+	assert_eq!(replacement.output.iter().find(|o| o.script_pubkey == destination).unwrap().value,
 		untouched.amount() - sat(1_000));
 	assert_eq!(ctx.bitcoind().await_transaction(replacement.compute_txid()).await, replacement);
 	ctx.generate_blocks(6).await;

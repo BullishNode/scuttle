@@ -351,9 +351,9 @@ async fn partial_conflict_reorg() {
 	let client = wallet.client().await;
 	let exiting = client.get_full_vtxo(first.vtxos[0]).await.unwrap();
 	let untouched = client.get_full_vtxo(second.vtxos[0]).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	let owner_mailbox = client.mailbox_identifier().as_pubkey();
-	destination.verify(Network::Regtest, owner_mailbox).unwrap();
+
 	let owner_keys = BTreeMap::from([
 		(exiting.id().to_string(), client.get_vtxo_key(&exiting).await.unwrap().public_key().to_string()),
 		(untouched.id().to_string(), client.get_vtxo_key(&untouched).await.unwrap().public_key().to_string()),
@@ -387,7 +387,7 @@ async fn partial_conflict_reorg() {
 		let transaction = ctx.bitcoind().await_transaction(utxo.outpoint.txid).await;
 		let output = transaction.output[utxo.outpoint.vout as usize].clone();
 		assert_eq!(output.value, utxo.amount);
-		assert_ne!(output.script_pubkey, destination.spk);
+		assert_ne!(output.script_pubkey, destination);
 		assert!(ordinary_change.insert(utxo.outpoint, output).is_none());
 	}
 	assert!(!ordinary_change.is_empty());
@@ -420,7 +420,7 @@ async fn partial_conflict_reorg() {
 	assert_eq!(original.output.iter().map(|out| out.value.to_sat()).sum::<u64>(),
 		backing.values().map(|out| out.value.to_sat()).sum::<u64>(),
 		"the immutable payout must conserve actual backing with zero parent miner fee");
-	let payouts = original.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination.spk)
+	let payouts = original.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination)
 		.collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
 	assert_eq!(payouts[0].1.value, sat(198_000));
@@ -477,7 +477,7 @@ async fn partial_conflict_reorg() {
 	}).await.expect("a real terminal claim and distinct unaffected-root regroup must both be recorded");
 	assert_eq!(regroup.input.len(), 1);
 	assert_eq!(regroup.input[0].previous_output, untouched.chain_anchor());
-	assert_eq!(regroup.output.iter().find(|out| out.script_pubkey == destination.spk).unwrap().value, sat(99_000));
+	assert_eq!(regroup.output.iter().find(|out| out.script_pubkey == destination).unwrap().value, sat(99_000));
 	assert!(!ctx.bitcoind().sync_client().get_raw_mempool().unwrap().contains(&regroup.compute_txid()));
 	let claim = ctx.bitcoind().await_transaction(claim_txid).await;
 	assert!(claim.input.iter().any(|input| input.previous_output == exiting.point()));
@@ -623,7 +623,7 @@ async fn partial_conflict_reorg() {
 		}
 		assert_eq!(parent.output.iter().map(|out| out.value.to_sat()).sum::<u64>(), gross.to_sat(),
 			"each canonical parent must conserve all actual backing with zero parent fee");
-		let payouts = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination.spk)
+		let payouts = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination)
 			.collect::<Vec<_>>();
 		assert_eq!(payouts.len(), 1);
 		let (index, payout) = payouts[0];
@@ -632,7 +632,7 @@ async fn partial_conflict_reorg() {
 		let output = rpc.get_tx_out(&txid, index as u32, Some(true)).unwrap().unwrap();
 		assert!(output.confirmations >= 6);
 		assert_eq!(output.value, payout.value);
-		assert_eq!(output.script_pub_key.script().unwrap(), destination.spk);
+		assert_eq!(output.script_pub_key.script().unwrap(), destination);
 		paid += output.value;
 	}
 	assert_eq!(root_payments.keys().copied().collect::<BTreeSet<_>>(), backing.keys().copied().collect::<BTreeSet<_>>());
@@ -645,7 +645,7 @@ async fn partial_conflict_reorg() {
 	]);
 	assert_final_outcome(&ctx, &db, &coins, &expected_payers, &stored_parents, &canonical).await;
 	let physical_cut = Box::pin(assert_physical_cut(&ctx, &db, &srv, &coins, &expected_payers,
-		&stored_parents, &canonical, &backing, &fee_sponsors, &destination.spk,
+		&stored_parents, &canonical, &backing, &fee_sponsors, &destination,
 		&owner_mailbox.to_string(), &owner_keys, &initial_funding, &boards, &ordinary_change, board_fee)).await;
 	assert_eq!(decided_obligations(&db, &coins).await, permanent);
 	// Reconsidering a shorter real branch must not resurrect the old claim's
@@ -660,7 +660,7 @@ async fn partial_conflict_reorg() {
 	rebuilt_generation(&db, reconsidered_tip).await;
 	assert_final_outcome(&ctx, &db, &coins, &expected_payers, &stored_parents, &canonical).await;
 	assert_eq!(Box::pin(assert_physical_cut(&ctx, &db, &srv, &coins, &expected_payers,
-		&stored_parents, &canonical, &backing, &fee_sponsors, &destination.spk,
+		&stored_parents, &canonical, &backing, &fee_sponsors, &destination,
 		&owner_mailbox.to_string(), &owner_keys, &initial_funding, &boards, &ordinary_change, board_fee)).await, physical_cut,
 		"a settled reconsider cycle must retain the same canonical signed packages and physical money cut");
 	assert!(rpc.custom_get_raw_transaction_info(claim_txid, None).unwrap()

@@ -134,7 +134,7 @@ impl Server {
 					crate::database::expiry_guard::guard_new_lightning_inputs(t, &source_ids).await?;
 				}
 			}
-			let inserted = t.execute_vtxo_tree_update(update, Some((self.config.network, self.mailbox_key.leak_ref()))).await?;
+			let inserted = t.execute_vtxo_tree_update(update).await?;
 			htlc_vtxo::set_htlc_vtxo_resolutions(
 				&t, &claimed_htlc_recvs, HtlcResolution::Fulfilled,
 			).await?;

@@ -258,7 +258,7 @@ impl Server {
 				.insert_unspent_vtxos(ff_vtxos, SpendState::RoundForfeit)
 				.mark_vtxos_round_forfeited(input_forfeit_pairs)
 				.mark_vtxos_claimed(output_vtxo_ids);
-			t.execute_vtxo_tree_update(update, None).await
+			t.execute_vtxo_tree_update(update).await
 				.context("failed to execute vtxo tree update")?;
 			t.mark_participation_forfeited(unlock_hash).await
 				.context("failed to mark participation as forfeited")?;

@@ -98,7 +98,7 @@ async fn partial_terminal(case: TerminalCase) {
 	let invoice = recipient.bolt11_invoice(sat(180_000), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
 	let receive_key = recipient.new_address().await.unwrap().policy().user_pubkey();
-	let receive_destination = recipient.fallback_destination().await.unwrap();
+	let receive_destination = recipient.fallback_script();
 	let actor = ctx.bark("sender", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
 		.funded(sat(400_000)).create().await;
 	let first = actor.board_and_confirm_and_register(&ctx, sat(100_000)).await;
@@ -110,8 +110,8 @@ async fn partial_terminal(case: TerminalCase) {
 	assert_ne!(inputs[0].chain_anchor(), inputs[1].chain_anchor());
 	assert!(inputs.iter().all(|input| input.amount() == sat(100_000)));
 	let keys = vec![sender.get_vtxo_key(&inputs[0]).await.unwrap(), sender.get_vtxo_key(&inputs[1]).await.unwrap()];
-	let fallback = sender.fallback_destination().await.unwrap();
-	assert_ne!(fallback.spk, receive_destination.spk);
+	let fallback = sender.fallback_script();
+	assert_ne!(fallback, receive_destination);
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let incoming_deadline = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
 	let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints(inputs,
@@ -132,7 +132,7 @@ async fn partial_terminal(case: TerminalCase) {
 		htlc_vtxo_ids: sources.iter().map(|source| source.id().to_bytes().to_vec()).collect(),
 		mailbox_id: None, retry_for_secs: Some(5),
 	}).await.unwrap();
-	let reply = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+	let reply = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receive_key.serialize().to_vec(),
 		htlc_recv_expiry: (tip + BlockDelta::new(36)).to_u32(), lightning_receive_anti_dos: None,
@@ -189,7 +189,7 @@ async fn partial_terminal(case: TerminalCase) {
 	let mut claim = Transaction {
 		version: bitcoin::transaction::Version::TWO, lock_time: clause.locktime(),
 		input: vec![TxIn { previous_output: point, script_sig: Default::default(), sequence: clause.sequence(), witness: Witness::new() }],
-		output: vec![TxOut { value: sat(98_000), script_pubkey: if all_terminal { fallback.spk.clone() } else { claim_address.script_pubkey() } }],
+		output: vec![TxOut { value: sat(98_000), script_pubkey: if all_terminal { fallback.clone() } else { claim_address.script_pubkey() } }],
 	};
 	if reorg_a {
 		claim.lock_time = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32).to_locktime().unwrap();
@@ -221,7 +221,7 @@ async fn partial_terminal(case: TerminalCase) {
 		if mature>current { ctx.generate_blocks(mature-current).await; }
 		let mut tx = Transaction { version:bitcoin::transaction::Version::TWO,lock_time:clause.locktime(),
 			input:vec![TxIn {previous_output:source.point(),script_sig:Default::default(),sequence:clause.sequence(),witness:Witness::new()}],
-			output:vec![TxOut {value:sat(98_000),script_pubkey:fallback.spk.clone()}] };
+			output:vec![TxOut {value:sat(98_000),script_pubkey:fallback.clone()}] };
 		let witness = sender.sign_input_with_clause(source,&clause.into(),0,
 			&mut SighashCache::new(&tx),&Prevouts::All(&[source.txout()])).await.unwrap();
 		tx.input[0].witness=witness;
@@ -261,7 +261,7 @@ async fn partial_terminal(case: TerminalCase) {
 				tokio::time::sleep(Duration::from_millis(50)).await;
 			}
 		}).await.expect("retain both actual original user authorizations before operator recovery");
-		all_terminal_returns(&ctx,&srv,&db,&sources,&[claim,second_claim.clone()],&grants,&operator,&fallback.spk,&receive_destination.spk).await;
+		all_terminal_returns(&ctx,&srv,&db,&sources,&[claim,second_claim.clone()],&grants,&operator,&fallback,&receive_destination).await;
 		return;
 	}
 	let unpaid = sources[1].id();
@@ -279,16 +279,16 @@ async fn partial_terminal(case: TerminalCase) {
 		panic!("the genuinely unpaid original source still requires an absent user");
 	}).await.expect("partial terminal closure must not strand the other original source");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx, &db, &grants, &receive_destination.spk).await;
+	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx, &db, &grants, &receive_destination).await;
 	let mut unpaid_path = sources[1].transactions().map(|step|
 		bitcoin::OutPoint::new(step.tx.compute_txid(), step.output_idx as u32)).collect::<BTreeSet<_>>();
 	unpaid_path.insert(sources[1].chain_anchor());
 	assert!(parent.input.iter().any(|input| unpaid_path.contains(&input.previous_output)),
 		"a grant-funded parent alone cannot discharge B while its original backing remains independently live");
 	assert!(!parent.input.iter().any(|input| input.previous_output == point));
-	let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == fallback.spk).unwrap();
+	let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == fallback).unwrap();
 	assert_eq!(output.value, sat(99_000));
-	assert!(!parent.output.iter().any(|output| output.script_pubkey == receive_destination.spk));
+	assert!(!parent.output.iter().any(|output| output.script_pubkey == receive_destination));
 	let mut value = sat(0);
 	for input in &parent.input {
 		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;

@@ -905,9 +905,9 @@ impl PendingRoundInfo {
 /// The app-selected fallback destination authenticated by this wallet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
-pub struct FallbackRegistrationInfo {
-	pub registered: bool,
-	pub payout_address: Option<String>,
+pub struct FallbackInfo {
+	pub mailbox_public_key: String,
+	pub payout_address: String,
 }
 
 #[derive(Serialize, Deserialize)]

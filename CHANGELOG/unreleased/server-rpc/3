@@ -1,0 +1,5 @@
+- Expose stage-entitled fallback receipts through authenticated status and mailbox reads.
+  Explicit source aliases support recipient recovery without a materialized VTXO.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+  - **BREAKING:** Retired owner-proof tags are decode-only refusal tombstones;
+    Scuttle protocol 1000 and current joint proofs are required. `SetFallback` is removed.

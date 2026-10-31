@@ -1,0 +1,3 @@
+- Show the mailbox-derived payout address without a registration request.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+  - **BREAKING:** The legacy development subcommand is `fallback-address`.

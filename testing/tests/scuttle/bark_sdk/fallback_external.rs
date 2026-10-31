@@ -1,4 +1,4 @@
-//! Fallback registration, payout and seed restoration with an application-owned BIP84 wallet.
+//! Mailbox-derived payout and seed restoration with an application-owned BIP86 wallet.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -15,31 +15,31 @@ use server_rpc::protos;
 use tokio::sync::RwLock;
 
 use ark_testing::{sat, TestContext};
-use ark_testing::onchain::AppBip84Wallet;
+use ark_testing::onchain::AppBip86Wallet;
 use ark_testing::daemon::captaind::{self, WalletAdminClient};
 
 #[tokio::test]
-async fn fallback_external_bip84_wallet_registers_and_restores_without_ark_seed_assumptions() {
-	let ctx = TestContext::new("bark_sdk/fallback_external_bip84_wallet").await;
+async fn fallback_external_bip86_wallet_registers_and_restores_without_ark_seed_assumptions() {
+	let ctx = TestContext::new("bark_sdk/fallback_external_bip86_wallet").await;
 	let srv = ctx.captaind("server").create().await;
 	let network = Network::Regtest;
 	let ark_seed = [33; 64];
 	let app_seed = [55; 64];
 	let app_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join("app.sqlite")).unwrap());
-	let app_bdk = AppBip84Wallet::load_or_create(network, app_seed, app_db, ctx.bitcoind().sync_client()).await.unwrap();
+	let app_bdk = AppBip86Wallet::load_or_create(network, app_seed, app_db, ctx.bitcoind().sync_client()).await.unwrap();
 	let payout = app_bdk.fallback_script();
-	assert!(payout.is_p2wpkh());
+	assert!(payout.is_p2tr());
 	let app: Arc<RwLock<dyn OnchainWalletTrait>> = Arc::new(RwLock::new(app_bdk));
 	let mut config = ctx.bark_default_cfg(&*srv, Some(ctx.bitcoind()));
 	config.daemon_manual_sync = true;
 	let ark_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join("ark.sqlite")).unwrap());
-	let wallet = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed), config.clone(), OpenWalletArgs {
-		persister: Some(ark_db.clone()), onchain: Some(app.clone()), fallback_spk: Some(payout.clone()),
+	let wallet = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed)
+		.with_external_mailbox_keypair(AppBip86Wallet::mailbox_keypair(network, &app_seed).unwrap()), config.clone(), OpenWalletArgs {
+		persister: Some(ark_db.clone()), onchain: Some(app.clone()),
 		run_daemon: false, ..Default::default()
 	}).await.unwrap();
-	let record = wallet.fallback_destination().await.unwrap();
-	assert_eq!(record.spk, payout);
-	record.verify(network, wallet.mailbox_identifier().as_pubkey()).unwrap();
+	let record = wallet.fallback_script();
+	assert_eq!(record, payout);
 	assert_eq!(wallet.new_address_with_index().await.unwrap().1, 0);
 	let address = Address::from_script(&payout, network).unwrap();
 	ctx.bitcoind().fund_addr(address, sat(20_000)).await;
@@ -47,11 +47,12 @@ async fn fallback_external_bip84_wallet_registers_and_restores_without_ark_seed_
 	app.write().await.sync(wallet.chain()).await.unwrap();
 	assert_eq!(app.read().await.balance().await, sat(20_000));
 
-	// An alternate standard address still conflicts with the cached registration.
+	// A different mailbox key cannot reopen the same Ark identity.
 	let changed = app.write().await.address().await.unwrap().script_pubkey();
 	assert_ne!(changed, payout);
-	let mismatch = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed), config.clone(), OpenWalletArgs {
-		persister: Some(ark_db), onchain: Some(app.clone()), fallback_spk: Some(changed),
+	let mismatch = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed)
+		.with_external_mailbox_keypair(AppBip86Wallet::mailbox_keypair(network, &[56; 64]).unwrap()), config.clone(), OpenWalletArgs {
+		persister: Some(ark_db), onchain: Some(app.clone()),
 		run_daemon: false, ..Default::default()
 	}).await;
 	assert!(mismatch.is_err());
@@ -61,15 +62,16 @@ async fn fallback_external_bip84_wallet_registers_and_restores_without_ark_seed_
 	// Restore both wallet databases from their separate seeds.
 	// The external payout destination is derived from the app seed.
 	let app_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join("restored-app.sqlite")).unwrap());
-	let restored_bdk = AppBip84Wallet::load_or_create(network, app_seed, app_db, ctx.bitcoind().sync_client()).await.unwrap();
+	let restored_bdk = AppBip86Wallet::load_or_create(network, app_seed, app_db, ctx.bitcoind().sync_client()).await.unwrap();
 	assert_eq!(restored_bdk.fallback_script(), payout);
 	let restored_app: Arc<RwLock<dyn OnchainWalletTrait>> = Arc::new(RwLock::new(restored_bdk));
 	let restored_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join("restored-ark.sqlite")).unwrap());
-	let restored = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed), config, OpenWalletArgs {
-		persister: Some(restored_db), onchain: Some(restored_app.clone()), fallback_spk: Some(payout),
+	let restored = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed)
+		.with_external_mailbox_keypair(AppBip86Wallet::mailbox_keypair(network, &app_seed).unwrap()), config, OpenWalletArgs {
+		persister: Some(restored_db), onchain: Some(restored_app.clone()),
 		run_daemon: false, ..Default::default()
 	}).await.unwrap();
-	assert_eq!(restored.fallback_destination().await.unwrap(), record);
+	assert_eq!(restored.fallback_script(), record);
 	restored_app.write().await.sync(restored.chain()).await.unwrap();
 	assert_eq!(restored_app.read().await.balance().await, sat(20_000));
 }
@@ -77,8 +79,8 @@ async fn fallback_external_bip84_wallet_registers_and_restores_without_ark_seed_
 /// Expire an Ark coin and recover its payout into fresh app and Ark stores.
 /// Restoration uses the original independent app and Ark seeds.
 #[tokio::test]
-async fn fallback_external_bip84_actual_payout_seed_restore_and_confirmed_spend() {
-	let ctx = TestContext::new("bark_sdk/fallback_external_bip84_actual_payout").await;
+async fn fallback_external_bip86_actual_payout_seed_restore_and_confirmed_spend() {
+	let ctx = TestContext::new("bark_sdk/fallback_external_bip86_actual_payout").await;
 	let srv = ctx.captaind("server").no_vtxo_pool()
 		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24))
 		.watchmand().create().await;
@@ -86,18 +88,19 @@ async fn fallback_external_bip84_actual_payout_seed_restore_and_confirmed_spend(
 	let ark_seed = [71; 64];
 	let app_seed = [92; 64];
 	let app_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join("app.sqlite")).unwrap());
-	let app_bdk = AppBip84Wallet::load_or_create(network, app_seed, app_db, ctx.bitcoind().sync_client()).await.unwrap();
+	let app_bdk = AppBip86Wallet::load_or_create(network, app_seed, app_db, ctx.bitcoind().sync_client()).await.unwrap();
 	let script = app_bdk.fallback_script();
-	assert!(script.is_p2wpkh());
+	assert!(script.is_p2tr());
 	let app: Arc<RwLock<dyn OnchainWalletTrait>> = Arc::new(RwLock::new(app_bdk));
 	let mut config = ctx.bark_default_cfg(&*srv, Some(ctx.bitcoind()));
 	config.daemon_manual_sync = true;
 	let ark_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join("ark.sqlite")).unwrap());
-	let wallet = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed), config.clone(), OpenWalletArgs {
-		persister: Some(ark_db), onchain: Some(app.clone()), fallback_spk: Some(script.clone()),
+	let wallet = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed)
+		.with_external_mailbox_keypair(AppBip86Wallet::mailbox_keypair(network, &app_seed).unwrap()), config.clone(), OpenWalletArgs {
+		persister: Some(ark_db), onchain: Some(app.clone()),
 		run_daemon: false, ..Default::default()
 	}).await.unwrap();
-	let registration = wallet.fallback_destination().await.unwrap();
+	let registration = wallet.fallback_script();
 	let scan_from = ctx.bitcoind().get_block_count().await;
 	let funding_address = app.write().await.address().await.unwrap();
 	assert_ne!(funding_address.script_pubkey(), script);
@@ -126,7 +129,7 @@ async fn fallback_external_bip84_actual_payout_seed_restore_and_confirmed_spend(
 	let mut board_change = BTreeMap::new();
 	for (vout, output) in board.funding_tx.output.iter().enumerate() {
 		if app.read().await.is_mine(&output.script_pubkey).await.unwrap() {
-			assert!(output.script_pubkey.is_p2wpkh());
+			assert!(output.script_pubkey.is_p2tr());
 			board_change.insert(OutPoint::new(board.funding_tx.compute_txid(), vout as u32), output.clone());
 		}
 	}
@@ -223,16 +226,17 @@ async fn fallback_external_bip84_actual_payout_seed_restore_and_confirmed_spend(
 	}
 
 	let restored_app_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join("restored-app.sqlite")).unwrap());
-	let restored_bdk = AppBip84Wallet::load_or_create(network, app_seed, restored_app_db, ctx.bitcoind().sync_client()).await.unwrap();
+	let restored_bdk = AppBip86Wallet::load_or_create(network, app_seed, restored_app_db, ctx.bitcoind().sync_client()).await.unwrap();
 	assert_eq!(restored_bdk.fallback_script(), script);
 	let restored_impl = Arc::new(RwLock::new(restored_bdk));
 	let restored_app: Arc<RwLock<dyn OnchainWalletTrait>> = restored_impl.clone();
 	let restored_ark_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join("restored-ark.sqlite")).unwrap());
-	let restored = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed), config, OpenWalletArgs {
-		persister: Some(restored_ark_db), onchain: Some(restored_app.clone()), fallback_spk: Some(script.clone()),
+	let restored = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed)
+		.with_external_mailbox_keypair(AppBip86Wallet::mailbox_keypair(network, &app_seed).unwrap()), config, OpenWalletArgs {
+		persister: Some(restored_ark_db), onchain: Some(restored_app.clone()),
 		run_daemon: false, ..Default::default()
 	}).await.unwrap();
-	assert_eq!(restored.fallback_destination().await.unwrap(), registration);
+	assert_eq!(restored.fallback_script(), registration);
 	restored_app.write().await.sync(restored.chain()).await.unwrap();
 	assert!(restored_impl.read().await.utxos().iter().any(|utxo| matches!(utxo,
 		bark::onchain::Utxo::Local(local) if local.outpoint == point && local.amount == expected && local.confirmation_height.is_some())));
@@ -243,12 +247,12 @@ async fn fallback_external_bip84_actual_payout_seed_restore_and_confirmed_spend(
 	assert_eq!(discovered, expected_inputs, "fresh seed discovery must find exactly the actual payout and legitimate board change");
 
 	assert_eq!(restored.verify_fallback_output(point).await.unwrap(), expected);
-	let wrong_index = parent.output.iter().position(|output| output.script_pubkey != registration.spk
+	let wrong_index = parent.output.iter().position(|output| output.script_pubkey != registration
 		&& output.value > Amount::ZERO).expect("the payout retains its operator fee separately") as u32;
 	assert!(restored.verify_fallback_output(OutPoint::new(parent.compute_txid(), wrong_index)).await.is_err(),
 		"a canonical operator output cannot substitute for the registered customer's output");
 
-	assert!(restored.history().await.unwrap().iter().all(|movement| movement.subsystem.name != "abandon.fallback_payout"));
+	assert!(restored.history().await.unwrap().iter().all(|movement| movement.subsystem.name != "scuttle.fallback"));
 
 	let destination = ctx.bitcoind().get_new_address();
 	let psbt = restored_app.write().await.prepare_drain_tx(destination.clone(), FeeRate::from_sat_per_vb(2).unwrap()).await.unwrap();
@@ -256,12 +260,12 @@ async fn fallback_external_bip84_actual_payout_seed_restore_and_confirmed_spend(
 	let final_psbt = restored_app.write().await.finish_psbt(signed).await.unwrap();
 	let recovery = final_psbt.extract_tx().unwrap();
 	let input = recovery.input.iter().find(|input| input.previous_output == point).expect("external callback did not spend its actual fallback outpoint");
-	assert_eq!(input.witness.len(), 2, "the fallback is actually spent through the app's BIP84 key");
+	assert_eq!(input.witness.len(), 2, "the fallback is actually spent through the app's BIP86 key");
 	let mut recovery_inputs = BTreeMap::new();
 	for input in &recovery.input {
 		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
 		let output = previous.output[input.previous_output.vout as usize].clone();
-		assert!(output.script_pubkey.is_p2wpkh());
+		assert!(output.script_pubkey.is_p2tr());
 		assert_eq!(input.witness.len(), 2);
 		assert!(recovery_inputs.insert(input.previous_output, output).is_none());
 	}
@@ -333,9 +337,9 @@ impl captaind::proxy::ArkRpcProxy for ExternalRecoveryHistoryGate {}
 
 /// The app can discover and spend its payout from its seed while Ark history is unavailable.
 #[tokio::test]
-async fn fallback_external_bip84_seed_restore_spends_actual_payout_while_history_unavailable() {
+async fn fallback_external_bip86_seed_restore_spends_actual_payout_while_history_unavailable() {
 	tokio::time::timeout(Duration::from_secs(180), Box::pin(async {
-		let ctx = TestContext::new("bark_sdk/fallback_external_bip84_history_unavailable").await;
+		let ctx = TestContext::new("bark_sdk/fallback_external_bip86_history_unavailable").await;
 		let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
 			.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24)).watchmand().create().await;
 		let gate = ExternalRecoveryHistoryGate::default();
@@ -344,19 +348,20 @@ async fn fallback_external_bip84_seed_restore_spends_actual_payout_while_history
 		let ark_seed = [101; 64];
 		let app_seed = [102; 64];
 		let app_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join("original-app.sqlite")).unwrap());
-		let app_bdk = AppBip84Wallet::load_or_create(network, app_seed, app_db, ctx.bitcoind().sync_client()).await.unwrap();
+		let app_bdk = AppBip86Wallet::load_or_create(network, app_seed, app_db, ctx.bitcoind().sync_client()).await.unwrap();
 		let script = app_bdk.fallback_script();
-		assert!(script.is_p2wpkh());
+		assert!(script.is_p2tr());
 		assert!(app_bdk.list_unspent().is_empty());
 		let app: Arc<RwLock<dyn OnchainWalletTrait>> = Arc::new(RwLock::new(app_bdk));
 		let mut config = ctx.bark_default_cfg(&proxy, Some(ctx.bitcoind()));
 		config.daemon_manual_sync = true;
 		let ark_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join("original-ark.sqlite")).unwrap());
-		let recipient = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed), config.clone(), OpenWalletArgs {
-			persister: Some(ark_db), onchain: Some(app.clone()), fallback_spk: Some(script.clone()),
+		let recipient = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed)
+		.with_external_mailbox_keypair(AppBip86Wallet::mailbox_keypair(network, &app_seed).unwrap()), config.clone(), OpenWalletArgs {
+			persister: Some(ark_db), onchain: Some(app.clone()),
 			run_daemon: false, ..Default::default()
 		}).await.unwrap();
-		let registration = recipient.fallback_destination().await.unwrap();
+		let registration = recipient.fallback_script();
 
 		// Keep the donor's board funding and change outside the external app wallet.
 		// The app's first on-chain receipt must be the fallback payout.
@@ -479,24 +484,25 @@ async fn fallback_external_bip84_seed_restore_spends_actual_payout_while_history
 		let fresh_ark_path = ctx.datadir.join("restored-ark.sqlite");
 		assert!(!fresh_app_path.exists() && !fresh_ark_path.exists());
 		let restored_app_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(fresh_app_path).unwrap());
-		let restored_bdk = AppBip84Wallet::load_or_create(network, app_seed, restored_app_db, ctx.bitcoind().sync_client()).await.unwrap();
+		let restored_bdk = AppBip86Wallet::load_or_create(network, app_seed, restored_app_db, ctx.bitcoind().sync_client()).await.unwrap();
 		assert!(restored_bdk.list_unspent().is_empty());
 		let restored_script = restored_bdk.fallback_script();
 		assert_eq!(restored_script, script);
 		let restored_impl = Arc::new(RwLock::new(restored_bdk));
 		let restored_app: Arc<RwLock<dyn OnchainWalletTrait>> = restored_impl.clone();
 		let restored_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(fresh_ark_path).unwrap());
-		assert!(restored_db.get_fallback_record().await.unwrap().is_none());
+		assert!(restored_db.get_fallback_receipts().await.unwrap().is_empty());
 
-		let restored = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed), config, OpenWalletArgs {
-			persister: Some(restored_db.clone()), onchain: Some(restored_app.clone()), fallback_spk: Some(restored_script),
+		let restored = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed)
+		.with_external_mailbox_keypair(AppBip86Wallet::mailbox_keypair(network, &app_seed).unwrap()), config, OpenWalletArgs {
+			persister: Some(restored_db.clone()), onchain: Some(restored_app.clone()),
 			run_daemon: false, ..Default::default()
 		}).await.unwrap();
-		assert_eq!(restored.fallback_destination().await.unwrap(), registration);
+		assert_eq!(restored.fallback_script(), registration);
 		srv.stop().await.unwrap();
 		restored.sync_fallback_payouts().await.unwrap();
 		assert_eq!(restored.verify_fallback_output(payout).await.unwrap(), expected);
-		assert!(restored.history().await.unwrap().iter().all(|movement| movement.subsystem.name != "abandon.fallback_payout"));
+		assert!(restored.history().await.unwrap().iter().all(|movement| movement.subsystem.name != "scuttle.fallback"));
 
 		restored_app.write().await.sync(restored.chain()).await.unwrap();
 		assert_eq!(restored_app.read().await.balance().await, expected);
@@ -551,6 +557,6 @@ async fn fallback_external_bip84_seed_restore_spends_actual_payout_while_history
 		}
 		assert_eq!(actual_payouts, vec![(payout, expected)], "one correct output must not conceal another canonical payout");
 		restored.sync_fallback_payouts().await.unwrap();
-		assert!(restored.history().await.unwrap().iter().all(|movement| movement.subsystem.name != "abandon.fallback_payout"));
+		assert!(restored.history().await.unwrap().iter().all(|movement| movement.subsystem.name != "scuttle.fallback"));
 	})).await.expect("chain-only external recovery exceeded the unchanged 180-second case budget");
 }

@@ -15,13 +15,16 @@ This branch is under construction and is not an installed or qualified release.
 | Native regressions | `testing/tests/scuttle/`: ownership, financial, recovery and wire cases. Existing upstream suites keep their necessary non-mailbox adaptations and share the original helpers. |
 | Fork baseline | Fresh Scuttle initial schema plus unchanged upstream PostgreSQL0–77/SQLite0–42 migrations; no fork migration runner. Protocol1000 is required on Ark/Mailbox operations. Scuttle operator methods stay on the existing private admin listener. |
 | Application mailbox | The SDK accepts an in-memory mailbox keypair and persists its full public point and network, refusing a missing or changed key on reopen. Application backup/discovery is the caller's responsibility. |
-| Remaining switch | Registration remains authoritative in the shadow baseline. The coordinated ownership/Taproot payout switch uses fresh matched stores and refuses older registration-shaped stores; it does not upgrade funded stores. |
+| Ownership switch | Joint admission and immutable birth ownership supply stage-selected BIP86 payouts. Explicit authenticated receipts replace the client ancestry ledger. Fresh matched stores refuse older registration-shaped stores instead of upgrading them. |
 
-The retained registration implementation and old proof read paths are temporary
-shadow dependencies, not the final payout or legacy policy. Bitcoin descriptors
-have not changed at this baseline. The final recipient contract, strict legacy
-refusal, stage resolver, late-completion fences and single payout engine must
-land together with their approved tests before the release claim.
+Registration and legacy proof dispatch are removed. Both joint signatures and
+address type `0x03` remain mandatory; the server derives the stage-entitled
+mailbox's Taproot destination. The default test client's mailbox follows its
+existing BIP86 external index-zero descriptor. External mailbox applications
+remain responsible for their corresponding Bitcoin account and backup.
+Source implementation does not establish executed qualification. Recipient
+ownership, canonical receipt recovery, late-completion fences and the payout
+engine require their named native evidence before a release claim.
 
 ## Rebase canary
 

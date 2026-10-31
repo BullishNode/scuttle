@@ -38,6 +38,7 @@ async fn reject_arkoor_with_bad_signature() {
 			let message = ArkoorMessage { vtxos: vec![vtxo.serialize()], owners };
 
 			Ok(protos::mailbox_server::MailboxMessages {
+			fallback_claims: vec![], have_more_fallback_claims: false, fallback_cursor: None,
 				messages: vec![protos::mailbox_server::MailboxMessage {
 					message: Some(mailbox_message::Message::Arkoor(message)),
 					checkpoint: 0,
@@ -226,6 +227,7 @@ async fn read_recovery_vtxo_ids(
 	let mailbox_auth = MailboxAuthorization::new(&recovery_mailbox_kp, expiry);
 
 	let read_mailbox = protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 		mailbox_id: recovery_mailbox_id.serialize(),
 		authorization: Some(mailbox_auth.serialize().to_vec()),
 		checkpoint: 0,

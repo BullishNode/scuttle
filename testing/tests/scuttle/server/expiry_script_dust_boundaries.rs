@@ -1,4 +1,4 @@
-//! Script-sensitive dust boundaries through original registered SDK accounts.
+//! Exact selected P2TR dust boundaries through ordinary SDK accounts.
 
 use super::expiry_test::{ExpectedLeaf, confirm_epoch, receipt, fields, rebuilt, actual_fee, Epoch, financial_cut};
 
@@ -17,8 +17,6 @@ use bark::persist::sqlite::SqliteClient;
 use bark::movement::{Movement, MovementStatus};
 use bark::vtxo::VtxoState;
 use bitcoin::{Address, Amount, Network, OutPoint, ScriptBuf, Transaction};
-use bitcoin::script::Builder;
-use bitcoin::opcodes::all::OP_CHECKSIG;
 use bitcoin::secp256k1::Keypair;
 use bitcoin_ext::{BlockDelta, TxOutExt};
 use bitcoin_ext::rpc::RpcApi;
@@ -37,26 +35,13 @@ async fn balances(wallet: &Wallet, spendable: Amount) {
 /// sponsors; historical branches are never added again as external principal.
 
 #[derive(Clone, Copy)]
-enum Family { P2pkh, P2sh, P2wpkh, P2wsh, P2tr }
+enum Family { P2tr }
 
 impl Family {
-	fn label(self) -> &'static str {
-		match self { Self::P2pkh => "p2pkh", Self::P2sh => "p2sh", Self::P2wpkh => "p2wpkh", Self::P2wsh => "p2wsh", Self::P2tr => "p2tr" }
-	}
-
-	fn dust(self) -> u64 {
-		match self { Self::P2pkh => 546, Self::P2sh => 540, Self::P2wpkh => 294, Self::P2wsh | Self::P2tr => 330 }
-	}
-
+	fn label(self) -> &'static str { "p2tr" }
+	fn dust(self) -> u64 { 330 }
 	fn script(self, key: &Keypair) -> ScriptBuf {
-		let public = bitcoin::PublicKey::new(key.public_key());
-		match self {
-			Self::P2pkh => ScriptBuf::new_p2pkh(&public.pubkey_hash()),
-			Self::P2sh => ScriptBuf::new_p2wpkh(&public.wpubkey_hash().unwrap()).to_p2sh(),
-			Self::P2wpkh => ScriptBuf::new_p2wpkh(&public.wpubkey_hash().unwrap()),
-			Self::P2wsh => Builder::new().push_key(&public).push_opcode(OP_CHECKSIG).into_script().to_p2wsh(),
-			Self::P2tr => ScriptBuf::new_p2tr(&SECP, key.x_only_public_key().0, None),
-		}
+		ScriptBuf::new_p2tr(&SECP, key.x_only_public_key().0, None)
 	}
 }
 
@@ -71,7 +56,7 @@ struct Application {
 impl Application {
 	fn new(ctx: &TestContext, family: Family, index: usize) -> Self {
 		let seed = bip39::Mnemonic::generate(12).unwrap().to_seed("");
-		let spend_key = Keypair::new(&SECP, &mut bitcoin::secp256k1::rand::thread_rng());
+		let spend_key = ark_testing::onchain::AppBip86Wallet::mailbox_keypair(Network::Regtest, &seed).unwrap();
 		let script = family.script(&spend_key);
 		let address = Address::from_script(&script, Network::Regtest).unwrap();
 		assert_eq!(address.script_pubkey(), script);
@@ -88,7 +73,7 @@ impl Application {
 			OpenWalletArgs {
 				persister: Some(Arc::new(SqliteClient::open(&self.database).unwrap())),
 				lock_manager: Some(Box::new(MemoryLockManager::new())),
-				fallback_spk: Some(self.script.clone()), onchain: None,
+				onchain: None,
 				create_if_not_exists: create, run_daemon: false, ..Default::default()
 			},
 		).await.unwrap()
@@ -216,26 +201,25 @@ async fn boundaries(family: Family) {
 	let apps = (0..3).map(|index| Application::new(&ctx, family, index)).collect::<Vec<_>>();
 	let mut recipients = Vec::new();
 	for app in &apps { recipients.push(Box::pin(app.open(&ctx, &srv, true)).await); }
-	let sender_binding = sender.fallback_destination().await.unwrap();
+	let sender_binding = sender.fallback_script();
 	let mut bindings = vec![sender_binding.clone()];
 	let mut mailboxes = vec![sender.mailbox_identifier()];
 	for (wallet, app) in recipients.iter().zip(&apps) {
 		assert!(wallet.onchain().is_none());
-		let binding = wallet.fallback_destination().await.unwrap();
-		assert_eq!(binding.spk, app.script);
-		binding.verify(Network::Regtest, wallet.mailbox_identifier().as_pubkey()).unwrap();
+		let binding = wallet.fallback_script();
+		assert_eq!(binding, app.script);
+
 		bindings.push(binding);
 		mailboxes.push(wallet.mailbox_identifier());
 	}
-	assert_eq!(bindings.iter().map(|binding| binding.spk.clone()).collect::<BTreeSet<_>>().len(), 4);
+	assert_eq!(bindings.iter().map(|binding| binding.clone()).collect::<BTreeSet<_>>().len(), 4);
 	assert_eq!(mailboxes.iter().map(|mailbox| mailbox.as_pubkey().to_string()).collect::<BTreeSet<_>>().len(), 4);
 	for (binding, mailbox) in bindings.iter().zip(&mailboxes) {
-		binding.verify(Network::Regtest, mailbox.as_pubkey()).unwrap();
-		let stored = db.read(async |tx| tx.get_fallback(mailbox.as_pubkey()).await).await.unwrap().unwrap();
-		assert!(stored.same_binding(binding));
+
+		assert_eq!(**binding, ScriptBuf::new_p2tr(&SECP, mailbox.as_pubkey().x_only_public_key().0, None));
 		for input in &board.input {
 			let funding = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-			assert!(funding.output.iter().all(|output| output.script_pubkey != binding.spk));
+			assert!(funding.output.iter().all(|output| output.script_pubkey != binding));
 		}
 	}
 	let dust = family.dust();
@@ -261,7 +245,7 @@ async fn boundaries(family: Family) {
 		let charged = coin.amount().to_sat().min(fee);
 		fee -= charged;
 		let payout = coin.amount().to_sat() - charged;
-		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[0], script: sender_binding.spk.clone(), fee: charged,
+		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[0], script: sender_binding.clone(), fee: charged,
 			payout, forfeited: 0, group_payout: change_gross - 1_000 });
 	}
 	assert_eq!(fee, 0);
@@ -312,7 +296,7 @@ async fn boundaries(family: Family) {
 	assert_eq!(epoch.children.len(), 1);
 	let parent = epoch.parents.values().next().unwrap();
 	let payees = vec![(apps[0].script.clone(), None), (apps[1].script.clone(), Some(dust)),
-		(apps[2].script.clone(), Some(dust + 1)), (sender_binding.spk.clone(), Some(change_gross - 1_000))];
+		(apps[2].script.clone(), Some(dust + 1)), (sender_binding.clone(), Some(change_gross - 1_000))];
 	let operator = {
 		let config = srv.watchmand().config();
 		config.sweep_address.clone().unwrap().require_network(config.network).unwrap().script_pubkey()
@@ -336,7 +320,7 @@ async fn boundaries(family: Family) {
 	let mut returned = Vec::new();
 	for (index, app) in apps.iter().enumerate() {
 		let wallet = Box::pin(app.open(&ctx, &srv, false)).await;
-		assert!(wallet.fallback_destination().await.unwrap().same_binding(&bindings[index + 1]));
+		assert_eq!(wallet.fallback_script(), bindings[index + 1]);
 		assert_eq!(wallet.mailbox_identifier(), mailboxes[index + 1]);
 		results.push(verify_return(&wallet, &[&leaves[index]], &epoch, &history_before[index + 1]).await);
 		returned.push(wallet);
@@ -358,7 +342,7 @@ async fn boundaries(family: Family) {
 	assert_eq!(verify_return(&reopened_sender, &sender_leaves, &epoch, &history_before[0]).await, sender_result);
 	for (index, app) in apps.iter().enumerate() {
 		let wallet = Box::pin(app.open(&ctx, &srv, false)).await;
-		assert!(wallet.fallback_destination().await.unwrap().same_binding(&bindings[index + 1]));
+		assert_eq!(wallet.fallback_script(), bindings[index + 1]);
 		assert_eq!(verify_return(&wallet, &[&leaves[index]], &epoch, &history_before[index + 1]).await, results[index]);
 		wallet.stop_daemon_wait().await.unwrap();
 	}
@@ -370,30 +354,6 @@ async fn bounded(family: Family) {
 	assert!(std::env::var_os("BARK_DOUBLE_DRIVE_ACTIONS").is_none());
 	tokio::time::timeout(Duration::from_secs(180), Box::pin(boundaries(family))).await
 		.expect("one family's three genuine boundaries must fit180seconds without retries");
-}
-
-#[tokio::test]
-async fn p2pkh_exact_dust_boundary_is_paid_and_one_sat_below_is_forfeited() {
-	require_bitcoind_chain_source!();
-	bounded(Family::P2pkh).await;
-}
-
-#[tokio::test]
-async fn p2sh_exact_dust_boundary_is_paid_and_one_sat_below_is_forfeited() {
-	require_bitcoind_chain_source!();
-	bounded(Family::P2sh).await;
-}
-
-#[tokio::test]
-async fn p2wpkh_exact_dust_boundary_is_paid_and_one_sat_below_is_forfeited() {
-	require_bitcoind_chain_source!();
-	bounded(Family::P2wpkh).await;
-}
-
-#[tokio::test]
-async fn p2wsh_exact_dust_boundary_is_paid_and_one_sat_below_is_forfeited() {
-	require_bitcoind_chain_source!();
-	bounded(Family::P2wsh).await;
 }
 
 #[tokio::test]

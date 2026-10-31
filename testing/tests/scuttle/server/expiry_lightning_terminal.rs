@@ -120,7 +120,7 @@ async fn failed_external_payout(no_channel: bool) {
 	let input = client.get_full_vtxo(ids[0]).await.unwrap();
 	let source_expiry = input.expiry_height();
 	let key = client.get_vtxo_key(&input).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	let preimage = Preimage::random();
 	let hash = preimage.compute_payment_hash();
 	let mut receiver = lightning.external.hold_client().await;
@@ -186,7 +186,7 @@ async fn failed_external_payout(no_channel: bool) {
 		}
 	}).await.expect("failed send still requires an online client to refund it");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination.spk).unwrap();
+	let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination).unwrap();
 	assert_eq!(output.value, sat(99_000));
 	let mut total = 0;
 	for input in &parent.input {
@@ -247,7 +247,7 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 	let source_expiry = input.expiry_height();
 	assert_eq!(input.amount(), sat(100_000));
 	let key = client.get_vtxo_key(&input).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let deadline = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
 	let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints([input],
@@ -317,9 +317,9 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 		}
 	}).await.expect("cancelled zero-grant internal funding still requires a returning wallet");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	let (index, paid) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination.spk).unwrap();
+	let (index, paid) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
 	assert_eq!(paid.value, sat(99_000));
-	assert_eq!(parent.output.iter().filter(|o| o.script_pubkey == destination.spk).count(), 1);
+	assert_eq!(parent.output.iter().filter(|o| o.script_pubkey == destination).count(), 1);
 	let mut input_sat = 0;
 	for input in &parent.input {
 		let prev = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
@@ -409,7 +409,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 	let invoice = recipient.bolt11_invoice(sat(invoice_amount), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
 	let receiver_key = recipient.new_address().await.unwrap().policy().user_pubkey();
-	let receiver_destination = recipient.fallback_destination().await.unwrap();
+	let receiver_destination = recipient.fallback_script();
 	let sender = ctx.bark("absent-sender", &srv).funded(sat(200_000)).create().await;
 	let ids = sender.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	let client = sender.client().await;
@@ -417,8 +417,8 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 	let source_expiry = input.expiry_height();
 	assert_eq!(input.amount(), sat(100_000));
 	let key = client.get_vtxo_key(&input).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
-	assert_ne!(destination.spk, receiver_destination.spk);
+	let destination = client.fallback_script();
+	assert_ne!(destination, receiver_destination);
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let incoming_deadline = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
 	let outgoing_deadline = tip + BlockDelta::new(36);
@@ -438,7 +438,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 		invoice: invoice.to_string(), payment_amount_sat: invoice_amount,
 		htlc_vtxo_ids: vec![source.to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
 	}).await.unwrap();
-	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 		owner_proof: Some(recipient.owner_link(receiver_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver_key.serialize().to_vec(),
 		htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,
@@ -515,7 +515,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 				tokio::time::sleep(Duration::from_millis(100)).await;
 			}
 		}).await.expect("uncollected internal grants must be reclaimed after fee replenishment");
-		assert_grants_reclaimed(&ctx, &db, &grants, &receiver_destination.spk).await;
+		assert_grants_reclaimed(&ctx, &db, &grants, &receiver_destination).await;
 		let height = ctx.bitcoind().get_block_count().await as u32;
 		assert!(height < closure_height + 5);
 		let height = ctx.generate_blocks(closure_height + 4 - height).await;
@@ -572,7 +572,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 		let retained = closure.0.output.iter().map(|output| output.value).sum::<bitcoin::Amount>();
 		assert!(retained < value, "the native claim pays its actual miner fee from operator funds");
 		assert_eq!(closure.0.version, bitcoin::transaction::Version::TWO);
-		assert!(closure.0.output.iter().all(|output| output.script_pubkey != receiver_destination.spk));
+		assert!(closure.0.output.iter().all(|output| output.script_pubkey != receiver_destination));
 		let operator_script = srv.watchmand().config().sweep_address.clone().unwrap().assume_checked().script_pubkey();
 		assert!(closure.0.output.iter().all(|output| output.script_pubkey == operator_script),
 			"native operator reclamation cannot redirect principal to another recipient");
@@ -625,10 +625,10 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 		panic!("the absent sender was not refunded after its receive grants were reclaimed");
 	}).await.expect("both-absent internal timeout required a returning wallet");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	assert_grants_reclaimed(&ctx, &db, &grants, &receiver_destination.spk).await;
-	let (index,paid) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination.spk).unwrap();
+	assert_grants_reclaimed(&ctx, &db, &grants, &receiver_destination).await;
+	let (index,paid) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
 	assert_eq!(paid.value, sat(99_000));
-	assert!(parent.output.iter().all(|o| o.script_pubkey != receiver_destination.spk));
+	assert!(parent.output.iter().all(|o| o.script_pubkey != receiver_destination));
 	let mut input_sat = 0;
 	for input in &parent.input {
 		let prev = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
@@ -643,8 +643,8 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 		for height in u64::from(tip.to_u32())..=chain.get_block_count().unwrap() {
 			for tx in chain.get_block(&chain.get_block_hash(height).unwrap()).unwrap().txdata {
 				for (vout, output) in tx.output.iter().enumerate() {
-					assert_ne!(output.script_pubkey, receiver_destination.spk);
-					if output.script_pubkey == destination.spk {
+					assert_ne!(output.script_pubkey, receiver_destination);
+					if output.script_pubkey == destination {
 						outputs.push((bitcoin::OutPoint::new(tx.compute_txid(), vout as u32), output.value));
 					}
 				}
@@ -654,7 +654,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 		for txid in chain.get_raw_mempool().unwrap() {
 			let tx = ctx.bitcoind().await_transaction(txid).await;
 			assert!(tx.output.iter().all(|output|
-				output.script_pubkey != destination.spk && output.script_pubkey != receiver_destination.spk));
+				output.script_pubkey != destination && output.script_pubkey != receiver_destination));
 		}
 		assert!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
 	}
@@ -686,14 +686,14 @@ async fn expiry_internal_shared_incoming_root_refunds_both_absent_attempts() {
 	assert_ne!(PaymentHash::from(&invoices[0]), PaymentHash::from(&invoices[1]));
 	let recipient_keys = [recipient.new_address().await.unwrap().policy().user_pubkey(),
 		recipient.new_address().await.unwrap().policy().user_pubkey()];
-	let recipient_destination = recipient.fallback_destination().await.unwrap();
+	let recipient_destination = recipient.fallback_script();
 	let sender = ctx.bark_sdk("absent-sender", &srv).boarded(sat(200_000))
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let original = sender.spendable_vtxos().await.unwrap().remove(0);
 	let original_body = sender.get_full_vtxo(original.id()).await.unwrap();
 	let anchor = original_body.chain_anchor();
-	let destination = sender.fallback_destination().await.unwrap();
-	assert_ne!(destination.spk, recipient_destination.spk);
+	let destination = sender.fallback_script();
+	assert_ne!(destination, recipient_destination);
 	// Normal signed self-payment creates two separately owned100k branches
 	// under this SAME200k board, before the distinct HTLC operations begin.
 	let own_address = sender.new_address().await.unwrap();
@@ -733,7 +733,7 @@ async fn expiry_internal_shared_incoming_root_refunds_both_absent_attempts() {
 			invoice: invoice.to_string(), payment_amount_sat: 90_000,
 			htlc_vtxo_ids: vec![source.to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
 		}).await.unwrap();
-		let response = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+		let response = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 			owner_proof: Some(recipient.owner_link(recipient_key).await.unwrap().into()),
 			payment_hash: hash.to_vec(), user_pubkey: recipient_key.serialize().to_vec(),
 			htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,
@@ -855,11 +855,11 @@ async fn expiry_internal_shared_incoming_root_refunds_both_absent_attempts() {
 		incoming_points.insert(matched[0].previous_output);
 	}
 	assert_eq!(parent.input.len(), incoming_points.len(), "no grant or unrelated input in the refund");
-	assert_grants_reclaimed(&ctx, &db, &grants, &recipient_destination.spk).await;
-	let payouts = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination.spk).collect::<Vec<_>>();
+	assert_grants_reclaimed(&ctx, &db, &grants, &recipient_destination).await;
+	let payouts = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
 	assert_eq!(payouts[0].1.value, sat(198_000), "the same 200,000 sat source pays one 1% fee");
-	assert!(parent.output.iter().all(|output| output.script_pubkey != recipient_destination.spk));
+	assert!(parent.output.iter().all(|output| output.script_pubkey != recipient_destination));
 	let mut input_sat = 0;
 	for input in &parent.input {
 		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;

@@ -260,7 +260,7 @@ impl Wallet {
 			.context("error setting funding details for board")?
 			.generate_user_nonces();
 
-		let cosign_resp = srv.client.request_board_cosign(protos::BoardCosignRequest {
+		let cosign_resp = srv.client.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
 			owner_proof: Some(OwnerLink::new_joint(self.network().await?, ark_info.mailbox_pubkey, &self.mailbox_keypair(), &user_keypair)?.into()),
 			amount: amount.to_sat(),
 			utxo: bitcoin::consensus::serialize(&utxo), //TODO(stevenroose) change to own

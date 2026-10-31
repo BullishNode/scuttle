@@ -56,7 +56,7 @@ async fn native_refund_status(two_sources: bool) {
 	let invoice = recipient.bolt11_invoice(sat(invoice_amount), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
 	let receive_key = recipient.new_address().await.unwrap().policy().user_pubkey();
-	let recipient_destination = recipient.fallback_destination().await.unwrap();
+	let recipient_destination = recipient.fallback_script();
 	let actor = ctx.bark("absent-sender", &srv).funded(sat(400_000)).create().await;
 	let first = actor.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	// Reserve the existing progress grace, six payout confirmations and two
@@ -75,9 +75,9 @@ async fn native_refund_status(two_sources: bool) {
 	}
 	let keys = futures::future::join_all(inputs.iter().map(|input| sender.get_vtxo_key(input))).await
 		.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
-	let destination = sender.fallback_destination().await.unwrap();
+	let destination = sender.fallback_script();
 	let mailbox = sender.mailbox_identifier();
-	assert_ne!(destination.spk, recipient_destination.spk);
+	assert_ne!(destination, recipient_destination);
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let backing_expiries = inputs.iter().map(|input| (input.chain_anchor(), input.expiry_height()))
 		.collect::<BTreeMap<_, _>>();
@@ -112,7 +112,7 @@ async fn native_refund_status(two_sources: bool) {
 		invoice: invoice.to_string(), payment_amount_sat: invoice_amount,
 		htlc_vtxo_ids: ids.clone(), mailbox_id: Some(mailbox.serialize()), retry_for_secs: Some(5),
 	}).await.unwrap();
-	let reply = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+	let reply = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receive_key.serialize().to_vec(),
 		htlc_recv_expiry: (tip + BlockDelta::new(12)).to_u32(), lightning_receive_anti_dos: None,
@@ -156,7 +156,7 @@ async fn native_refund_status(two_sources: bool) {
 				ctx.bitcoind().await_transaction(parent.compute_txid()).await;
 				ctx.generate_blocks(6).await;
 				completed_view(&ctx, &srv, &db).await;
-				let index = parent.output.iter().position(|output| output.script_pubkey == destination.spk).unwrap();
+				let index = parent.output.iter().position(|output| output.script_pubkey == destination).unwrap();
 				assert_eq!(parent.output[index].value, sat(99_000));
 				assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true))
 					.unwrap().unwrap().confirmations >= 6, "partial-negative must include a real paid source");
@@ -188,20 +188,20 @@ async fn native_refund_status(two_sources: bool) {
 	assert_eq!(parents.values().map(Transaction::compute_txid).collect::<std::collections::BTreeSet<_>>().len(), sources.len());
 	for parent in parents.values() {
 		assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, *parent);
-		let paid = parent.output.iter().find(|output| output.script_pubkey == destination.spk).unwrap();
+		let paid = parent.output.iter().find(|output| output.script_pubkey == destination).unwrap();
 		assert_eq!(paid.value, sat(99_000));
-		assert!(parent.output.iter().all(|output| output.script_pubkey != recipient_destination.spk));
+		assert!(parent.output.iter().all(|output| output.script_pubkey != recipient_destination));
 		let mut total = sat(0);
 		for input in &parent.input {
 			total += ctx.bitcoind().await_transaction(input.previous_output.txid).await.output[input.previous_output.vout as usize].value;
 		}
 		assert_eq!(parent.output.iter().map(|output| output.value).sum::<bitcoin::Amount>(), total);
 	}
-	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx, &db, &grants, &recipient_destination.spk).await;
+	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx, &db, &grants, &recipient_destination).await;
 	ctx.generate_blocks(6).await;
 	completed_view(&ctx, &srv, &db).await;
 	for parent in parents.values() {
-		let index = parent.output.iter().position(|output| output.script_pubkey == destination.spk).unwrap();
+		let index = parent.output.iter().position(|output| output.script_pubkey == destination).unwrap();
 		assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
 	}
 	let status = rpc.check_lightning_payment(protos::CheckLightningPaymentRequest {

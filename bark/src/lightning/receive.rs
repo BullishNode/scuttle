@@ -250,9 +250,9 @@ impl Wallet {
 	/// Mailbox delivery is a separate step that only this wallet performs.
 	/// The parked delivery action resumes automatically on restart. If
 	/// delivery does not occur, the server can pay an expired receive to
-	/// the recipient's registered on-chain fallback script without this
+	/// the recipient's mailbox-derived BIP86 script without this
 	/// wallet. The Ark server verifies the destination's signed owner link
-	/// and fallback registration before it creates the invoice.
+	/// and mailbox-key authorization before it creates the invoice.
 	pub async fn bolt11_invoice_for_address(
 		&self,
 		amount: Amount,

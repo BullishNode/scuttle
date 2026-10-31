@@ -125,7 +125,7 @@ async fn oversized_fee_child() {
 	assert_eq!(ids.len(), 1);
 	let client = owner.client().await;
 	let coin = client.get_full_vtxo(ids[0]).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	drop(client);
 	drop(owner);
 	let address = srv.watchmand().wait_wallet_address().await;
@@ -251,7 +251,7 @@ async fn oversized_fee_child() {
 	let actual_fee = actual_input - replacement.output.iter().map(|out| out.value).sum::<bitcoin::Amount>();
 	assert_eq!(actual_fee.to_sat(), u64::try_from(measured_fee).unwrap());
 	assert!(actual_fee >= target * (parent.weight() + replacement.weight()));
-	let payees = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination.spk).collect::<Vec<_>>();
+	let payees = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payees.len(), 1);
 	assert_eq!(payees[0].1.value, coin.amount() - sat(1_000));
 	ctx.generate_blocks(6).await;
@@ -345,7 +345,7 @@ async fn payout_reorg(depth: u32) {
 	assert_eq!(ids.len(), 1);
 	let client = wallet.client().await;
 	let coin = client.get_full_vtxo(ids[0]).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	let expected = coin.amount() - sat(1_000);
 	drop(client);
 	let fee_address = srv.watchmand().wait_wallet_address().await;
@@ -386,7 +386,7 @@ async fn payout_reorg(depth: u32) {
 			assert_eq!(queries.load(Ordering::SeqCst), deep_queries, "deep-confirmed allocation was queried again");
 		}
 	}
-	let payout_index = parent.output.iter().position(|out| out.script_pubkey == destination.spk).unwrap() as u32;
+	let payout_index = parent.output.iter().position(|out| out.script_pubkey == destination).unwrap() as u32;
 	assert_eq!(parent.output[payout_index as usize].value, expected);
 	let permanent = db.read(async |t| Ok(t.query_one(
 		"SELECT e.id,e.irreversible_facts::TEXT AS facts FROM expiry_entitlement e WHERE e.vtxo_id=$1", &[&ids[0].to_string()],
@@ -492,7 +492,7 @@ async fn expiry_payout_fee_replacement_keeps_parent_and_counts_only_confirmed_ch
 	let ids = wallet.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	let client = wallet.client().await;
 	let coin = client.get_full_vtxo(ids[0]).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	drop(client);
 	// Two confirmed funding outputs allow a replacement to select
 	// another usable sponsor while the first child remains in the mempool.
@@ -508,7 +508,7 @@ async fn expiry_payout_fee_replacement_keeps_parent_and_counts_only_confirmed_ch
 	assert_eq!(ctx.bitcoind().await_transaction(first_child.compute_txid()).await, first_child);
 	let target = bitcoin::FeeRate::from_sat_per_vb(100).unwrap();
 	assert!(sat(first_fee) < target * (parent.weight() + first_child.weight()));
-	let payouts = parent.output.iter().filter(|out| out.script_pubkey == destination.spk).collect::<Vec<_>>();
+	let payouts = parent.output.iter().filter(|out| out.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
 	assert_eq!(payouts[0].value, coin.amount() - sat(1_000));
 	srv.watchmand().stop().await.unwrap();
@@ -573,7 +573,7 @@ async fn expiry_payout_replaces_orphan_funding_child_without_changing_parent() {
 	let ids = wallet.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	let client = wallet.client().await;
 	let coin = client.get_full_vtxo(ids[0]).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	drop(client);
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	let before = ctx.bitcoind().get_block_count().await as u32;
@@ -638,7 +638,7 @@ async fn expiry_payout_replaces_orphan_funding_child_without_changing_parent() {
 			.unwrap().is_some_and(|output| output.confirmations >= 2));
 	}
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	let index = parent.output.iter().position(|output| output.script_pubkey == destination.spk).unwrap();
+	let index = parent.output.iter().position(|output| output.script_pubkey == destination).unwrap();
 	assert_eq!(parent.output[index].value, coin.amount() - sat(1_000));
 	ctx.generate_blocks(6).await;
 	assert!(rpc.get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
@@ -680,7 +680,7 @@ async fn independently_sponsored_payout(confirm_before_restart: bool) {
 	let ids = wallet.board_and_confirm_and_register(&ctx,sat(100_000)).await;
 	let client = wallet.client().await;
 	let coin = client.get_full_vtxo(ids[0]).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	drop(client);
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	ctx.generate_blocks(coin.expiry_height().to_u32()+1-height).await;
@@ -698,7 +698,7 @@ async fn independently_sponsored_payout(confirm_before_restart: bool) {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("unfunded ordinary parent was not durably prepared");
-	let payouts=parent.output.iter().filter(|out|out.script_pubkey==destination.spk).collect::<Vec<_>>();
+	let payouts=parent.output.iter().filter(|out|out.script_pubkey==destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(),1);
 	assert_eq!(payouts[0].value,coin.amount()-sat(1_000));
 	srv.watchmand().stop().await.unwrap();
@@ -769,7 +769,7 @@ async fn expiry_payout_replaces_unrecognized_foreign_fee_child() {
 	let ids = wallet.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	let client = wallet.client().await;
 	let coin = client.get_full_vtxo(ids[0]).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	drop(client);
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - height).await;
@@ -795,7 +795,7 @@ async fn expiry_payout_replaces_unrecognized_foreign_fee_child() {
 	// Returning the fixture sponsor's change to the operator is deliberately
 	// outside recognize_fee_only's scope, even though Core accepts the child.
 	let drain = parent.output.iter().find(|out|
-		out.script_pubkey != destination.spk && !out.is_p2a_fee_anchor()).unwrap();
+		out.script_pubkey != destination && !out.is_p2a_fee_anchor()).unwrap();
 	foreign.output[0].script_pubkey = drain.script_pubkey.clone();
 	foreign.output[0].value -= sat(2_000);
 	for input in &mut foreign.input { input.witness.clear(); }
@@ -849,7 +849,7 @@ async fn expiry_payout_replaces_unrecognized_foreign_fee_child() {
 	let tip = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
 	wait_for_confirmation(&db, allocation, tip, info.blockhash.unwrap()).await;
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	let payees = parent.output.iter().filter(|out| out.script_pubkey == destination.spk).collect::<Vec<_>>();
+	let payees = parent.output.iter().filter(|out| out.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payees.len(), 1);
 	assert_eq!(payees[0].value, coin.amount() - sat(1_000));
 	let (canonical_child, canonical_fee) = super::watchman::observed_payout_fee_child(&ctx, &parent).unwrap();
@@ -879,7 +879,7 @@ async fn expiry_payout_recovers_same_parent_when_positive_untrusted_funds_mature
 	assert_eq!(ids.len(), 1);
 	let client = wallet.client().await;
 	let coin = client.get_full_vtxo(ids[0]).await.unwrap();
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	assert_eq!(coin.amount(), sat(100_000));
 	drop(client);
 	drop(wallet);
@@ -922,7 +922,7 @@ async fn expiry_payout_recovers_same_parent_when_positive_untrusted_funds_mature
 		.get_tx_out(&backing_point.txid, backing_point.vout, Some(true)).unwrap().unwrap();
 	assert!(actual_backing.confirmations > 0);
 	assert_eq!(actual_backing.value, backing_output.value);
-	let payees = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination.spk).collect::<Vec<_>>();
+	let payees = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payees.len(), 1);
 	let payout_index = payees[0].0 as u32;
 	assert_eq!(payees[0].1.value, sat(99_000));
@@ -935,7 +935,7 @@ async fn expiry_payout_recovers_same_parent_when_positive_untrusted_funds_mature
 		let config = srv.watchmand().config();
 		config.sweep_address.clone().unwrap().require_network(config.network).unwrap().script_pubkey()
 	};
-	assert_ne!(destination.spk, operator_spk);
+	assert_ne!(destination, operator_spk);
 	assert_eq!(parent.output.iter().filter(|out| out.script_pubkey == operator_spk)
 		.map(|out| out.value).sum::<bitcoin::Amount>(), sat(1_000));
 
@@ -1009,7 +1009,7 @@ async fn expiry_payout_recovers_same_parent_when_positive_untrusted_funds_mature
 	let fee = sat(100_000) - child.output.iter().map(|out| out.value).sum::<bitcoin::Amount>();
 	assert!(fee > sat(0));
 	assert_eq!(i64::try_from(fee.to_sat()).unwrap(), measured_fee);
-	assert!(child.output.iter().all(|out| out.script_pubkey != destination.spk));
+	assert!(child.output.iter().all(|out| out.script_pubkey != destination));
 
 	ctx.generate_blocks(6).await;
 	let parent_receipt: serde_json::Value = rpc.call("getrawtransaction", &[

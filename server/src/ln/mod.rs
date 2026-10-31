@@ -297,9 +297,6 @@ impl Server {
 		mailbox_id: Option<ark::mailbox::MailboxIdentifier>,
 		retry_for: Option<Duration>,
 	) -> anyhow::Result<()> {
-		if let Some(mailbox) = mailbox_id {
-			self.db.write(async |t| t.require_registered_mailbox(mailbox).await).await?;
-		}
 		//TODO(stevenroose) validate vtxo generally (based on input)
 		check_max_amount("lightning send", payment_amount, self.config.max_ln_send_amount)?;
 
@@ -567,7 +564,7 @@ impl Server {
 				}
 			}
 
-			t.execute_vtxo_tree_update(update, Some((self.config.network, self.mailbox_key.leak_ref()))).await?;
+			t.execute_vtxo_tree_update(update).await?;
 
 			// Committing the refund spend concludes these htlcs: the server
 			// can no longer collect them against the preimage.
@@ -599,9 +596,6 @@ impl Server {
 		expiry: Option<Duration>,
 		claim_destination: Option<protos::VtxoRequest>,
 	) -> anyhow::Result<protos::StartLightningReceiveResponse> {
-		if let Some(mailbox) = mailbox_id {
-			self.db.write(async |t| t.require_registered_mailbox(mailbox).await).await?;
-		}
 		info!("Starting bolt11 board with payment_hash: {}", payment_hash.as_hex());
 
 		check_max_amount("lightning receive", amount, self.config.max_ln_receive_amount)?;
@@ -819,9 +813,7 @@ impl Server {
 		owner_links: &crate::owner_proof::OwnerLinks,
 		client_address: Option<SocketAddr>,
 	) -> anyhow::Result<(LightningHtlcSubscription, Vec<Vtxo<Full>>)> {
-		if !owner_links.has_legacy() {
-			owner_links.check_signatures([user_pubkey], self.mailbox_key.leak_ref(), self.config.network)?;
-		}
+		owner_links.check_signatures([user_pubkey], self.mailbox_key.leak_ref(), self.config.network)?;
 		// Held for the whole call. The status only becomes `htlcs-ready` after
 		// the arkoor is persisted, so without this lock concurrent calls each
 		// allocate a full HTLC set for one invoice and can each return a

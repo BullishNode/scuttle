@@ -103,7 +103,7 @@ async fn reserved_batched_terminal(reorg:bool) {
 	let invoice = recipient.bolt11_invoice(sat(280_000),None,None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
 	let receive_key = recipient.new_address().await.unwrap().policy().user_pubkey();
-	let receive_destination = recipient.fallback_destination().await.unwrap();
+	let receive_destination = recipient.fallback_script();
 	let actor = Box::pin(ctx.bark("sender",&srv).cfg(|cfg|cfg.daemon_manual_sync=true).funded(sat(600_000)).create()).await;
 	let mut ids = Vec::new();
 	for _ in 0..3 {
@@ -123,9 +123,9 @@ async fn reserved_batched_terminal(reorg:bool) {
 	assert!(inputs.iter().all(|input|input.amount()==sat(100_000)));
 	assert_eq!(inputs.iter().map(|input|input.expiry_height()).collect::<BTreeSet<_>>().len(),3,
 		"each sequential board has a distinct original expiry height");
-	let fallback = sender.fallback_destination().await.unwrap();
-	fallback.verify(bitcoin::Network::Regtest,sender.mailbox_identifier().as_pubkey()).unwrap();
-	assert_ne!(fallback.spk,receive_destination.spk);
+	let fallback = sender.fallback_script();
+
+	assert_ne!(fallback,receive_destination);
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let deadline = tip+srv.config().htlc_send_expiry_delta+BlockDelta::new(2);
 	let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints(inputs,
@@ -143,7 +143,7 @@ async fn reserved_batched_terminal(reorg:bool) {
 		invoice:invoice.to_string(),payment_amount_sat:280_000,
 		htlc_vtxo_ids:sources.iter().map(|source|source.id().to_bytes().to_vec()).collect(),mailbox_id:None,retry_for_secs:Some(5),
 	}).await.unwrap();
-	let response = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+	let response = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash:hash.to_vec(),user_pubkey:receive_key.serialize().to_vec(),
 		htlc_recv_expiry:(tip+BlockDelta::new(36)).to_u32(),lightning_receive_anti_dos:None,
@@ -205,7 +205,7 @@ async fn reserved_batched_terminal(reorg:bool) {
 			srv.watchmand().wait_for_sync_height(height).await;
 			tokio::time::sleep(Duration::from_secs(1)).await;
 			if let Some(closures) = super::expiry_lightning_terminal::confirmed_grant_closures(
-				&ctx, &db, &grants, &receive_destination.spk,
+				&ctx, &db, &grants, &receive_destination,
 			).await {
 				if closures.values().all(|(_, closed)| closed.checked_add(6).is_some_and(|required| required <= height.to_u32())) { break; }
 			}
@@ -239,10 +239,10 @@ async fn reserved_batched_terminal(reorg:bool) {
 	assert_eq!(reserved.1.values().map(|coin|coin.entitlement).collect::<BTreeSet<_>>().len(),3);
 	assert!(reserved.1.values().all(|coin|coin.gross==100_000));
 	let expected_reserved=prefixes.iter().map(ToString::to_string).collect::<BTreeSet<_>>();
-	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx,&db,&grants,&receive_destination.spk).await;
+	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx,&db,&grants,&receive_destination).await;
 	assert_eq!(reserved.0,expected_reserved);
 	let parents=reserved_ids.iter().map(|id|reservations.values().find(|(r,_)|r==id).unwrap().1.clone()).collect::<Vec<_>>();
-	let reserved_fallback=parents.iter().flat_map(|p|&p.output).filter(|out|out.script_pubkey==fallback.spk).map(|out|out.value).sum::<bitcoin::Amount>();
+	let reserved_fallback=parents.iter().flat_map(|p|&p.output).filter(|out|out.script_pubkey==fallback).map(|out|out.value).sum::<bitcoin::Amount>();
 	assert_eq!(reserved_fallback,sat(297_000),"three 100,000 sat sources at distinct expiry heights each pay 1,000 sats");
 	for parent in &parents {
 		assert_eq!(parent.output.iter().map(|out|out.value).sum::<bitcoin::Amount>(),
@@ -278,7 +278,7 @@ async fn reserved_batched_terminal(reorg:bool) {
 		assert!(core.get_tx_out(&source.point().txid,source.point().vout,Some(true)).unwrap().is_some());
 	}
 	for point in &prefixes[..2] {assert!(core.get_tx_out(&point.txid,point.vout,Some(false)).unwrap().is_none());}
-	assert_remaining_source_backing(&ctx,unpaid_prefix,&reservations[&originals[2]].1,&fallback.spk);
+	assert_remaining_source_backing(&ctx,unpaid_prefix,&reservations[&originals[2]].1,&fallback);
 	// Sponsor before user receipt: neither the198k receipt nor the later99k
 	// payout is controlled by the Core funding wallet or recycled into fees.
 	// Four independent operator parents can publish before the customer refund.
@@ -330,7 +330,7 @@ async fn reserved_batched_terminal(reorg:bool) {
 		lock_time:clauses.iter().max_by_key(|clause|clause.timelock_height).unwrap().locktime(),
 		input:sources[..2].iter().zip(&clauses).map(|(source,clause)|TxIn {previous_output:source.point(),
 			script_sig:Default::default(),sequence:clause.sequence(),witness:Witness::new()}).collect(),
-		output:vec![TxOut {value:sat(198_000),script_pubkey:fallback.spk.clone()}],
+		output:vec![TxOut {value:sat(198_000),script_pubkey:fallback.clone()}],
 	};
 	if reorg {
 		claim.lock_time = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32).to_locktime().unwrap();
@@ -348,7 +348,7 @@ async fn reserved_batched_terminal(reorg:bool) {
 		sources[..2].iter().map(Vtxo::point).collect());
 	assert!(claim.weight().to_vbytes_ceil()<=2_000,"real fixed2k fee must meet ordinary relay floor");
 	chain.send_raw_transaction(&claim).unwrap();
-	assert_remaining_source_backing(&ctx,unpaid_prefix,&reservations[&originals[2]].1,&fallback.spk);
+	assert_remaining_source_backing(&ctx,unpaid_prefix,&reservations[&originals[2]].1,&fallback);
 	if reorg {
 		reorg_user_exit_claims(&ctx, &srv, &db, &[claim.clone()], &[]).await;
 	}
@@ -425,8 +425,8 @@ async fn reserved_batched_terminal(reorg:bool) {
 		}
 	}).await.expect("a real two-source user receipt must not strand the same attempt's third rightful original");
 	assert_eq!(parent.input.iter().map(|input|input.previous_output).collect::<BTreeSet<_>>(),BTreeSet::from([unpaid_prefix]));
-	assert!(!parent.output.iter().any(|output|output.script_pubkey==receive_destination.spk));
-	let customer=parent.output.iter().enumerate().filter(|(_,output)|output.script_pubkey==fallback.spk).collect::<Vec<_>>();
+	assert!(!parent.output.iter().any(|output|output.script_pubkey==receive_destination));
+	let customer=parent.output.iter().enumerate().filter(|(_,output)|output.script_pubkey==fallback).collect::<Vec<_>>();
 	assert_eq!(customer.len(),1); assert_eq!(customer[0].1.value,sat(99_000));
 	let payout=OutPoint::new(parent.compute_txid(),u32::try_from(customer[0].0).unwrap());
 	assert_eq!(parent.output.iter().filter(|output|output.script_pubkey==operator.script_pubkey()).map(|output|output.value).sum::<bitcoin::Amount>(),sat(1_000));
@@ -530,8 +530,8 @@ async fn reserved_batched_terminal(reorg:bool) {
 	for height in u64::from(tip.to_u32())..=chain.get_block_count().unwrap() {
 		for tx in chain.get_block(&chain.get_block_hash(height).unwrap()).unwrap().txdata {
 			for (index, output) in tx.output.iter().enumerate() {
-				assert_ne!(output.script_pubkey, receive_destination.spk);
-				if output.script_pubkey == fallback.spk {
+				assert_ne!(output.script_pubkey, receive_destination);
+				if output.script_pubkey == fallback {
 					assert!(customer_outputs.insert(OutPoint::new(tx.compute_txid(),index as u32),output.value).is_none());
 				}
 			}
@@ -540,8 +540,8 @@ async fn reserved_batched_terminal(reorg:bool) {
 	assert_eq!(customer_outputs, BTreeMap::from([(OutPoint::new(claim.compute_txid(),0),sat(198_000)),(payout,sat(99_000))]));
 	for txid in chain.get_raw_mempool().unwrap() {
 		let tx = ctx.bitcoind().await_transaction(txid).await;
-		assert!(tx.output.iter().all(|output| output.script_pubkey != fallback.spk
-			&& output.script_pubkey != receive_destination.spk));
+		assert!(tx.output.iter().all(|output| output.script_pubkey != fallback
+			&& output.script_pubkey != receive_destination));
 	}
 }
 

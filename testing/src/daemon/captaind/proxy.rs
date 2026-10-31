@@ -27,9 +27,7 @@ pub trait ArkRpcProxy: Send + Sync + Clone + 'static {
 		Ok(upstream.get_ark_info(req).await?.into_inner())
 	}
 
-	async fn set_fallback(&self, upstream: &mut ArkClient, req: protos::SetFallbackRequest) -> Result<protos::SetFallbackResponse, tonic::Status> {
-		Ok(upstream.set_fallback(req).await?.into_inner())
-	}
+
 
 
 	async fn get_offboard_fee_rate(&self, upstream: &mut ArkClient, req: protos::Empty) -> Result<protos::OffboardFeeRateResponse, tonic::Status> {
@@ -299,12 +297,7 @@ impl<T: ArkRpcProxy> rpc::server::ArkService for ArkRpcProxyWrapper<T> {
 		Ok(tonic::Response::new(ArkRpcProxy::get_ark_info(&self.proxy, &mut self.upstream_client(), req.into_inner()).await?))
 	}
 
-	async fn set_fallback(
-		&self, req: tonic::Request<protos::SetFallbackRequest>,
-	) -> Result<tonic::Response<protos::SetFallbackResponse>, tonic::Status> {
-		self.proxy.on_request(req.metadata()).await?;
-		Ok(tonic::Response::new(ArkRpcProxy::set_fallback(&self.proxy, &mut self.upstream_client(), req.into_inner()).await?))
-	}
+
 
 
 	async fn get_offboard_fee_rate(

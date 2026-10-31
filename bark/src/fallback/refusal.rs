@@ -3,7 +3,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackRefusal {
-	#[error("This coin expired and is being paid to your fallback address.")]
+	#[error("This coin has a committed fallback claim. Check its payout status.")]
 	DecidedForFallback,
 	#[error("This coin expired. Refresh it first, then send.")]
 	ExpiredNewLightning,
@@ -13,8 +13,6 @@ pub enum FallbackRefusal {
 	InvalidOwnerProof,
 	#[error("The output key is already linked to another mailbox.")]
 	ConflictingOwnerBinding,
-	#[error("Register the mailbox's Bitcoin fallback destination before using it.")]
-	UnregisteredMailbox,
 	#[error("Recipient must update their wallet and provide a signed mailbox address.")]
 	RecipientMustUpdate,
 }
@@ -27,7 +25,6 @@ impl FallbackRefusal {
 			Self::OwnerProofRequired => "owner_proof_required",
 			Self::InvalidOwnerProof => "invalid_owner_proof",
 			Self::ConflictingOwnerBinding => "conflicting_owner_binding",
-			Self::UnregisteredMailbox => "unregistered_mailbox",
 			Self::RecipientMustUpdate => "recipient_must_update",
 		}
 	}
@@ -42,7 +39,6 @@ impl FallbackRefusal {
 			"owner_proof_required" => Some(Self::OwnerProofRequired),
 			"invalid_owner_proof" => Some(Self::InvalidOwnerProof),
 			"conflicting_owner_binding" => Some(Self::ConflictingOwnerBinding),
-			"unregistered_mailbox" => Some(Self::UnregisteredMailbox),
 			"recipient_must_update" => Some(Self::RecipientMustUpdate),
 			_ => None,
 		}
@@ -82,7 +78,7 @@ mod tests {
 	fn typed_anyhow_context_without_tonic_is_classified() {
 		for refusal in [FallbackRefusal::DecidedForFallback, FallbackRefusal::ExpiredNewLightning,
 			FallbackRefusal::OwnerProofRequired, FallbackRefusal::InvalidOwnerProof, FallbackRefusal::ConflictingOwnerBinding,
-			FallbackRefusal::UnregisteredMailbox, FallbackRefusal::RecipientMustUpdate] {
+			FallbackRefusal::RecipientMustUpdate] {
 			let error = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
 				.context(refusal).context("outer action context");
 			assert!(error.downcast_ref::<tonic::Status>().is_none());
@@ -95,7 +91,7 @@ mod tests {
 	fn metadata_alone_selects_the_typed_refusal_and_preserves_original_status() {
 		for refusal in [FallbackRefusal::DecidedForFallback, FallbackRefusal::ExpiredNewLightning,
 			FallbackRefusal::OwnerProofRequired, FallbackRefusal::InvalidOwnerProof, FallbackRefusal::ConflictingOwnerBinding,
-			FallbackRefusal::UnregisteredMailbox, FallbackRefusal::RecipientMustUpdate] {
+			FallbackRefusal::RecipientMustUpdate] {
 			let mut status = tonic::Status::invalid_argument("server diagnostic text can change");
 			status.metadata_mut().insert("abandon-reason", refusal.code().parse().unwrap());
 			let error = FallbackRefusal::map_status(status).context("operation context");

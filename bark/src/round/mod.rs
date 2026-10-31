@@ -2240,7 +2240,6 @@ impl Wallet {
 		let (_, info) = self.require_server().await?;
 		let links = self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
 			&participation.owner_proofs, info.mailbox_pubkey).await?;
-		ensure!(links.values().all(OwnerLink::is_joint), crate::FallbackRefusal::RecipientMustUpdate);
 		let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 
 		// The inputs are only locked at attempt start; here they must just
@@ -2299,7 +2298,6 @@ impl Wallet {
 		let (_, info) = self.require_server().await?;
 		let links = self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
 			&participation.owner_proofs, info.mailbox_pubkey).await?;
-		ensure!(links.values().all(OwnerLink::is_joint), crate::FallbackRefusal::RecipientMustUpdate);
 		let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 		self.check_inputs_spendable(&input_ids).await?;
 
@@ -2381,7 +2379,7 @@ impl Wallet {
 		// Build proto VtxoRequests
 		let vtxo_requests = participation.outputs.iter()
 			.map(|req|
-				protos::VtxoRequest {
+				protos::VtxoRequest { retired_owner_proof: None,
 					owner_proof: Some(links[&req.policy.user_pubkey()].into()),
 					policy: req.policy.serialize(),
 					amount: req.amount.to_sat(),
@@ -2499,27 +2497,22 @@ impl Wallet {
 			complete_released_outputs(self, &mut srv, &participation, &mut outputs, &funding_tx,
 				unlock_hash, &response).await?;
 		}
-		// The replacement is funded by a different tree, so an old wallet backup
-		// must retire its already-owned originals before admitting this output.
-		{
-			let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
-			let claimed = self.operation_input_ids().await?;
-			let mut snapshot = self.inner.db.get_fallback_snapshot().await?;
-			let mut existing = Vec::new();
-			for id in &input_ids {
-				let Some(stored) = self.inner.db.get_wallet_vtxo(*id).await? else { continue; };
-				ensure!(!claimed.contains(id) && !snapshot.adopted_payout_vtxos.contains(id),
-					"released input still belongs to another local operation or payout");
-				if stored.state == (VtxoState::Locked { holder: None }) {
-					ensure!(self.inner.db.retire_vtxo_lock(*id, None).await?,
-						"released input acquired another holder");
-				}
-				snapshot.awaiting_settlement.remove(id);
-				existing.push(*id);
+		// Retire only the exact authenticated participation's originals. No
+		// inferred ancestry or fallback snapshot can release another holder.
+		for id in &input_ids {
+			let Some(stored) = self.inner.db.get_wallet_vtxo(*id).await? else { continue; };
+			ensure!(!self.inner.db.get_fallback_receipts().await?.iter().any(|r| r.vtxo_id == *id),
+				"released input has a committed fallback claim");
+			match stored.state {
+				VtxoState::Locked { holder: None } => {
+					ensure!(self.inner.db.retire_vtxo_lock(*id, None).await?, "released input acquired another holder");
+				},
+				VtxoState::Spendable | VtxoState::Spent => {
+					self.inner.db.update_vtxo_state_checked(*id, VtxoState::Spent,
+						&[VtxoStateKind::Spendable, VtxoStateKind::Spent]).await?;
+				},
+				_ => bail!("released input still belongs to another operation"),
 			}
-			self.inner.db.store_fallback_snapshot(&snapshot).await?;
-			self.inner.db.update_vtxo_states_checked(&existing, VtxoState::Spent,
-				&[VtxoStateKind::Spendable, VtxoStateKind::Spent]).await?;
 		}
 		for output in &outputs { self.inner.db.update_vtxo_witnesses(output).await?; }
 		Ok(outputs.into_iter().find(|output| output.id() == candidate.id()).expect("checked above"))

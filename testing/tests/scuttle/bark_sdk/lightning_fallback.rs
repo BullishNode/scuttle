@@ -45,7 +45,7 @@ async fn pay_hold_expired_inputs_are_refused_then_refresh_succeeds() {
 		source.validate(&source_anchor).unwrap();
 		let tip = ctx.bitcoind().get_block_count().await as u32;
 		assert!(tip < source.expiry_height().to_u32());
-		wallet.fallback_destination().await.unwrap();
+		wallet.fallback_script();
 		let earliest = db.read(async |tx| Ok(tx.query_one(
 			"SELECT MIN(expiry) FROM vtxo WHERE frontier_at IS NOT NULL AND onchain_spent_height IS NULL", &[],
 		).await?.get::<_, Option<i32>>(0))).await.unwrap().expect("fixture must have a real backing frontier");
@@ -187,7 +187,7 @@ async fn pay_hold_expired_inputs_are_refused_then_refresh_succeeds() {
 		assert!(!native_replacement.decided_for_fallback);
 		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1",
 			&[&replacement.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
-		assert!(wallet.history().await.unwrap().iter().all(|movement| movement.subsystem.name != "abandon.fallback_payout"));
+		assert!(wallet.history().await.unwrap().iter().all(|movement| movement.subsystem.name != "scuttle.fallback"));
 		let balance = assert_balance_consistent(&wallet, false).await;
 		assert_eq!(balance.spendable, board_amount);
 		assert_eq!(balance.needs_refresh, bitcoin::Amount::ZERO);
@@ -290,7 +290,7 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 		arrived: Arc::new(tokio::sync::Notify::new()), requests: Arc::new(AtomicUsize::new(0)) };
 	let proxy = srv.start_proxy_no_mailbox(gate.clone()).await;
 	let mut wallet_builder = ctx.bark_sdk("receiver", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true);
-	if fallback { wallet_builder = wallet_builder.app_bip84(); }
+	if fallback { wallet_builder = wallet_builder.app_bip86(); }
 	let wallet = wallet_builder.create().await;
 	lightning.sync().await;
 	let amount = btc(0.5);
@@ -345,7 +345,7 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 		.await.unwrap().trim()).unwrap();
 	let database = Arc::new(SqliteClient::open(ctx.datadir.join("receiver/db.sqlite")).unwrap());
 	let (onchain, script): (Arc<tokio::sync::RwLock<dyn OnchainWalletTrait>>, _) = if fallback {
-		let wallet = AppBip84Wallet::load_or_create(
+		let wallet = AppBip86Wallet::load_or_create(
 			Network::Regtest, mnemonic.to_seed(""), database.clone(), ctx.bitcoind().sync_client(),
 		).await.unwrap();
 		let script = wallet.fallback_script();
@@ -358,8 +358,7 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 	let mut config = ctx.bark_default_cfg(&proxy, Some(ctx.bitcoind()));
 	config.daemon_manual_sync = true;
 	let reopened = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &mnemonic), config,
-		OpenWalletArgs { persister: Some(database), onchain: Some(onchain),
-			fallback_spk: Some(script), run_daemon: false, ..Default::default() }).await.unwrap();
+		OpenWalletArgs { persister: Some(database), onchain: Some(onchain), run_daemon: false, ..Default::default() }).await.unwrap();
 	assert_eq!(reopened.lightning_receive_checkpoint(hash).await.unwrap().unwrap(), checkpoint);
 	assert!(matches!(reopened.try_claim_lightning_receive(hash, true).await.unwrap(), LightningReceiveState::Settled(_)));
 	assert!(gate.requests.load(Ordering::SeqCst) >= 2, "reopen must execute the genuine idempotent claim RPC again");
@@ -391,8 +390,8 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 		attestation: VtxoStatusAttestation::new(source.id(), &key).serialize(),
 	}).await.unwrap().into_inner();
 	assert_eq!(status.spend_state, protos::VtxoSpendState::Spendable as i32);
-	let registration = reopened.fallback_destination().await.unwrap();
-	assert!(registration.spk.is_p2wpkh());
+	let registration = reopened.fallback_script();
+	assert!(registration.is_p2wpkh());
 	let expected = source.amount() - ark_testing::sat(500_000);
 	let absent_height = ctx.bitcoind().get_block_count().await;
 	drop(reopened);
@@ -464,7 +463,7 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 	let anchor = OutPoint::new(parent.compute_txid(), anchors[0].0 as u32);
 	assert!(child.input.iter().any(|input| input.previous_output == anchor),
 		"the measured fee subsidy must actually spend this payout parent's P2A");
-	let outputs = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == registration.spk).collect::<Vec<_>>();
+	let outputs = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == registration).collect::<Vec<_>>();
 	assert_eq!(outputs.len(), 1);
 	assert_eq!(outputs[0].1.value, expected);
 	let point = OutPoint::new(parent.compute_txid(), outputs[0].0 as u32);
@@ -511,7 +510,7 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 	for height in absent_height + 1..=u64::from(confirmed.to_u32()) {
 		let block = core.get_block(&core.get_block_hash(height).unwrap()).unwrap();
 		for tx in block.txdata {
-			received += tx.output.iter().filter(|output| output.script_pubkey == registration.spk)
+			received += tx.output.iter().filter(|output| output.script_pubkey == registration)
 				.map(|output| output.value).sum::<bitcoin::Amount>();
 		}
 	}
@@ -520,9 +519,9 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 
 	// New Ark and BDK databases, original seed only; no leaf IDs, receipts,
 	// or payout transaction are supplied to the restored wallet.
-	let restored = ctx.bark_sdk("seed_only", &srv).mnemonic(mnemonic).app_bip84()
+	let restored = ctx.bark_sdk("seed_only", &srv).mnemonic(mnemonic).app_bip86()
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
-	assert_eq!(restored.fallback_destination().await.unwrap(), registration);
+	assert_eq!(restored.fallback_script(), registration);
 	restored.sync_onchain().await.unwrap();
 	let onchain = restored.onchain().unwrap();
 	assert_eq!(onchain.read().await.balance().await, expected);

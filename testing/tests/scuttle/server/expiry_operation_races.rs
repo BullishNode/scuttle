@@ -89,7 +89,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 	let wallet = Arc::new(builder.boarded(sat(100_000)).create().await);
 	let coin = wallet.spendable_vtxos().await.unwrap().pop().unwrap();
 	let id = coin.id();
-	let destination = wallet.fallback_destination().await.unwrap();
+	let destination = wallet.fallback_script();
 	let native_balance = wallet.history().await.unwrap().iter()
 		.map(|entry| entry.effective_balance.to_sat()).sum::<i64>();
 	assert_eq!(native_balance, 100_000, "the genuine board credit must be retained");
@@ -190,7 +190,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 		", &[&offboard_txid.to_string()]).await?.get::<_, i64>(0))).await.unwrap();
 		assert_eq!(persisted, 0, "the actual registration transaction must roll back its offboard insert");
 		assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-		let (index, output) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination.spk).unwrap();
+		let (index, output) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
 		assert_eq!(output.value, coin.amount() - sat(1_000));
 		let movement = match &prepared.progress {
 			Progress::OffboardTxPrepared { movement_id, .. } => *movement_id,
@@ -271,7 +271,7 @@ async fn expiry_uninitiated_grant_can_revoke_after_backing_expiry() {
 	let input = wallet.spendable_vtxos().await.unwrap().pop().unwrap();
 	let input = wallet.get_full_vtxo(input.id()).await.unwrap();
 	let key = wallet.get_vtxo_key(&input).await.unwrap();
-	let destination = wallet.fallback_destination().await.unwrap();
+	let destination = wallet.fallback_script();
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let deadline = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
 	assert!(deadline > input.expiry_height());
@@ -326,7 +326,7 @@ async fn expiry_uninitiated_grant_can_revoke_after_backing_expiry() {
 		}
 	}).await.expect("genuine post-expiry revocation did not permit its actual fallback payout");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	let (index, output) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination.spk).unwrap();
+	let (index, output) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
 	assert_eq!(output.value, input.amount() - sat(1_000));
 	ctx.generate_blocks(6).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);

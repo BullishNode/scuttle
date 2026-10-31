@@ -27,10 +27,9 @@ async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	let mut request = tonic::Request::new(protos::Empty {});
 	request.set_pver(version);
 	public.get_offboard_fee_rate(request).await.unwrap();
-	// A retired tag cannot populate the required1000+ proof field (codec unit
-	// control); the real handler must refuse the resulting absent proof.
+	// A missing current proof remains refused independently of retired tags.
 	let key = Keypair::new(&ark::SECP, &mut thread_rng());
-	let mut request = tonic::Request::new(protos::BoardCosignRequest {
+	let mut request = tonic::Request::new(protos::BoardCosignRequest { retired_owner_proof: None,
 		user_pubkey: key.public_key().serialize().to_vec(),
 		..Default::default()
 	});
@@ -38,6 +37,41 @@ async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	let missing = public.request_board_cosign(request).await.unwrap_err();
 	assert_eq!(missing.code(), tonic::Code::InvalidArgument);
 	assert_eq!(missing.metadata().get("abandon-reason").unwrap().to_str().unwrap(), "owner_proof_required");
+
+	let mailbox_key = Keypair::new(&ark::SECP, &mut thread_rng());
+	let proof = ark::fallback::OwnerLink::new_joint(bitcoin::Network::Regtest,
+		srv.mailbox_keypair().public_key(), &mailbox_key, &key).unwrap();
+	for retired in [vec![], vec![1, 2, 3]] {
+		let mut board = tonic::Request::new(protos::BoardCosignRequest {
+			user_pubkey: key.public_key().serialize().to_vec(), owner_proof: Some(proof.into()),
+			retired_owner_proof: Some(retired.clone()), ..Default::default()
+		});
+		board.set_pver(version);
+		let error = public.request_board_cosign(board).await.unwrap_err();
+		assert_eq!(error.code(), tonic::Code::InvalidArgument);
+		assert_eq!(error.message(), "retired owner proof field");
+		let mut claim = tonic::Request::new(protos::PrepareLightningReceiveClaimRequest {
+			owner_proof: Some(proof.into()), retired_owner_proof: Some(retired.clone()),
+			..Default::default()
+		});
+		claim.set_pver(version);
+		let error = public.prepare_lightning_receive_claim(claim).await.unwrap_err();
+		assert_eq!(error.code(), tonic::Code::InvalidArgument);
+		assert_eq!(error.message(), "retired owner proof field");
+		for isolated in [false, true] {
+			let output = protos::ArkoorDestination {
+				owner_proof: Some(proof.into()), retired_owner_proof: Some(retired.clone()),
+				..Default::default()
+			};
+			let mut part = protos::ArkoorCosignRequest::default();
+			if isolated { part.isolated_outputs.push(output); } else { part.outputs.push(output); }
+			let mut request = tonic::Request::new(protos::ArkoorPackageCosignRequest { parts: vec![part] });
+			request.set_pver(version);
+			let error = public.request_arkoor_cosign(request).await.unwrap_err();
+			assert_eq!(error.code(), tonic::Code::InvalidArgument);
+			assert!(error.message().contains("retired owner proof field"));
+		}
+	}
 
 	let mut mailbox = server_rpc::mailbox::MailboxServiceClient::connect(srv.ark_url()).await.unwrap();
 	let error = mailbox.read_mailbox(protos::mailbox_server::MailboxRequest::default()).await.unwrap_err();

@@ -58,8 +58,7 @@ async fn offline_signed_addresses_receive_split_and_isolated_outputs() {
 	assert_eq!(assert_balance_consistent(&reopened, false).await.spendable, sat(199_999));
 	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	for address in [first, second] {
-		let owner = db.read(async |tx| tx.expiry_owner(address.policy().user_pubkey(), bitcoin::Network::Regtest,
-			&srv.mailbox_keypair()).await).await.unwrap();
+		let owner = db.read(async |tx| tx.expiry_owner(address.policy().user_pubkey()).await).await.unwrap();
 		assert!(matches!(owner, server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. }
 			if mailbox_pk == recipient_mailbox.as_pubkey()));
 	}
@@ -114,7 +113,7 @@ async fn rejected_change_link_unlocks_inputs_without_recycling_the_key() {
 	assert_eq!(assert_balance_consistent(&sender, false).await.spendable, sat(400_000));
 	let db = server::database::Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	let keys = [key.to_string(), address.policy().user_pubkey().to_string()];
-	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_owner_key WHERE user_pubkey=ANY($1)", &[&keys.as_slice()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM owner_key WHERE user_pubkey=ANY($1)", &[&keys.as_slice()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 	armed.store(false, Ordering::SeqCst);
 	sender.send_arkoor_payment(&address, sat(100_000)).await.unwrap();
 	recipient.sync_mailbox().await.unwrap();

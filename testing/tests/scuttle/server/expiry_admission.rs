@@ -8,7 +8,7 @@ use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::attestations::RoundParticipationStatusAttestation;
 use ark::lightning::{PaymentHash, Preimage};
-use ark::fallback::{FallbackRegistration, OwnerLink};
+use ark::fallback::OwnerLink;
 use ark::mailbox::MailboxIdentifier;
 use ark::{ProtocolEncoding, VtxoPolicy};
 use ark::test_util::VTXO_VECTORS;
@@ -106,43 +106,53 @@ async fn ownership_links_are_required_at_all_eight_admissions() {
 	let ctx = TestContext::new("server/owner_links_all_admissions").await;
 	let srv = ctx.captaind("server").create().await;
 	let mut rpc = srv.get_public_rpc().await;
-	let key = VTXO_VECTORS.board_vtxo.user_pubkey();
-	let policy = VtxoPolicy::new_pubkey(key).serialize();
-	let destination = protos::ArkoorDestination {
-		total_amount: 100_000, policy: policy.clone(), owner_proof: None,
-	};
-	let part = protos::ArkoorCosignRequest { outputs: vec![destination], ..Default::default() };
-	let package = || protos::ArkoorPackageCosignRequest { parts: vec![part.clone()] };
-	let refusal = |status: tonic::Status| {
-		assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
-		assert_eq!(status.metadata().get("abandon-reason").unwrap().to_str().unwrap(), "owner_proof_required");
-		assert_eq!(status.metadata().get("identifiers").unwrap().to_str().unwrap(), key.to_string());
-	};
-	refusal(rpc.request_board_cosign(protos::BoardCosignRequest {
-		user_pubkey: key.serialize().to_vec(), ..Default::default()
-	}).await.unwrap_err());
-	refusal(rpc.request_arkoor_cosign(package()).await.unwrap_err());
-	refusal(rpc.request_lightning_pay_htlc_cosign(protos::LightningPayHtlcCosignRequest {
-		parts: vec![part.clone()],
-	}).await.unwrap_err());
-	refusal(rpc.request_lightning_pay_htlc_revocation(package()).await.unwrap_err());
-	refusal(rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
-		payment_hash: vec![1; 32], user_pubkey: key.serialize().to_vec(), ..Default::default()
-	}).await.unwrap_err());
-	refusal(rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
-		payment_hash: vec![1; 32], payment_preimage: vec![2; 32], cosign_request: Some(package()),
-	}).await.unwrap_err());
-	let output = protos::VtxoRequest { amount: 100_000, policy, owner_proof: None };
-	refusal(rpc.submit_payment(protos::SubmitPaymentRequest {
-		vtxo_requests: vec![protos::SignedVtxoRequest { vtxo: Some(output.clone()), ..Default::default() }],
-		..Default::default()
-	}).await.unwrap_err());
-	refusal(rpc.submit_round_participation(protos::RoundParticipationRequest {
-		vtxo_requests: vec![output], ..Default::default()
-	}).await.unwrap_err());
+	let pair = Keypair::from_seckey_slice(&SECP, &[37;32]).unwrap();
+	let mailbox = Keypair::from_seckey_slice(&SECP, &[38;32]).unwrap();
+	let key = pair.public_key();
+	let joint = protos::OwnerProof::from(OwnerLink::new_joint(Network::Regtest,
+		srv.mailbox_keypair().public_key(), &mailbox, &pair).unwrap());
+	let mut version_zero = joint.clone(); version_zero.version = 0;
+	let mut legacy = joint.clone(); legacy.version = 1; legacy.mailbox_signature.clear();
+	let mut missing_mailbox = joint; missing_mailbox.mailbox_signature.clear();
+	for proof in [None, Some(version_zero), Some(legacy), Some(missing_mailbox)] {
+		let policy = VtxoPolicy::new_pubkey(key).serialize();
+		let reason = if proof.is_none() { "owner_proof_required" } else { "invalid_owner_proof" };
+		let destination = protos::ArkoorDestination { retired_owner_proof: None,
+			total_amount: 100_000, policy: policy.clone(), owner_proof: proof.clone(),
+		};
+		let part = protos::ArkoorCosignRequest { outputs: vec![destination], ..Default::default() };
+		let package = || protos::ArkoorPackageCosignRequest { parts: vec![part.clone()] };
+		let refusal = |status: tonic::Status| {
+			assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
+			assert_eq!(status.metadata().get("abandon-reason").unwrap().to_str().unwrap(), reason);
+			assert_eq!(status.metadata().get("identifiers").unwrap().to_str().unwrap(), key.to_string());
+		};
+		refusal(rpc.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
+			user_pubkey: key.serialize().to_vec(), owner_proof: proof.clone(), ..Default::default()
+		}).await.unwrap_err());
+		refusal(rpc.request_arkoor_cosign(package()).await.unwrap_err());
+		refusal(rpc.request_lightning_pay_htlc_cosign(protos::LightningPayHtlcCosignRequest {
+			parts: vec![part.clone()],
+		}).await.unwrap_err());
+		refusal(rpc.request_lightning_pay_htlc_revocation(package()).await.unwrap_err());
+		refusal(rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+			payment_hash: vec![1; 32], user_pubkey: key.serialize().to_vec(), owner_proof: proof.clone(), ..Default::default()
+		}).await.unwrap_err());
+		refusal(rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
+			payment_hash: vec![1; 32], payment_preimage: vec![2; 32], cosign_request: Some(package()),
+		}).await.unwrap_err());
+		let output = protos::VtxoRequest { retired_owner_proof: None, amount: 100_000, policy, owner_proof: proof };
+		refusal(rpc.submit_payment(protos::SubmitPaymentRequest {
+			vtxo_requests: vec![protos::SignedVtxoRequest { vtxo: Some(output.clone()), ..Default::default() }],
+			..Default::default()
+		}).await.unwrap_err());
+		refusal(rpc.submit_round_participation(protos::RoundParticipationRequest {
+			vtxo_requests: vec![output], ..Default::default()
+		}).await.unwrap_err());
+	}
 	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let counts = db.read(async |tx| Ok(tx.query_one("SELECT
-		(SELECT count(*) FROM expiry_owner_key),
+		(SELECT count(*) FROM owner_key),
 		(SELECT count(*) FROM lightning_payment_attempt),
 		(SELECT count(*) FROM lightning_htlc_subscription)", &[]).await?)).await.unwrap();
 	assert_eq!((counts.get::<_, i64>(0), counts.get::<_, i64>(1), counts.get::<_, i64>(2)), (0, 0, 0));
@@ -157,8 +167,8 @@ async fn ownership_links_are_required_at_all_eight_admissions() {
 /// Valid replays intentionally touch VTXO updated_at. Keep every other field,
 /// including created_at, exact; refused requests use the full source_rows.
 
-/// A mailbox's destination registration does not authorize an unrelated coin.
-/// A coin signature alone must not assign that coin to the registered mailbox.
+/// A public mailbox identifier does not authorize an unrelated coin.
+/// A coin signature alone must not assign that coin to that mailbox.
 #[tokio::test]
 async fn ownership_board_requires_coin_and_mailbox_authorization() {
 	let ctx = TestContext::new("server/ownership_board_joint_authorization").await;
@@ -166,11 +176,8 @@ async fn ownership_board_requires_coin_and_mailbox_authorization() {
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let bob = ctx.bark_sdk("bob", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let bob_mailbox = bob.mailbox_identifier();
-	let bob_record = db.read(async |tx| tx.get_fallback(bob_mailbox.as_pubkey()).await)
-		.await.unwrap().expect("Bob has an authenticated destination registration");
-	bob_record.verify(Network::Regtest, bob_mailbox.as_pubkey()).unwrap();
 
-	// Alice's coin key exists only after Bob registered. No Bob signature for
+	// Alice's coin key is derived independently of Bob's mailbox. No Bob signature for
 	// this key is requested or supplied. Both wallets retain their own keys.
 	let alice = ctx.bark_sdk("alice", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
 		.funded(sat(200_000)).create().await;
@@ -178,9 +185,24 @@ async fn ownership_board_requires_coin_and_mailbox_authorization() {
 	assert_ne!(coin.public_key(), bob_mailbox.as_pubkey());
 	assert_ne!(alice.mailbox_identifier(), bob_mailbox);
 	let info = srv.ark_info().await;
-	let link = OwnerLink::new(info.mailbox_pubkey, bob_mailbox, &coin).unwrap();
-	link.verify(info.mailbox_pubkey, coin.public_key()).unwrap();
-	assert_eq!(MailboxIdentifier::from_blinded(link.blinded_id, coin.public_key(), &srv.mailbox_keypair()).unwrap(), bob_mailbox);
+	let blinded = bob_mailbox.to_blinded(info.mailbox_pubkey, &coin).unwrap();
+	// Sign only the existing coin half of the current intent. Bob's secret
+	// is never requested and no mailbox authorization is constructed.
+	use bitcoin::hashes::HashEngine;
+	let mut intent = vec![2];
+	intent.extend_from_slice(bitcoin::constants::ChainHash::using_genesis_block_const(Network::Regtest).as_bytes());
+	intent.extend_from_slice(&info.mailbox_pubkey.serialize());
+	intent.extend_from_slice(&coin.public_key().serialize());
+	intent.extend_from_slice(blinded.as_ref());
+	let tag = sha256::Hash::hash(b"Ark/ExpiryOwnerLink/Coin/v2");
+	let mut engine = sha256::Hash::engine();
+	engine.input(tag.as_byte_array()); engine.input(tag.as_byte_array()); engine.input(&intent);
+	let message = bitcoin::secp256k1::Message::from_digest(sha256::Hash::from_engine(engine).to_byte_array());
+	let signature = SECP.sign_schnorr_no_aux_rand(&message, &coin);
+	SECP.verify_schnorr(&signature, &message, &coin.x_only_public_key().0).unwrap();
+	let proof = protos::OwnerProof { blinded_mailbox_id: blinded.as_ref().to_vec(),
+		signature: signature.serialize().to_vec(), version: 2, mailbox_signature: vec![] };
+	assert_eq!(MailboxIdentifier::from_blinded(blinded, coin.public_key(), &srv.mailbox_keypair()).unwrap(), bob_mailbox);
 	let expiry = ctx.generate_blocks(1).await + info.vtxo_lifetime;
 	let gross = sat(100_000);
 	let fee = info.fees.board.calculate(gross).unwrap();
@@ -200,10 +222,10 @@ async fn ownership_board_requires_coin_and_mailbox_authorization() {
 	let builder = builder.set_funding_details(gross, fee, outpoint).unwrap();
 	let exit_txid = builder.exit_tx().compute_txid();
 	let builder = builder.generate_user_nonces();
-	let request = protos::BoardCosignRequest {
+	let request = protos::BoardCosignRequest { retired_owner_proof: None,
 		amount: gross.to_sat(), utxo: outpoint.serialize(), expiry_height: expiry.into(),
 		user_pubkey: coin.public_key().serialize().to_vec(), pub_nonce: builder.user_pub_nonce().serialize().to_vec(),
-		funding_tx: bitcoin::consensus::serialize(&funding), owner_proof: Some(link.into()),
+		funding_tx: bitcoin::consensus::serialize(&funding), owner_proof: Some(proof.clone()),
 	};
 	let txids = [funding_id.to_string(), exit_txid.to_string()];
 	let economic_rows = async || db.read(async |tx| {
@@ -245,7 +267,8 @@ async fn ownership_board_requires_coin_and_mailbox_authorization() {
 	}));
 	std::fs::write(ctx.datadir.join("joint-authorization-observation.json"), serde_json::to_vec_pretty(&serde_json::json!({
 		"coin_pubkey": coin.public_key().to_string(), "mailbox_pubkey": bob_mailbox.as_pubkey().to_string(),
-		"owner_proof": link.serialize(), "funding_tx": bitcoin::consensus::serialize(&funding),
+		"owner_proof": { "blinded_id": proof.blinded_mailbox_id, "coin_signature": proof.signature,
+			"mailbox_signature": proof.mailbox_signature, "version": proof.version }, "funding_tx": bitcoin::consensus::serialize(&funding),
 		"accepted_response": accepted_response, "refusal_code": result.as_ref().err().map(|error| error.code().to_string()),
 		"inputs_before": inputs_before, "inputs_after": inputs_after,
 		"mempool_before": mempool_before, "mempool_after": mempool_after,
@@ -260,7 +283,6 @@ async fn ownership_board_requires_coin_and_mailbox_authorization() {
 	assert_owner_refusal(error, coin.public_key(), bark::FallbackRefusal::InvalidOwnerProof);
 	assert!(owners_after.is_empty());
 	assert_eq!(economic_after, before, "refusal must precede issuance and payout allocation");
-	assert_eq!(db.read(async |tx| tx.get_fallback(bob_mailbox.as_pubkey()).await).await.unwrap(), Some(bob_record));
 	assert!(bob.all_vtxos().await.unwrap().is_empty());
 	assert!(alice.all_vtxos().await.unwrap().is_empty());
 	assert!(bob.history().await.unwrap().is_empty());
@@ -286,7 +308,7 @@ async fn ownership_board_refusals_preserve_funding_and_exact_replay() {
 	let builder = builder.set_funding_details(sat(100_000), sat(0), outpoint).unwrap();
 	let exit_txid = builder.exit_tx().compute_txid();
 	let builder = builder.generate_user_nonces();
-	let request = protos::BoardCosignRequest {
+	let request = protos::BoardCosignRequest { retired_owner_proof: None,
 		amount: 100_000, utxo: outpoint.serialize(), expiry_height: expiry.into(),
 		user_pubkey: coin.public_key().serialize().to_vec(), pub_nonce: builder.user_pub_nonce().serialize().to_vec(),
 		funding_tx: bitcoin::consensus::serialize(&funding), owner_proof: Some(link.into()),
@@ -477,7 +499,7 @@ async fn ownership_package_refusals_preserve_sources_and_isolated_prefixes() {
 	for output in replay.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
 		let key = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
 		let pair = if key == a.public_key() { &a } else if key == b.public_key() { &b } else { &isolated };
-		output.owner_proof = Some(OwnerLink::new(srv.mailbox_keypair().public_key(), MailboxIdentifier::from_pubkey(pair.public_key()), pair).unwrap().into());
+		output.owner_proof = Some(OwnerLink::new_joint(Network::Regtest, srv.mailbox_keypair().public_key(), pair, pair).unwrap().into());
 	}
 	let replay_response = package_rpc(&mut srv.get_public_rpc().await, PackageAdmission::Arkoor, replay).await.unwrap();
 	let actual = source_rows(&db, &ids).await;
@@ -556,9 +578,6 @@ impl RoundLinkRequest {
 			Self::Delegated(r) => r.vtxo_requests.last_mut().unwrap(),
 		}
 	}
-	fn notification(&mut self) -> &mut Option<Vec<u8>> {
-		match self { Self::Interactive(r) => &mut r.unblinded_mailbox_id, Self::Delegated(r) => &mut r.unblinded_mailbox_id }
-	}
 	async fn send(self, rpc: &mut ArkClient) -> Result<Vec<u8>, tonic::Status> {
 		Ok(match self {
 			Self::Interactive(r) => rpc.submit_payment(r).await?.into_inner().unlock_hash,
@@ -587,7 +606,6 @@ struct CheckRoundLinks {
 	db: Db,
 	server: Keypair,
 	other_mailbox: Keypair,
-	unknown_mailbox: MailboxIdentifier,
 	checked: Arc<AtomicUsize>,
 }
 
@@ -601,10 +619,6 @@ impl CheckRoundLinks {
 		let (_, pair) = wallet.pubkey_keypair(&key).await.unwrap().unwrap();
 		let before = round_admission_rows(&self.db, &ids, &keys).await;
 		assert!(owner_rows(&self.db, &keys).await.is_empty());
-		let mut notification = req.clone();
-		*notification.notification() = Some(self.unknown_mailbox.serialize());
-		assert_owner_refusal(notification.send(rpc).await.unwrap_err(), self.unknown_mailbox.as_pubkey(), bark::FallbackRefusal::UnregisteredMailbox);
-		assert_eq!(round_admission_rows(&self.db, &ids, &keys).await, before, "notification refusal must roll back newly verified links");
 		let mut invalid = req.clone();
 		invalid.last_output().owner_proof.as_mut().unwrap().signature = vec![0; 64];
 		assert_owner_refusal(invalid.send(rpc).await.unwrap_err(), key, bark::FallbackRefusal::InvalidOwnerProof);
@@ -639,9 +653,8 @@ async fn ownership_round_refusals_release_flux_and_preserve_durable_participatio
 	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
 	let other = Keypair::new(&ark::SECP, &mut bip39::rand::thread_rng());
 	unmapped_owner_link(&srv, &other, &other).await;
-	let unknown = Keypair::new(&ark::SECP, &mut bip39::rand::thread_rng());
 	let state = CheckRoundLinks { wallet: Arc::new(Mutex::new(None)), db: db.clone(), server: srv.mailbox_keypair(),
-		other_mailbox: other, unknown_mailbox: MailboxIdentifier::from_pubkey(unknown.public_key()), checked: Arc::new(AtomicUsize::new(0)) };
+		other_mailbox: other, checked: Arc::new(AtomicUsize::new(0)) };
 	let proxy = srv.start_proxy_no_mailbox(state.clone()).await;
 	let mnemonic = bip39::Mnemonic::generate(12).unwrap();
 	let wallet = ctx.bark_sdk("sender", &proxy).mnemonic(mnemonic.clone()).boarded(sat(400_000))

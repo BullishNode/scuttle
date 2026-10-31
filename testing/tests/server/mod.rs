@@ -40,7 +40,7 @@ use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::attestations::ArkoorCosignAttestation;
 use ark::attestations::VtxoStatusAttestation;
-use ark::fallback::{FallbackRegistration, OwnerLink};
+use ark::fallback::OwnerLink;
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
 use ark::rounds::{Challenge, RoundAttemptAttestation, RoundEvent, RoundSeq};
 use ark::test_util::dummy::{DummyTestVtxoSpec, DUMMY_USER_KEY};
@@ -1499,7 +1499,7 @@ async fn bad_round_input() {
 	let err = rpc.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: vec![],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
-			vtxo: Some(protos::VtxoRequest {
+			vtxo: Some(protos::VtxoRequest { retired_owner_proof: None,
 				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
@@ -1548,7 +1548,7 @@ async fn bad_round_input() {
 	let err = rpc.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: vec![fake_input],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
-			vtxo: Some(protos::VtxoRequest {
+			vtxo: Some(protos::VtxoRequest { retired_owner_proof: None,
 				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
@@ -1672,7 +1672,7 @@ async fn reject_overlong_board_cosign() {
 	};
 
 	let mut rpc = srv.get_public_rpc().await;
-	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
+	let res = rpc.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
 		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
 		amount: sat(100_000).to_sat(),
 		utxo: OutPoint::null().serialize(),
@@ -1729,7 +1729,7 @@ async fn request_board_cosign_with_funding_tx(
 	let (_sec_nonce, pub_nonce) = musig::nonce_pair(&user_key);
 
 	let mut rpc = srv.get_public_rpc().await;
-	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
+	let res = rpc.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
 		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
 		amount: amount.to_sat(),
 		utxo: utxo.serialize(),
@@ -2317,6 +2317,7 @@ async fn mailbox_post_and_process_with_auth() {
 	let authorization = Some(mailbox_auth.serialize().to_vec());
 
 	let read_mailbox = protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 		authorization,
 		mailbox_id: unblinded_id.clone(),
 		checkpoint: 0,
@@ -2357,6 +2358,7 @@ async fn mailbox_post_and_process_with_auth() {
 	let invalid_authorization = Some(invalid_mailbox_auth.serialize().to_vec());
 
 	let incorrect_read_mailbox = protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 		authorization: invalid_authorization,
 		mailbox_id: unblinded_id.clone(),
 		checkpoint: 0,
@@ -2376,6 +2378,7 @@ async fn mailbox_post_and_process_with_auth() {
 	let expired_authorization = Some(expired_mailbox_auth.serialize().to_vec());
 
 	let expired_read_mailbox = protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 		mailbox_id: unblinded_id.clone(),
 		authorization: expired_authorization.clone(),
 		checkpoint: 0,
@@ -2391,6 +2394,7 @@ async fn mailbox_post_and_process_with_auth() {
 
 	// Now we check that the server rejects requests with no authorization
 	let no_auth_read_mailbox = protos::mailbox_server::MailboxRequest {
+			fallback_cursor: None,
 		mailbox_id: unblinded_id.clone(),
 		authorization: None,
 		checkpoint: 0,
@@ -2577,7 +2581,7 @@ async fn test_register_board() {
 		.generate_user_nonces();
 
 	// Request server to cosign the board
-	let cosign_request = protos::BoardCosignRequest {
+	let cosign_request = protos::BoardCosignRequest { retired_owner_proof: None,
 		owner_proof: Some(test_owner_link(&srv, &client_cosign_keypair).await.into()),
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),

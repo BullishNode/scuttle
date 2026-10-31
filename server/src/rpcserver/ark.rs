@@ -83,6 +83,17 @@ fn client_spend_state(spend_state: SpendState, fallback_pending: bool) -> Option
 	}
 }
 
+fn receipt_spend_state(state: protos::VtxoSpendState,
+	claim: Option<&crate::database::expiry_payout::FallbackClaim>) -> protos::VtxoSpendState
+{
+	match claim {
+		Some(claim) if claim.confirmed_block.is_some() && claim.payout == Amount::ZERO => protos::VtxoSpendState::FallbackForfeited,
+		Some(claim) if claim.confirmed_block.is_some() => protos::VtxoSpendState::Spent,
+		Some(_) => protos::VtxoSpendState::FallbackPending,
+		None => state,
+	}
+}
+
 #[async_trait]
 impl rpc::server::ArkService for Server {
 	#[tracing::instrument(skip(self, req))]
@@ -177,11 +188,11 @@ impl rpc::server::ArkService for Server {
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 		let attestation = VtxoStatusAttestation::from_bytes(&req.attestation)?;
 
-		let (vtxo_state, fallback, owners) = self.db.read(async |t| {
+		let (vtxo_state, fallback, owners, claims) = self.db.read(async |t| {
 			let state = t.get_server_vtxo_by_id(id).await?;
 			let keys = state.vtxo.policy().user_pubkey().map(|key| (id, key)).into_iter().collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
-			Ok((state, fallback, t.coin_owner_mailboxes(&[id]).await?))
+			Ok((state, fallback, t.coin_owner_mailboxes(&[id]).await?, t.fallback_claims(&[id]).await?))
 		}).await.to_status()?;
 
 		let spend_state = vtxo_state.spend_state;
@@ -200,8 +211,9 @@ impl rpc::server::ArkService for Server {
 		};
 
 		Ok(tonic::Response::new(protos::GetVtxoStatusResponse {
-			spend_state: spend_state as i32,
+			spend_state: receipt_spend_state(spend_state, claims.get(&id).filter(|_| fallback.contains(&id))) as i32,
 			owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
+			fallback_claim: claims.get(&id).filter(|_| fallback.contains(&id)).map(Into::into),
 		}))
 	}
 
@@ -262,12 +274,12 @@ impl rpc::server::ArkService for Server {
 			.collect::<Result<Vec<_>, tonic::Status>>()?;
 
 		let ids = queries.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-		let (states, fallback, owners) = self.db.read(async |t| {
+		let (states, fallback, owners, claims) = self.db.read(async |t| {
 			let states = t.get_existing_server_vtxos_by_id(&ids).await?;
 			let keys = states.iter().filter_map(|(id, state)| state.vtxo.policy().user_pubkey().map(|key| (*id, key)))
 				.collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
-			Ok((states, fallback, t.coin_owner_mailboxes(&ids).await?))
+			Ok((states, fallback, t.coin_owner_mailboxes(&ids).await?, t.fallback_claims(&ids).await?))
 		}).await.to_status()?;
 
 		// An id without a client-visible user vtxo is reported as missing,
@@ -296,8 +308,9 @@ impl rpc::server::ArkService for Server {
 
 			vtxos.push(protos::VtxoStatus {
 				vtxo_id: id.to_bytes().to_vec(),
-				spend_state: *spend_state as i32,
+				spend_state: receipt_spend_state(*spend_state, claims.get(&id).filter(|_| fallback.contains(&id))) as i32,
 				owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
+				fallback_claim: claims.get(&id).filter(|_| fallback.contains(&id)).map(Into::into),
 			});
 		}
 
@@ -361,16 +374,17 @@ impl rpc::server::ArkService for Server {
 		// not found.
 		let keys = res.vtxos.iter().map(|v| (v.vtxo.id(), v.vtxo.user_pubkey())).collect::<Vec<_>>();
 		let ids = keys.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-		let (fallback, owners) = self.db.read(async |t| Ok((
-			t.fallback_customer_vtxos(&keys).await?, t.coin_owner_mailboxes(&ids).await?,
+		let (fallback, owners, claims) = self.db.read(async |t| Ok((
+			t.fallback_customer_vtxos(&keys).await?, t.coin_owner_mailboxes(&ids).await?, t.fallback_claims(&ids).await?,
 		))).await.to_status()?;
 		let vtxos = res.vtxos.into_iter().filter_map(|v| {
 			Some(protos::RecoveredVtxo {
-				spend_state: client_spend_state(v.spend_state,
-					fallback.contains(&v.vtxo.id()))? as i32,
+				spend_state: receipt_spend_state(client_spend_state(v.spend_state,
+					fallback.contains(&v.vtxo.id()))?, claims.get(&v.vtxo.id()).filter(|_| fallback.contains(&v.vtxo.id()))) as i32,
 				vtxo: v.vtxo.serialize(),
 				derivation_index: v.derivation_index,
 				owner_mailbox: owners.get(&v.vtxo.id()).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
+				fallback_claim: claims.get(&v.vtxo.id()).filter(|_| fallback.contains(&v.vtxo.id())).map(Into::into),
 			})
 		}).collect();
 
@@ -380,20 +394,6 @@ impl rpc::server::ArkService for Server {
 			have_more: res.have_more,
 			cursor_vtxo_id: res.cursor_vtxo_id.map(|id| id.to_bytes().to_vec()),
 		}))
-	}
-
-	#[tracing::instrument(skip(self, req))]
-	async fn set_fallback(
-		&self, req: tonic::Request<protos::SetFallbackRequest>,
-	) -> Result<tonic::Response<protos::SetFallbackResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
-		let req = req.into_inner();
-		let mailbox = PublicKey::from_bytes(&req.mailbox_pk)?;
-		let record = ark::fallback::FallbackRegistration::deserialize(&req.record)
-			.badarg("invalid fallback record")?;
-		let stored = self.db.write(async |tx| tx.set_fallback(mailbox, &record, self.config.network).await)
-			.await.to_status()?;
-		Ok(tonic::Response::new(protos::SetFallbackResponse { record: stored.serialize() }))
 	}
 
 	// boarding
@@ -408,6 +408,9 @@ impl rpc::server::ArkService for Server {
 	) -> Result<tonic::Response<protos::BoardCosignResponse>, tonic::Status> {
 		let pver = super::validate_scuttle_pver(&req)?;
 		let req = req.into_inner();
+		if req.retired_owner_proof.is_some() {
+			return Err(tonic::Status::invalid_argument("retired owner proof field"));
+		}
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_BOARD_FUNDING_TX
 			&& self.config.require_board_funding_tx
@@ -719,6 +722,9 @@ impl rpc::server::ArkService for Server {
 		let client_address = req.extensions().get::<SocketAddr>().cloned()
 			.or_else(|| req.remote_addr());
 		let req = req.into_inner();
+		if req.retired_owner_proof.is_some() {
+			return Err(tonic::Status::invalid_argument("retired owner proof field"));
+		}
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
 			macros::badarg!("Your client version is too old, you need to update \
@@ -855,7 +861,7 @@ impl rpc::server::ArkService for Server {
 			Ok(SelfSignedInput { vtxo_id, attestation })
 		}).collect::<Result<_, tonic::Status>>()?;
 
-		let notification_mailbox = req.unblinded_mailbox_id.as_ref()
+		req.unblinded_mailbox_id.as_ref()
 			.map(|b| MailboxIdentifier::deserialize(b)).transpose().badarg("invalid unblinded mailbox id")?;
 		let mut owner_links = OwnerLinks::default();
 		let mut vtxo_requests = Vec::with_capacity(req.vtxo_requests.len());
@@ -881,7 +887,6 @@ impl rpc::server::ArkService for Server {
 			inputs,
 			vtxo_requests,
 			owner_links,
-			notification_mailbox,
 			unlock_preimage: Secret::new(unlock_preimage),
 			user_agent_name: crate::telemetry::current_user_agent_name(),
 		};
@@ -1238,6 +1243,25 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	#[test]
+	fn fallback_receipt_distinguishes_pending_payment_and_no_output() {
+		let key = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[7;32]).unwrap().public_key();
+		let mut claim = crate::database::expiry_payout::FallbackClaim {
+			vtxo_id: ark::test_util::VTXO_VECTORS.board_vtxo.id(), source_vtxo_ids: Default::default(),
+			allocation_id: 1, owner_mailbox: key, gross: Amount::from_sat(10_000),
+			fee: Amount::from_sat(1_000), payout: Amount::from_sat(9_000), forfeited: Amount::ZERO,
+			transaction_id: None, output_index: Some(0), confirmed_block: None,
+		};
+		assert_eq!(receipt_spend_state(protos::VtxoSpendState::Spent, Some(&claim)), protos::VtxoSpendState::FallbackPending);
+		claim.confirmed_block = Some(bitcoin_ext::BlockRef { height: bitcoin_ext::BlockHeight::new(1),
+			hash: bitcoin::BlockHash::all_zeros() });
+		assert_eq!(receipt_spend_state(protos::VtxoSpendState::Spent, Some(&claim)), protos::VtxoSpendState::Spent);
+		claim.payout = Amount::ZERO; claim.forfeited = Amount::from_sat(9_000); claim.output_index = None;
+		assert_eq!(receipt_spend_state(protos::VtxoSpendState::Spent, Some(&claim)), protos::VtxoSpendState::FallbackForfeited);
+		claim.confirmed_block = None;
+		assert_eq!(receipt_spend_state(protos::VtxoSpendState::Spent, Some(&claim)), protos::VtxoSpendState::FallbackPending);
+	}
 
 	#[test]
 	fn client_spend_state_collapses_server_internal_states() {

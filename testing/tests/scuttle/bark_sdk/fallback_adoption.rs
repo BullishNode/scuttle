@@ -47,12 +47,10 @@ async fn reopen(ctx: &TestContext, name: &str, srv: &captaind::Captaind) -> Wall
 	let mnemonic = mnemonic(ctx, name).await;
 	let db = Arc::new(SqliteClient::open(ctx.datadir.join(name).join("db.sqlite")).unwrap());
 	let onchain = OnchainWallet::load_or_create(Network::Regtest, mnemonic.to_seed(""), db.clone()).await.unwrap();
-	let script = onchain.fallback_script();
 	let mut cfg = ctx.bark_default_cfg(srv, Some(ctx.bitcoind()));
 	config(&mut cfg);
 	Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &mnemonic), cfg, OpenWalletArgs {
-		persister: Some(db), onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
-		fallback_spk: Some(script), run_daemon: false, ..Default::default()
+		persister: Some(db), onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))), run_daemon: false, ..Default::default()
 	}).await.unwrap()
 }
 
@@ -87,7 +85,7 @@ async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
 	recipient.stop_daemon_wait().await.unwrap();
 	let source = sender.spendable_vtxos().await.unwrap().remove(0);
 	let address = recipient.new_address().await.unwrap();
-	let destination = recipient.fallback_destination().await.unwrap();
+	let destination = recipient.fallback_script();
 	let local = SqliteClient::open(ctx.datadir.join("recipient/db.sqlite")).unwrap();
 	assert!(recipient.history().await.unwrap().is_empty());
 	drop(recipient);
@@ -153,11 +151,11 @@ async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
 	srv.watchmand().wait_for_sync_height(confirmed).await;
 	let mut paid = sat(0);
 	for (txid, parent) in &parents {
-		for (vout, output) in parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination.spk) {
+		for (vout, output) in parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination) {
 			let actual = core.get_tx_out(txid, vout as u32, Some(true)).unwrap().unwrap();
 			assert!(actual.confirmations >= 6);
 			assert_eq!(actual.value, output.value);
-			assert_eq!(actual.script_pub_key.script().unwrap(), destination.spk);
+			assert_eq!(actual.script_pub_key.script().unwrap(), destination);
 			paid += actual.value;
 		}
 	}
@@ -173,13 +171,19 @@ async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
 	assert!(returned.spendable_vtxos().await.unwrap().is_empty());
 	assert_eq!(returned.balance().await.unwrap().total(), sat(0));
 	let history = returned.history().await.unwrap();
-	assert_eq!(history.len(), 2);
-	assert!(history.iter().all(|movement| movement.status == bark::movement::MovementStatus::Successful
-		&& movement.subsystem.name == "bark.arkoor" && movement.input_vtxos.is_empty()
-		&& movement.offchain_fee == sat(0)));
+	assert_eq!(history.len(), 4);
+	let incoming = history.iter().filter(|movement| movement.subsystem.name == "bark.arkoor").collect::<Vec<_>>();
+	assert_eq!(incoming.len(), 2);
+	assert!(incoming.iter().all(|movement| movement.status == bark::movement::MovementStatus::Successful
+		&& movement.input_vtxos.is_empty() && movement.offchain_fee == sat(0)));
+	let receipts = history.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback").collect::<Vec<_>>();
+	assert_eq!(receipts.len(), 2);
+	assert!(receipts.iter().all(|movement| movement.status == bark::movement::MovementStatus::Successful));
+	assert_eq!(receipts.iter().map(|movement| movement.offchain_fee).sum::<bitcoin::Amount>(), sat(1_000));
+	assert_eq!(receipts.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(), -20_000);
 	assert_eq!(history.iter().flat_map(|movement| movement.output_vtxos.iter().copied()).collect::<BTreeSet<_>>(),
 		ids.iter().copied().collect());
-	assert_eq!(history.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(), 20_000);
+	assert_eq!(history.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(), 0);
 	for _ in 0..2 {
 		returned.sync().await;
 		assert_eq!(returned.history().await.unwrap(), history);
@@ -216,18 +220,18 @@ async fn fallback_adoption_fresh_seed_retains_unpaid_body_and_recovers_registere
 	let restored = ctx.bark_sdk("restored", &srv).cfg(config)
 		.mnemonic(mnemonic(&ctx, "original").await).create().await;
 	let db = SqliteClient::open(ctx.datadir.join("restored/db.sqlite")).unwrap();
-	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
+	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
 	assert_eq!(restored.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
 	assert!(restored.spendable_vtxos().await.unwrap().is_empty());
 	assert!(restored.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
-	assert!(db.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.is_empty());
-	assert!(restored.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "abandon.fallback_payout")
+	assert!(super::fallback_receipt_ids(db.get_fallback_receipts().await.unwrap(), true).is_empty());
+	assert!(restored.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
 		.all(|movement| movement.effective_balance.to_sat() == 0), "fresh restore must not invent an earlier Ark debit");
 	let paid = ctx.bark_sdk("paid", &srv).cfg(config)
 		.mnemonic(mnemonic(&ctx, "original").await).create().await;
 	srv.stop().await.unwrap();
 	assert!(restored.exit_mgr().get_exit_vtxo(coin.id()).await.is_none());
-	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
+	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
 	assert_eq!(restored.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
 	assert_eq!(restored.balance().await.unwrap().awaiting_settlement, coin.amount(), "the explicit customer claim remains unpaid");
 
@@ -239,7 +243,7 @@ async fn fallback_adoption_fresh_seed_retains_unpaid_body_and_recovers_registere
 	let restored = reopen(&ctx, "restored", &srv).await;
 	ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
 	ctx.generate_blocks(2).await;
-	let script = paid.fallback_destination().await.unwrap().spk;
+	let script = paid.fallback_script();
 	let payout = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			for txid in ctx.bitcoind().sync_client().get_raw_mempool().unwrap() {
@@ -251,7 +255,7 @@ async fn fallback_adoption_fresh_seed_retains_unpaid_body_and_recovers_registere
 	}).await.expect("actual payout did not broadcast after funding");
 	paid.sync_fallback_payouts().await.unwrap();
 	restored.sync_fallback_payouts().await.unwrap();
-	assert!(restored.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "abandon.fallback_payout")
+	assert!(restored.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
 		.all(|movement| movement.effective_balance.to_sat() == 0), "another restore must not invent an earlier Ark debit");
 	ctx.generate_blocks(6).await;
 	srv.stop().await.unwrap();
@@ -259,7 +263,7 @@ async fn fallback_adoption_fresh_seed_retains_unpaid_body_and_recovers_registere
 	paid.sync_fallback_payouts().await.unwrap();
 	let paid_db = SqliteClient::open(ctx.datadir.join("paid/db.sqlite")).unwrap();
 	assert_eq!(paid_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(paid_db.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.contains(&coin.id()));
+	assert!(super::fallback_receipt_ids(paid_db.get_fallback_receipts().await.unwrap(), true).contains(&coin.id()));
 	let transaction = ctx.bitcoind().await_transaction(payout).await;
 	assert!(transaction.output.iter().any(|output| output.script_pubkey == script && output.value == sat(99_000)));
 }
@@ -282,12 +286,9 @@ async fn ordinary_spent_history_uses_upstream_trust_and_retains_only_change() {
 	assert_eq!(restored.balance().await.unwrap().total(), sat(40_000));
 	assert_eq!(restored.balance().await.unwrap().awaiting_settlement, sat(0));
 	restored.dangerous_drop_vtxo(source.id()).await.unwrap();
-	let mut snapshot = db.get_fallback_snapshot().await.unwrap();
-	snapshot.awaiting_settlement.insert(source.id());
-	db.store_fallback_snapshot(&snapshot).await.unwrap();
 	restored.import_vtxo(&signed, bark::ImportVtxoArgs::default()).await.unwrap();
 	assert_eq!(db.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(!db.get_fallback_snapshot().await.unwrap().awaiting_settlement.contains(&source.id()));
+	assert!(!super::fallback_receipt_ids(db.get_fallback_receipts().await.unwrap(), false).contains(&source.id()));
 	restored.sync_fallback_payouts().await.unwrap();
 	assert_eq!(db.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
 	assert_eq!(restored.balance().await.unwrap().total(), sat(40_000));
@@ -327,7 +328,7 @@ async fn trusted_pending_adoption_keeps_owned_principal_during_chain_outage() {
 }
 
 #[tokio::test]
-async fn trusted_pending_adoption_does_not_credit_unvalidated_signed_history() {
+async fn authentic_pending_receipt_never_makes_unvalidated_history_spendable() {
 	Box::pin(trusted_pending_chain_outage(false)).await;
 }
 
@@ -360,13 +361,12 @@ async fn trusted_pending_chain_outage(already_owned: bool) {
 		drop(original);
 		let database = Arc::new(SqliteClient::open(ctx.datadir.join("history.sqlite")).unwrap());
 		let onchain = OnchainWallet::load_or_create(Network::Regtest, seed.to_seed(""), database.clone()).await.unwrap();
-		let script = onchain.fallback_script();
 		let mut cfg = ctx.bark_default_cfg(&proxy, Some(&node));
 		config(&mut cfg);
 		client_chain(&mut cfg, node.rpc_url());
 		let wallet = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &seed), cfg,
 			OpenWalletArgs { persister: Some(database.clone()),
-				onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))), fallback_spk: Some(script),
+				onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
 				run_daemon: false, skip_recovery: true, ..Default::default() }).await.unwrap();
 		// The new device accepts an explicit ordinary-history status fault.
 		// It has never validated this complete-looking body against the chain.
@@ -386,44 +386,38 @@ async fn trusted_pending_chain_outage(already_owned: bool) {
 	assert!(matches!(error.downcast_ref::<VtxoValidationError>(),
 		Some(VtxoValidationError::Chain(_) | VtxoValidationError::AnchorNotFound)));
 	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
-	assert!(database.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.is_empty());
+	assert!(super::fallback_receipt_ids(database.get_fallback_receipts().await.unwrap(), true).is_empty());
 	let balance = wallet.balance().await.unwrap();
 	assert_eq!(balance.spendable, bitcoin::Amount::ZERO);
-	if already_owned {
-		assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
-		assert_eq!(balance.awaiting_settlement, sat(100_000));
-		assert_eq!(balance.total(), sat(100_000));
-		assert!(wallet.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
-	} else {
-		assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-		assert_eq!(balance.total(), bitcoin::Amount::ZERO);
-		assert!(database.get_fallback_snapshot().await.unwrap().awaiting_settlement.is_empty());
-		assert!(wallet.awaiting_settlement_vtxos().await.unwrap().is_empty());
-	}
-	assert!(!wallet.history().await.unwrap().iter().any(|movement| movement.subsystem.name == "abandon.fallback_payout"));
+	assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
+	assert_eq!(balance.awaiting_settlement, sat(100_000), "only the authentic committed receipt supplies pending principal");
+	assert_eq!(balance.total(), sat(100_000));
+	assert!(wallet.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
+	assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
+	assert!(wallet.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
+		.all(|movement| movement.status == bark::movement::MovementStatus::Pending && movement.effective_balance.to_sat() == 0));
 	let mut cfg = wallet.config().clone();
 	wallet.stop_daemon_wait().await.unwrap();
 	drop(wallet);
 	node.start().await.unwrap();
 	client_chain(&mut cfg, node.rpc_url());
 	let onchain = OnchainWallet::load_or_create(Network::Regtest, seed.to_seed(""), database.clone()).await.unwrap();
-	let script = onchain.fallback_script();
 	let wallet = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &seed), cfg,
 		OpenWalletArgs { persister: Some(database.clone()),
-			onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))), fallback_spk: Some(script),
+			onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
 			run_daemon: false, skip_recovery: true, ..Default::default() }).await.unwrap();
 	assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state,
-		if already_owned { VtxoState::Spendable } else { VtxoState::Spent },
-		"reopen itself must not perform the positive status adoption under test");
+		VtxoState::Locked { holder: None },
+		"reopen retains the explicit commitment without making its body spendable");
 	assert_eq!(wallet.trust_and_adopt_server_vtxo_status(coin.id()).await.unwrap(), Some(ServerStatusAdoption::FallbackPending));
 	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
 	wallet.validate_vtxo(&signed).await.unwrap();
-	assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
+	assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
 	assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
 	let balance = wallet.balance().await.unwrap();
 	assert_eq!(balance.awaiting_settlement, sat(100_000));
 	assert_eq!(balance.total(), sat(100_000));
-	assert!(database.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.is_empty());
+	assert!(super::fallback_receipt_ids(database.get_fallback_receipts().await.unwrap(), true).is_empty());
 }
 
 #[derive(Clone, Default)]
@@ -455,7 +449,7 @@ impl captaind::proxy::ArkRpcProxy for HoldArkoorRegistration {
 }
 
 #[tokio::test]
-async fn stalled_arkoor_change_remains_pending_for_its_own_mailbox_until_paid() {
+async fn provisional_recipient_transfer_pays_input_owner() {
 	Box::pin(stalled_change(false, false)).await;
 }
 
@@ -489,7 +483,7 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 	let recipient_key = address.policy().user_pubkey();
 	let source = owner.spendable_vtxos().await.unwrap().remove(0);
 	let source_key = source.user_pubkey();
-	let destination = owner.fallback_destination().await.unwrap();
+	let destination = owner.fallback_script();
 	let (arrived, prepared) = oneshot::channel();
 	*gate.arrived.lock().unwrap() = Some((recipient_key, arrived));
 	let sender = owner.clone();
@@ -539,35 +533,34 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 		let seed = mnemonic(&ctx, "owner").await;
 		let history_db = Arc::new(SqliteClient::open(ctx.datadir.join("unsigned-history.sqlite")).unwrap());
 		let onchain = OnchainWallet::load_or_create(Network::Regtest, seed.to_seed(""), history_db.clone()).await.unwrap();
-		let script = onchain.fallback_script();
 		let mut cfg = ctx.bark_default_cfg(&history_proxy, Some(ctx.bitcoind()));
 		config(&mut cfg);
 		let history = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &seed), cfg,
 			OpenWalletArgs { persister: Some(history_db.clone()),
-				onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))), fallback_spk: Some(script),
+				onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
 				run_daemon: false, skip_recovery: true, ..Default::default() }).await.unwrap();
 		// Only the history status is faulted. The actual unsigned server body,
 		// immutable owner link and unpaid allocation remain unchanged.
 		let report = history.recover_vtxos(changes.iter().map(|coin| coin.id()), None).await.unwrap();
-		assert!(report.is_complete());
-		assert_eq!(report.skipped().total_amount(), sat(40_000));
+		assert!(!report.is_complete());
+		assert_eq!(report.failed().total_amount(), sat(40_000));
 		history_status.force_spent.store(false, Ordering::SeqCst);
 		for change in &changes {
 			let unsigned = history.get_full_vtxo(change.id()).await.unwrap();
 			assert!(!unsigned.has_all_witnesses());
 			assert_ne!(unsigned.serialize(), change.serialize());
-			assert_eq!(history_db.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Spent);
+			assert_eq!(history_db.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
 			let error = history.trust_and_adopt_server_vtxo_status(change.id()).await.unwrap_err();
 			assert!(matches!(error.downcast_ref::<VtxoValidationError>(), Some(VtxoValidationError::Invalid(_))));
 			assert_eq!(history.get_full_vtxo(change.id()).await.unwrap().serialize(), unsigned.serialize());
-			assert_eq!(history_db.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Spent);
+			assert_eq!(history_db.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
 		}
-		assert_eq!(history.balance().await.unwrap().total(), bitcoin::Amount::ZERO);
+		assert_eq!(history.balance().await.unwrap().awaiting_settlement, sat(40_000));
+		assert_eq!(history.balance().await.unwrap().spendable, sat(0));
 		assert!(history.spendable_vtxos().await.unwrap().is_empty());
-		assert!(history.awaiting_settlement_vtxos().await.unwrap().is_empty());
-		let snapshot = history_db.get_fallback_snapshot().await.unwrap();
-		assert!(snapshot.awaiting_settlement.is_empty() && snapshot.adopted_payout_vtxos.is_empty());
-		assert!(!history.history().await.unwrap().iter().any(|movement| movement.subsystem.name == "abandon.fallback_payout"));
+		assert!(history_db.get_fallback_receipts().await.unwrap().iter().all(|receipt| receipt.retired_block.is_none()));
+		assert!(history.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
+			.all(|movement| movement.status == bark::movement::MovementStatus::Pending));
 		history.stop_daemon_wait().await.unwrap();
 		drop(history);
 		drop(history_db);
@@ -622,20 +615,38 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 	for change in &changes {
 		assert_eq!(recovered.vtxos.iter().find(|entry| Vtxo::<Full>::deserialize(&entry.vtxo).unwrap().id() == change.id())
 			.unwrap().spend_state, protos::VtxoSpendState::FallbackPending as i32);
-		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
+		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
 	}
-	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert_eq!(owner.balance().await.unwrap().awaiting_settlement, sat(40_000));
-	assert_eq!(owner.balance().await.unwrap().total(), sat(40_000), "change counts once, without its ordinary spent ancestor");
+	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
+	assert_eq!(owner.balance().await.unwrap().awaiting_settlement, sat(100_000));
+	assert_eq!(owner.balance().await.unwrap().total(), sat(100_000), "both provisional leaves remain owed to the original input owner, once");
 	assert!(owner.spendable_vtxos().await.unwrap().is_empty());
-	assert!(!owner.awaiting_settlement_vtxos().await.unwrap().contains(&source.id()));
+	assert!(owner.awaiting_settlement_vtxos().await.unwrap().contains(&source.id()));
+	let claims = owner.fallback_receipts().await.unwrap();
+	assert_eq!(claims.iter().map(|receipt| receipt.gross).sum::<bitcoin::Amount>(), source.amount());
+	assert!(claims.iter().all(|receipt| receipt.owner_mailbox == owner.mailbox_keypair().public_key()
+		&& receipt.source_vtxo_ids.contains(&source.id())));
+	let mut cursor = None;
+	let mut paged = BTreeSet::new();
+	loop {
+		let page = db.read(async |tx| tx.mailbox_fallback_claims(owner.mailbox_keypair().public_key(), cursor, 1).await).await.unwrap();
+		if page.is_empty() { break; }
+		assert_eq!(page.len(), 1);
+		assert!(paged.insert(page[0].vtxo_id));
+		cursor = Some(page[0].vtxo_id);
+	}
+	assert_eq!(paged, leaves.iter().map(|coin| coin.id()).collect());
+	assert!(db.read(async |tx| tx.mailbox_fallback_claims(recipient.mailbox_keypair().public_key(), None, 1).await).await.unwrap().is_empty());
+	recipient.sync_fallback_payouts().await.unwrap();
+	assert!(recipient.fallback_receipts().await.unwrap().is_empty());
+	assert_eq!(recipient.balance().await.unwrap().total(), sat(0));
 	ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
 	ctx.generate_blocks(2).await;
 	let payout = tokio::time::timeout(Duration::from_secs(30), async {
 		'payout: loop {
 			for txid in ctx.bitcoind().sync_client().get_raw_mempool().unwrap() {
 				let tx = ctx.bitcoind().await_transaction(txid).await;
-				if tx.output.iter().any(|output| output.script_pubkey == destination.spk && output.value == sat(99_000)) { break 'payout tx; }
+				if tx.output.iter().any(|output| output.script_pubkey == destination && output.value == sat(99_000)) { break 'payout tx; }
 			}
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -645,18 +656,18 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 	owner.sync_fallback_payouts().await.unwrap();
 	for change in &changes {
 		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-		assert!(local.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.contains(&change.id()));
+		assert!(super::fallback_receipt_ids(local.get_fallback_receipts().await.unwrap(), true).contains(&change.id()));
 	}
 	assert_eq!(owner.balance().await.unwrap().awaiting_settlement, sat(0));
 	assert_eq!(owner.balance().await.unwrap().total(), sat(0));
-	let (index, _) = payout.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination.spk && output.value == sat(99_000)).unwrap();
+	let (index, _) = payout.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination && output.value == sat(99_000)).unwrap();
 	let output = ctx.bitcoind().sync_client().get_tx_out(&payout.compute_txid(), index as u32, Some(true)).unwrap().unwrap();
 	assert!(output.confirmations >= 6);
 	assert_eq!(output.value, sat(99_000));
-	assert_eq!(output.script_pub_key.script().unwrap(), destination.spk);
+	assert_eq!(output.script_pub_key.script().unwrap(), destination);
 	if check_unsigned_history {
 		assert_eq!(payout.output.iter().filter(|output|
-			output.script_pubkey == destination.spk && output.value == sat(99_000)).count(), 1);
+			output.script_pubkey == destination && output.value == sat(99_000)).count(), 1);
 		let payout_point = OutPoint::new(payout.compute_txid(), index as u32);
 		let chain = owner.chain().clone();
 		owner.stop_daemon_wait().await.unwrap();
@@ -670,11 +681,11 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 		// action checkpoint, address cache or UTXO is imported into it.
 		let database = Arc::new(StorageAdaptorWrapper::new_memory());
 		let mut recovery = OnchainWallet::load_or_create(Network::Regtest, seed.to_seed(""), database).await.unwrap();
-		assert_eq!(recovery.fallback_script(), destination.spk);
+		assert_eq!(recovery.fallback_script(), destination);
 		recovery.sync(&chain).await.unwrap();
 		let coins = recovery.list_unspent();
 		assert!(coins.iter().any(|coin| coin.outpoint == payout_point
-			&& coin.txout.value == sat(99_000) && coin.txout.script_pubkey == destination.spk));
+			&& coin.txout.value == sat(99_000) && coin.txout.script_pubkey == destination));
 		let points = coins.iter().map(|coin| coin.outpoint).collect::<BTreeSet<_>>();
 		assert_eq!(points.len(), coins.len());
 		let total = coins.iter().try_fold(bitcoin::Amount::ZERO,
@@ -807,148 +818,12 @@ async fn expired_status_retirement(paused: bool) {
 	}
 	for _ in 0..2 { stale.sync_fallback_payouts().await.unwrap(); }
 	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(!local.get_fallback_snapshot().await.unwrap().awaiting_settlement.contains(&source.id()));
-	assert!(!local.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.contains(&source.id()));
+	assert!(!super::fallback_receipt_ids(local.get_fallback_receipts().await.unwrap(), false).contains(&source.id()));
+	assert!(!super::fallback_receipt_ids(local.get_fallback_receipts().await.unwrap(), true).contains(&source.id()));
 	assert_eq!(stale.get_full_vtxo(source.id()).await.unwrap().serialize(), signed.serialize());
 	assert_eq!(stale.balance().await.unwrap().total(), sat(40_000));
 	for id in change_ids {
 		assert_eq!(local.get_wallet_vtxo(id).await.unwrap().unwrap().state, VtxoState::Spendable);
 		assert_eq!(stale.get_full_vtxo(id).await.unwrap().serialize(), current.get_full_vtxo(id).await.unwrap().serialize());
 	}
-}
-
-#[tokio::test]
-async fn stale_pending_marker_cannot_reverse_a_newer_native_send() {
-	Box::pin(stale_projection_after_state_write(false)).await;
-}
-
-#[tokio::test]
-async fn stale_pending_marker_cannot_steal_a_foreign_holder() {
-	Box::pin(stale_projection_after_state_write(true)).await;
-}
-
-/// Reproduce the check/store await gap with genuine state writes between the
-/// old read and the stale projection. The projection is not payment evidence.
-async fn stale_projection_after_state_write(foreign_holder: bool) {
-	let name = if foreign_holder { "bark_sdk/stale_projection_foreign_holder" }
-		else { "bark_sdk/stale_projection_native_send" };
-	let ctx = TestContext::new(name).await;
-	let srv = ctx.captaind("server").no_vtxo_pool().create().await;
-	let wallet = ctx.bark_sdk("owner", &srv).cfg(config).boarded(sat(100_000)).create().await;
-	let source = wallet.spendable_vtxos().await.unwrap().remove(0);
-	let signed = wallet.get_full_vtxo(source.id()).await.unwrap();
-	let local = SqliteClient::open(ctx.datadir.join("owner/db.sqlite")).unwrap();
-	let observed = local.get_wallet_vtxo(source.id()).await.unwrap().unwrap();
-	assert_eq!(observed.state, VtxoState::Spendable);
-	let mut stale = local.get_fallback_snapshot().await.unwrap();
-	let holder = bark::vtxo::VtxoLockHolder::Action { id: "reserved-by-another-action".to_owned() };
-	let recipient = ctx.bark_sdk("recipient", &srv).cfg(config).create().await;
-	if foreign_holder {
-		wallet.lock_vtxos([source.id()], Some(holder.clone())).await.unwrap();
-	} else {
-		wallet.send_arkoor_payment(&recipient.new_address().await.unwrap(), sat(60_000)).await.unwrap();
-	}
-	// The delayed projection still saw Spendable, but it has no authority to
-	// reverse the completed native spend or the other holder's reservation.
-	stale.awaiting_settlement.insert(source.id());
-	local.store_fallback_snapshot(&stale).await.unwrap();
-	for _ in 0..2 { wallet.sync_fallback_payouts().await.unwrap(); }
-	let current = local.get_wallet_vtxo(source.id()).await.unwrap().unwrap();
-	assert_eq!(wallet.get_full_vtxo(source.id()).await.unwrap().serialize(), signed.serialize());
-	if foreign_holder {
-		assert_eq!(current.state, VtxoState::Locked { holder: Some(holder) });
-		assert_eq!(wallet.unavailable_vtxos(&[signed], None).await.unwrap(), vec![source.id()]);
-		assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
-	} else {
-		assert_eq!(current.state, VtxoState::Spent);
-		assert!(!local.get_fallback_snapshot().await.unwrap().awaiting_settlement.contains(&source.id()));
-		assert!(!local.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.contains(&source.id()));
-		let change = wallet.spendable_vtxos().await.unwrap();
-		assert_eq!(change.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(40_000));
-		assert_eq!(wallet.balance().await.unwrap().total(), sat(40_000));
-	}
-}
-
-#[tokio::test]
-async fn unresolved_status_preserves_multidevice_original_change_and_grandchild() {
-	Box::pin(real_multidevice_ancestry()).await;
-}
-
-async fn real_multidevice_ancestry() {
-	let ctx = TestContext::new("bark_sdk/unresolved_real_multidevice_ancestry").await;
-	let srv = ctx.captaind("server").create().await;
-	let source = Box::pin(ctx.bark_sdk("source", &srv).cfg(config).boarded(sat(200_000)).create()).await;
-	let target = Box::pin(ctx.bark_sdk("target", &srv).cfg(config).create()).await;
-	source.send_arkoor_payment(&target.new_address().await.unwrap(), sat(100_000)).await.unwrap();
-	Box::pin(target.sync()).await;
-	let original = target.spendable_vtxos().await.unwrap().remove(0);
-	let signed = target.get_full_vtxo(original.id()).await.unwrap();
-	let seed = mnemonic(&ctx, "target").await;
-	let gate = MissingExpiredStatus::default();
-	let proxy = srv.start_proxy_no_mailbox(gate.clone()).await;
-	// The older device positively owns and validates the original before its
-	// peer spends. This is not an unanswered fresh-history import.
-	let older = Box::pin(ctx.bark_sdk("older-device", &proxy).cfg(config).mnemonic(seed).create()).await;
-	let older_db = SqliteClient::open(ctx.datadir.join("older-device/db.sqlite")).unwrap();
-	assert_eq!(older.balance().await.unwrap().total(), sat(100_000));
-	target.send_arkoor_payment(&source.new_address().await.unwrap(), sat(60_000)).await.unwrap();
-	assert_eq!(target.balance().await.unwrap().total(), sat(40_000));
-	let intermediate = target.spendable_vtxos().await.unwrap();
-	assert!(!intermediate.is_empty());
-	assert_eq!(intermediate.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(40_000));
-	*gate.target.lock().unwrap() = Some(original.id());
-	let missing = older.recover_vtxos([original.id()], None).await.unwrap();
-	assert!(!missing.is_complete());
-	assert_eq!(missing.failed().ids().collect::<BTreeSet<_>>(), BTreeSet::from([original.id()]));
-	assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
-	assert!(older.recover_vtxos(intermediate.iter().map(|coin| coin.id()), None).await.unwrap().is_complete());
-	assert_eq!(gate.calls.load(Ordering::SeqCst), 1, "current change must use forwarded status, not a refused whole batch");
-	assert_eq!(older.get_full_vtxo(original.id()).await.unwrap().serialize(), signed.serialize());
-	let older_pending = older.balance().await.unwrap();
-	assert_eq!(older_pending.spendable, sat(40_000));
-	assert_eq!(older_pending.awaiting_settlement, sat(60_000));
-	assert_eq!(older_pending.total(), sat(100_000), "the original and its signed change must never become 140k");
-
-	// Learn only the newest change after a second real payment. Availability
-	// must fence the stale middle before any balance call performs inference.
-	target.send_arkoor_payment(&source.new_address().await.unwrap(), sat(10_000)).await.unwrap();
-	let newest = target.spendable_vtxos().await.unwrap();
-	assert_eq!(newest.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(30_000));
-	let current_ids = newest.iter().map(|coin| coin.id()).collect::<BTreeSet<_>>();
-	let stale = intermediate.iter().filter(|coin| !current_ids.contains(&coin.id())).collect::<Vec<_>>();
-	assert!(!stale.is_empty(), "the real second payment must consume a retained intermediate");
-	let mut current_paths = Vec::new();
-	for coin in &newest {
-		let full = target.get_full_vtxo(coin.id()).await.unwrap();
-		let path = full.ancestor_ids();
-		assert!(path.contains(&original.id()), "current change must use the real original signed path");
-		current_paths.push(path);
-	}
-	assert!(stale.iter().any(|coin| current_paths.iter().any(|path| path.contains(&coin.id()))),
-		"the native path must contain an actual stale middle ancestor");
-	drop(target);
-	assert!(older.recover_vtxos(newest.iter().map(|coin| coin.id()), None).await.unwrap().is_complete());
-	for coin in &stale {
-		assert_eq!(older_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
-		assert!(!older_db.get_fallback_snapshot().await.unwrap().awaiting_settlement.contains(&coin.id()));
-	}
-	assert_eq!(older.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<BTreeSet<_>>(), current_ids);
-	let fenced = older_db.get_fallback_snapshot().await.unwrap().awaiting_settlement;
-	for coin in &stale { assert!(fenced.contains(&coin.id()), "a stale middle remains fenced after the original resolves"); }
-	assert!(current_ids.iter().all(|id| !fenced.contains(id)));
-	let transitive = older.balance().await.unwrap();
-	assert_eq!(transitive.spendable, sat(30_000));
-	assert_eq!(transitive.awaiting_settlement, sat(70_000));
-	assert_eq!(transitive.total(), sat(100_000), "stale middle and newest change represent one principal cut");
-
-	*gate.target.lock().unwrap() = None;
-	Box::pin(older.sync()).await;
-	assert_eq!(older.balance().await.unwrap().total(), sat(30_000));
-	assert_eq!(older.balance().await.unwrap().awaiting_settlement, sat(0));
-	assert_eq!(older.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<BTreeSet<_>>(), current_ids);
-	assert_eq!(older_db.get_wallet_vtxo(original.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(!older.awaiting_settlement_vtxos().await.unwrap().contains(&original.id()));
-	for coin in &stale { assert_eq!(older_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spent); }
-	assert_eq!(older.get_full_vtxo(original.id()).await.unwrap().serialize(), signed.serialize());
-	assert!(older_db.get_fallback_snapshot().await.unwrap().adopted_payout_vtxos.is_empty());
 }

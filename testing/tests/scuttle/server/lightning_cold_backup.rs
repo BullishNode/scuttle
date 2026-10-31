@@ -326,9 +326,9 @@ async fn lightning_backup(unclean: bool) {
 	let invoice = recipient.bolt11_invoice(sat(90_000), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
 	let receiver_key = recipient.new_address().await.unwrap().policy().user_pubkey();
-	let receiver_registration = recipient.fallback_destination().await.unwrap();
+	let receiver_registration = recipient.fallback_script();
 	let receiver_mailbox = recipient.mailbox_identifier().as_pubkey();
-	receiver_registration.verify(Network::Regtest, receiver_mailbox).unwrap();
+
 	let sender = Box::pin(ctx.bark("original-sender", &original)
 		.cfg(|config| config.daemon_manual_sync = true).create()).await;
 	let customer_funding = ctx.fund_bark(&sender, sat(200_000)).await;
@@ -354,9 +354,9 @@ async fn lightning_backup(unclean: bool) {
 	let customer_change = sender.onchain_utxos().await.into_iter().map(|u| (u.outpoint, u.amount)).collect::<BTreeMap<_, _>>();
 	assert_eq!(customer_change.values().copied().sum::<Amount>() + sat(100_000) + board_fee, sat(200_000));
 	assert!(customer_change.keys().all(|point| point.txid == board.compute_txid() && *point != customer_root));
-	let registration = client.fallback_destination().await.unwrap();
+	let registration = client.fallback_script();
 	let mailbox = client.mailbox_identifier().as_pubkey();
-	registration.verify(Network::Regtest, mailbox).unwrap();
+
 	let secp = Secp256k1::new();
 	let master = Xpriv::new_master(Network::Regtest, &seed.to_seed("")).unwrap();
 	let path = DerivationPath::from_str("m/86'/1'/0'/0/0").unwrap();
@@ -364,9 +364,9 @@ async fn lightning_backup(unclean: bool) {
 	let expected_fallback_script = Address::p2tr(
 		&secp, fallback_key.x_only_public_key().0, None, Network::Regtest,
 	).script_pubkey();
-	assert_eq!(registration.spk, expected_fallback_script, "the native fallback must use the seed-derived BIP86 destination");
-	assert!(registration.spk.is_p2tr());
-	assert_ne!(registration.spk, receiver_registration.spk);
+	assert_eq!(registration, expected_fallback_script, "the native fallback must use the seed-derived BIP86 destination");
+	assert!(registration.is_p2tr());
+	assert_ne!(registration, receiver_registration);
 	assert_ne!(mailbox, receiver_mailbox);
 	let key = client.get_vtxo_key(&input).await.unwrap();
 	let owner_key = key.public_key();
@@ -393,7 +393,7 @@ async fn lightning_backup(unclean: bool) {
 		invoice: invoice.to_string(), payment_amount_sat: 90_000,
 		htlc_vtxo_ids: vec![source.to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
 	}).await.unwrap();
-	let response = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+	let response = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
 		owner_proof: Some(recipient.owner_link(receiver_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver_key.serialize().to_vec(),
 		htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,
@@ -486,8 +486,14 @@ async fn lightning_backup(unclean: bool) {
 	}
 	assert_eq!(remaining_pool.iter().map(|coin| coin.amount()).sum::<Amount>(), sat(110_000));
 	assert_eq!(remaining_pool.iter().chain(grants.iter()).map(|coin| coin.amount()).sum::<Amount>(), sat(200_000));
-	assert_eq!(db.read(async |tx| tx.get_fallback(mailbox).await).await.unwrap(), Some(registration.clone()));
-	assert_eq!(db.read(async |tx| tx.get_fallback(receiver_mailbox).await).await.unwrap(), Some(receiver_registration.clone()));
+	assert_eq!(registration, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None));
+	assert_eq!(receiver_registration, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, receiver_mailbox.x_only_public_key().0, None));
+	let ownership_before = db.read(async |tx| {
+		let row = tx.query_one("SELECT
+			(SELECT COALESCE(jsonb_agg(to_jsonb(k) ORDER BY user_pubkey),'[]')::TEXT FROM owner_key k),
+			(SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY vtxo_id),'[]')::TEXT FROM coin_owner c)", &[]).await?;
+		Ok((row.get::<_,String>(0),row.get::<_,String>(1)))
+	}).await.unwrap();
 	let changesets = db.read(async |tx| Ok(tx.query("SELECT kind::TEXT AS kind,id,content FROM wallet_changeset ORDER BY kind,id", &[]).await?
 		.into_iter().map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1), row.get::<_, Vec<u8>>(2))).collect::<Vec<_>>())).await.unwrap();
 	assert!(changesets.iter().any(|(kind, _, _)| kind == "watchman"));
@@ -547,8 +553,14 @@ async fn lightning_backup(unclean: bool) {
 	let restored_changesets = db.read(async |tx| Ok(tx.query("SELECT kind::TEXT AS kind,id,content FROM wallet_changeset ORDER BY kind,id", &[]).await?
 		.into_iter().map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1), row.get::<_, Vec<u8>>(2))).collect::<Vec<_>>())).await.unwrap();
 	assert_eq!(restored_changesets, changesets);
+	assert_eq!(db.read(async |tx| {
+		let row = tx.query_one("SELECT
+			(SELECT COALESCE(jsonb_agg(to_jsonb(k) ORDER BY user_pubkey),'[]')::TEXT FROM owner_key k),
+			(SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY vtxo_id),'[]')::TEXT FROM coin_owner c)", &[]).await?;
+		Ok((row.get::<_,String>(0),row.get::<_,String>(1)))
+	}).await.unwrap(), ownership_before, "cold restore preserves complete ownership and first proofs");
 	for (id, expected) in [(mailbox, registration.clone()), (receiver_mailbox, receiver_registration.clone())] {
-		assert_eq!(db.read(async |tx| tx.get_fallback(id).await).await.unwrap(), Some(expected));
+		assert_eq!(expected, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, id.x_only_public_key().0, None));
 	}
 	server_config.postgres = config.clone();
 	server_config.data_dir = restored_root.join("server");
@@ -563,7 +575,7 @@ async fn lightning_backup(unclean: bool) {
 	assert_eq!(restored.ark_info().await.server_pubkey, public_key);
 	assert_eq!(pending_checkpoint(&db, hash, source, &grants).await, checkpoint);
 	wait_watchman_coins(restored.watchmand(), &sponsors.keys().copied().collect()).await;
-	assert_eq!(db.read(async |tx| tx.get_fallback(mailbox).await).await.unwrap(), Some(registration.clone()));
+	assert_eq!(registration, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None));
 
 	// Checkpoints can close a grant at tree expiry without publishing its leaf.
 	// Observe the applicable barrier before crossing it; never invent a missing
@@ -661,7 +673,7 @@ async fn lightning_backup(unclean: bool) {
 			}
 			let graph = canonical_descendants(&ctx, first_height, &external);
 			assert!(graph.values().flat_map(|tx| &tx.output).all(|output|
-				output.script_pubkey != registration.spk && output.script_pubkey != receiver_registration.spk
+				output.script_pubkey != registration && output.script_pubkey != receiver_registration
 			), "neither fallback destination may receive a canonical payout before the signed receive deadline");
 			let height = mine_continuing_core(&ctx, 1).await;
 			mined += 1;
@@ -676,7 +688,7 @@ async fn lightning_backup(unclean: bool) {
 			let mut closures = BTreeMap::new();
 			let mut closed_points = BTreeMap::new();
 			let observed = super::expiry_lightning_terminal::confirmed_grant_closures(
-				&ctx, &db, &grants, &receiver_registration.spk,
+				&ctx, &db, &grants, &receiver_registration,
 			).await;
 			let height = u32::try_from(ctx.bitcoind().get_block_count().await).unwrap();
 			let required = observed.as_ref().map(|rows| rows.values().map(|(_, closed)|
@@ -701,8 +713,8 @@ async fn lightning_backup(unclean: bool) {
 						assert_eq!(input.witness.taproot_leaf_script().unwrap().script,
 							ark::tree::signed::expiry_clause(public_key, *expiry).as_script());
 					}
-					assert!(tx.output.iter().all(|output| output.script_pubkey != registration.spk
-						&& output.script_pubkey != receiver_registration.spk));
+					assert!(tx.output.iter().all(|output| output.script_pubkey != registration
+						&& output.script_pubkey != receiver_registration));
 					let point = assert_grant_closure(&ctx, grant, &pool_funding, &tx, &operator_script,
 						ancestor_required.contains(&grant.id())).await;
 					closed_points.insert(grant.id(), point);
@@ -763,15 +775,15 @@ async fn lightning_backup(unclean: bool) {
 		assert!(parent_block.height.to_u32() >= block.height.to_u32() + 5,
 			"sender refund cannot precede six canonical confirmations of every grant closure");
 	}
-	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx, &db, &grants, &receiver_registration.spk).await;
+	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx, &db, &grants, &receiver_registration).await;
 	assert_eq!(parent.version.0, 3);
 	assert!(parent.vsize() <= 10_000);
 	assert_eq!(actual_fee(&ctx, &parent).await, Amount::ZERO);
-	let outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == registration.spk).collect::<Vec<_>>();
+	let outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == registration).collect::<Vec<_>>();
 	assert_eq!(outputs.len(), 1);
 	assert_eq!(outputs[0].1.value, sat(99_000));
 	let payout = OutPoint::new(parent.compute_txid(), u32::try_from(outputs[0].0).unwrap());
-	for output in parent.output.iter().filter(|output| output.script_pubkey != registration.spk) {
+	for output in parent.output.iter().filter(|output| output.script_pubkey != registration) {
 		assert!(output.is_p2a_fee_anchor() || output.script_pubkey == operator_script);
 	}
 	let anchors = parent.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor())
@@ -786,7 +798,7 @@ async fn lightning_backup(unclean: bool) {
 	assert!(child.vsize() <= 1_000);
 	let child_fee = actual_fee(&ctx, &child).await;
 	assert!(child_fee > Amount::ZERO);
-	let operator_remainder = parent.output.iter().filter(|output| output.script_pubkey != registration.spk).map(|output| output.value).sum::<Amount>();
+	let operator_remainder = parent.output.iter().filter(|output| output.script_pubkey != registration).map(|output| output.value).sum::<Amount>();
 	assert_eq!(operator_remainder, sat(1_000), "receive grant capital returns in its separate operator closures");
 	assert!(pool_change.values().copied().sum::<Amount>() + operator_remainder < sat(100_000));
 	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.owner_mailbox,c.user_pubkey,c.spk,c.gross_sat,c.fee_sat, \
@@ -798,7 +810,7 @@ async fn lightning_backup(unclean: bool) {
 	assert_eq!(row.get::<_, String>("vtxo_id"), source.to_string());
 	assert_eq!(row.get::<_, String>("owner_mailbox"), mailbox.to_string());
 	assert_eq!(row.get::<_, String>("user_pubkey"), owner_key.to_string());
-	assert_eq!(row.get::<_, String>("spk"), registration.spk.as_bytes().to_lower_hex_string());
+	assert_eq!(row.get::<_, String>("spk"), registration.as_bytes().to_lower_hex_string());
 	assert_eq!(row.get::<_, i64>("gross_sat"), 100_000);
 	assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
 	assert_eq!(row.get::<_, i64>("payout_sat"), 99_000);
@@ -829,9 +841,8 @@ async fn lightning_backup(unclean: bool) {
 		.cfg(|config| config.daemon_manual_sync = true).create()).await;
 	let client = Box::pin(recovered.client()).await;
 	assert_eq!(client.mailbox_identifier().as_pubkey(), mailbox);
-	let rebound = client.fallback_destination().await.unwrap();
-	rebound.verify(Network::Regtest, mailbox).unwrap();
-	assert!(rebound.same_binding(&registration));
+	let rebound = client.fallback_script();
+	assert_eq!(rebound, registration);
 	client.sync_fallback_payouts().await.unwrap();
 	assert_eq!(client.verify_fallback_output(payout).await.unwrap(), sat(99_000));
 	let balance = client.balance().await.unwrap();
@@ -954,8 +965,8 @@ async fn lightning_backup(unclean: bool) {
 		for (vout, output) in tx.output.iter().enumerate() {
 			let point = OutPoint::new(*txid, u32::try_from(vout).unwrap());
 			assert!(monetary_outputs.insert(point, output.clone()).is_none());
-			assert_ne!(output.script_pubkey, receiver_registration.spk, "unclaimed grants cannot create a recipient refund");
-			if output.script_pubkey == registration.spk { assert!(sender_outputs.insert(point, output.value).is_none()); }
+			assert_ne!(output.script_pubkey, receiver_registration, "unclaimed grants cannot create a recipient refund");
+			if output.script_pubkey == registration { assert!(sender_outputs.insert(point, output.value).is_none()); }
 		}
 	}
 	assert_eq!(sender_outputs, BTreeMap::from([(payout, sat(99_000))]), "only one actual customer economic output is allowed in the entire connected graph");

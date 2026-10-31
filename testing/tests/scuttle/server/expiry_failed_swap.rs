@@ -147,7 +147,7 @@ async fn failed_swap_during_restart() {
 	let backing = funding.output[root.vout as usize].clone();
 	assert_eq!(input.amount(), sat(100_000));
 	assert_eq!(backing.value, sat(100_000));
-	let destination = client.fallback_destination().await.unwrap();
+	let destination = client.fallback_script();
 	let owner_mailbox = client.mailbox_identifier().as_pubkey();
 	let key = client.get_vtxo_key(&input).await.unwrap();
 	let hash = Preimage::random().compute_payment_hash();
@@ -273,7 +273,7 @@ async fn failed_swap_during_restart() {
 	assert_eq!(parent.input.len(), 1);
 	assert_eq!(parent.input[0].previous_output, root);
 	assert_eq!(parent.output.iter().map(|out| out.value.to_sat()).sum::<u64>(), backing.value.to_sat());
-	let payouts = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination.spk).collect::<Vec<_>>();
+	let payouts = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
 	assert_eq!(payouts[0].1.value, sat(99_000));
 	let payout = OutPoint::new(parent.compute_txid(), payouts[0].0 as u32);
@@ -282,13 +282,13 @@ async fn failed_swap_during_restart() {
 	let actual = ctx.bitcoind().sync_client().get_tx_out(&payout.txid, payout.vout, Some(true)).unwrap().unwrap();
 	assert!(actual.confirmations >= 6);
 	assert_eq!(actual.value, sat(99_000));
-	assert_eq!(actual.script_pub_key.script().unwrap(), destination.spk);
+	assert_eq!(actual.script_pub_key.script().unwrap(), destination);
 	assert_eq!(actual.value + sat(1_000), input.amount());
-	let operator_remainder = parent.output.iter().filter(|out| out.script_pubkey != destination.spk)
+	let operator_remainder = parent.output.iter().filter(|out| out.script_pubkey != destination)
 		.map(|out| out.value).sum::<Amount>();
 	assert_eq!(operator_remainder, sat(1_000));
 	let (parent_block, child) = canonical_package(&ctx, &parent,
-		&destination.spk, &operator_script).await;
+		&destination, &operator_script).await;
 	let child_txid = child.compute_txid();
 	let mut graph = BTreeMap::from([(parent.compute_txid(), parent.clone()), (child_txid, child)]);
 	let rows = db.read(async |tx| Ok(tx.query("SELECT a.id,a.status,a.sweep_tx,a.sweep_txid,a.confirmed_height,a.confirmed_hash, \
@@ -309,7 +309,7 @@ async fn failed_swap_during_restart() {
 			assert_eq!(row.get::<_, String>("status"), "confirmed");
 			assert_eq!(row.get::<_, String>("owner_mailbox"), owner_mailbox.to_string());
 			assert_eq!(row.get::<_, String>("user_pubkey"), key.public_key().to_string());
-			assert_eq!(row.get::<_, String>("spk"), destination.spk.as_bytes().to_lower_hex_string());
+			assert_eq!(row.get::<_, String>("spk"), destination.as_bytes().to_lower_hex_string());
 			assert_eq!(row.get::<_, i64>("gross_sat"), 100_000);
 			assert_eq!(row.get::<_, i64>("entitlement_gross_sat"), 100_000);
 			assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
@@ -337,7 +337,7 @@ async fn failed_swap_during_restart() {
 		let Some(info) = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(txid, None).unwrap() else { continue; };
 		if info.confirmations.unwrap_or(0) == 0 { continue; }
 		let (_, sponsor) = canonical_package(&ctx, &recorded,
-			&destination.spk, &operator_script).await;
+			&destination, &operator_script).await;
 		graph.insert(txid, recorded);
 		graph.insert(sponsor.compute_txid(), sponsor);
 	}
@@ -346,7 +346,7 @@ async fn failed_swap_during_restart() {
 		FROM expiry_allocation_payout WHERE allocation_id=$1", &[&allocation],
 	).await?)).await.unwrap();
 	assert_eq!(payee.get::<_, i32>("output_index"), i32::try_from(payout.vout).unwrap());
-	assert_eq!(payee.get::<_, String>("spk"), destination.spk.as_bytes().to_lower_hex_string());
+	assert_eq!(payee.get::<_, String>("spk"), destination.as_bytes().to_lower_hex_string());
 	assert_eq!(payee.get::<_, i64>("amount_sat"), 99_000);
 	let inputs = db.read(async |tx| Ok(tx.query("SELECT vtxo_id FROM expiry_allocation_input \
 		WHERE allocation_id=$1", &[&allocation],
@@ -373,7 +373,7 @@ async fn failed_swap_during_restart() {
 				external_inputs += previous.output[input.previous_output.vout as usize].value;
 			}
 		}
-		for (vout, output) in transaction.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination.spk) {
+		for (vout, output) in transaction.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination) {
 			canonical_outputs.insert(OutPoint::new(*txid, vout as u32));
 			assert_eq!(output.value, sat(99_000));
 		}

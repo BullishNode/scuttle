@@ -471,7 +471,8 @@ impl captaind::proxy::MailboxRpcProxy for NoMailbox {
 	async fn read_mailbox(
 		&self, _upstream: &mut MailboxClient, _req: protos::mailbox_server::MailboxRequest,
 	) -> Result<protos::mailbox_server::MailboxMessages, tonic::Status> {
-		Ok(protos::mailbox_server::MailboxMessages { messages: vec![], have_more: false })
+		Ok(protos::mailbox_server::MailboxMessages {
+			fallback_claims: vec![], have_more_fallback_claims: false, fallback_cursor: None, messages: vec![], have_more: false })
 	}
 }
 
@@ -637,7 +638,8 @@ async fn recovered_wallet_follows_xpub_lookup_cursor() {
 		async fn read_mailbox(
 			&self, _upstream: &mut MailboxClient, _req: protos::mailbox_server::MailboxRequest,
 		) -> Result<protos::mailbox_server::MailboxMessages, tonic::Status> {
-			Ok(protos::mailbox_server::MailboxMessages { messages: vec![], have_more: false })
+			Ok(protos::mailbox_server::MailboxMessages {
+			fallback_claims: vec![], have_more_fallback_claims: false, fallback_cursor: None, messages: vec![], have_more: false })
 		}
 	}
 

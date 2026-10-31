@@ -69,7 +69,7 @@ async fn insert_spendable_vtxos() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert succeeded");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert succeeded");
 
 	let state = db.read(async |t| t.get_user_vtxo_by_id(vtxo.id()).await).await.expect("vtxo found");
 	assert_eq!(state.vtxo_id, vtxo.id());
@@ -83,12 +83,12 @@ async fn insert_spendable_is_idempotent() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("first insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("first insert");
 
 	// Second insert with same vtxo should succeed (ON CONFLICT DO NOTHING)
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("idempotent insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("idempotent insert");
 }
 
 #[tokio::test]
@@ -100,7 +100,7 @@ async fn insert_oor_spent_vtxos() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_oor_spent_vtxos([(vtxo.clone(), spending_txid)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert succeeded");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert succeeded");
 
 	let state = db.read(async |t| t.get_user_vtxo_by_id(vtxo.id()).await).await.expect("vtxo found");
 	assert_eq!(state.oor_spent_txid, Some(spending_txid));
@@ -115,12 +115,12 @@ async fn insert_oor_spent_is_idempotent() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_oor_spent_vtxos([(vtxo.clone(), spending_txid)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("first insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("first insert");
 
 	// Re-inserting the same vtxo with the same spending txid is a no-op.
 	let update = VtxoTreeUpdate::new()
 		.insert_oor_spent_vtxos([(vtxo.clone(), spending_txid)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("idempotent insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("idempotent insert");
 
 	let state = db.read(async |t| t.get_user_vtxo_by_id(vtxo.id()).await).await.expect("vtxo found");
 	assert_eq!(state.oor_spent_txid, Some(spending_txid));
@@ -134,13 +134,13 @@ async fn insert_oor_spent_double_spend_fails() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_oor_spent_vtxos([(vtxo.clone(), dummy_txid(0x01))]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("first insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("first insert");
 
 	// A second oor-spent insert for the same vtxo with a different txid
 	// would silently authorize a double-spend under ON CONFLICT DO NOTHING.
 	let update = VtxoTreeUpdate::new()
 		.insert_oor_spent_vtxos([(vtxo.clone(), dummy_txid(0x02))]);
-	let err = db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.unwrap_err();
+	let err = db.write(async |t| t.execute_vtxo_tree_update(update).await).await.unwrap_err();
 	assert!(err.to_alt_string().contains("already spent"), "got: {}", err);
 }
 
@@ -154,12 +154,12 @@ async fn mark_oor_spent() {
 	// First insert as spendable
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert");
 
 	// Then mark as oor spent
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_oor_spent([(vtxo.id(), spending_txid)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("mark oor spent");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("mark oor spent");
 
 	let state = db.read(async |t| t.get_user_vtxo_by_id(vtxo.id()).await).await.expect("vtxo found");
 	assert_eq!(state.oor_spent_txid, Some(spending_txid));
@@ -174,17 +174,17 @@ async fn mark_oor_spent_is_idempotent() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert");
 
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_oor_spent([(vtxo.id(), spending_txid)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("first mark");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("first mark");
 	let before = vtxo_history_state(&db, vtxo.id()).await;
 
 	// Same mark again should succeed
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_oor_spent([(vtxo.id(), spending_txid)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("idempotent mark");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("idempotent mark");
 
 	// Nothing changed, so neither a history record nor a new updated_at
 	assert_eq!(vtxo_history_state(&db, vtxo.id()).await, before);
@@ -198,16 +198,16 @@ async fn mark_oor_spent_double_spend_fails() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert");
 
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_oor_spent([(vtxo.id(), dummy_txid(0x01))]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("first spend");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("first spend");
 
 	// Try to spend with a different txid
 	let err = VtxoTreeUpdate::new()
 		.mark_vtxos_oor_spent([(vtxo.id(), dummy_txid(0x02))]);
-	let err = db.write(async |t| t.execute_vtxo_tree_update(err, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.unwrap_err();
+	let err = db.write(async |t| t.execute_vtxo_tree_update(err).await).await.unwrap_err();
 	assert!(err.to_alt_string().contains("unspendable"), "got: {}", err);
 }
 
@@ -219,7 +219,7 @@ async fn mark_oor_spent_missing_vtxo_fails() {
 
 	let err = VtxoTreeUpdate::new()
 		.mark_vtxos_oor_spent([(vtxo.id(), dummy_txid(0xdd))]);
-	let err = db.write(async |t| t.execute_vtxo_tree_update(err, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.unwrap_err();
+	let err = db.write(async |t| t.execute_vtxo_tree_update(err).await).await.unwrap_err();
 	assert!(err.to_alt_string().contains("unspendable"), "got: {}", err);
 }
 
@@ -234,14 +234,14 @@ async fn insert_and_mark_in_single_update() {
 	// Insert the input as spendable first
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([input_vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert input");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert input");
 
 	// Arkoor-style update: insert output + internal vtxos, mark input spent
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([output_vtxo.clone()])
 		.insert_oor_spent_vtxos([(ServerVtxo::from(VTXO_VECTORS.arkoor2_vtxo.clone()), spending_txid)])
 		.mark_vtxos_oor_spent([(input_vtxo.id(), spending_txid)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("arkoor update");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("arkoor update");
 
 	// Input should be spent
 	let state = db.read(async |t| t.get_user_vtxo_by_id(input_vtxo.id()).await).await.expect("input found");
@@ -260,11 +260,11 @@ async fn mark_round_spent() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert");
 
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_round_spent([(vtxo.id(), round_id)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("mark round spent");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("mark round spent");
 
 	let state = db.read(async |t| t.get_user_vtxo_by_id(vtxo.id()).await).await.expect("vtxo found");
 	assert_eq!(state.spent_in_round, Some(round_id));
@@ -280,15 +280,15 @@ async fn mark_round_spent_double_spend_fails() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert");
 
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_round_spent([(vtxo.id(), round_id_1)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("first spend");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("first spend");
 
 	let err = VtxoTreeUpdate::new()
 		.mark_vtxos_round_spent([(vtxo.id(), round_id_2)]);
-	let err = db.write(async |t| t.execute_vtxo_tree_update(err, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.unwrap_err();
+	let err = db.write(async |t| t.execute_vtxo_tree_update(err).await).await.unwrap_err();
 	assert!(err.to_alt_string().contains("unspendable"), "got: {}", err);
 }
 
@@ -302,11 +302,11 @@ async fn mark_offboard_spent() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert");
 
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_offboard_spent([(vtxo.id(), offboard_txid, forfeit_txid)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("mark offboard spent");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("mark offboard spent");
 
 	let state = db.read(async |t| t.get_user_vtxo_by_id(vtxo.id()).await).await.expect("vtxo found");
 	assert_eq!(state.offboarded_in, Some(offboard_txid));
@@ -321,15 +321,15 @@ async fn mark_offboard_spent_double_spend_fails() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert");
 
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_offboard_spent([(vtxo.id(), dummy_txid(0x01), dummy_txid(0x11))]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("first spend");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("first spend");
 
 	let err = VtxoTreeUpdate::new()
 		.mark_vtxos_offboard_spent([(vtxo.id(), dummy_txid(0x02), dummy_txid(0x22))]);
-	let err = db.write(async |t| t.execute_vtxo_tree_update(err, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.unwrap_err();
+	let err = db.write(async |t| t.execute_vtxo_tree_update(err).await).await.unwrap_err();
 	assert!(err.to_alt_string().contains("unspendable"), "got: {}", err);
 }
 
@@ -343,15 +343,15 @@ async fn round_forfeit_after_round_spend() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert");
 
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_round_spent([(vtxo.id(), round_id)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("round spend");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("round spend");
 
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_round_forfeited([(vtxo.id(), forfeit_txid)]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("round forfeit");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("round forfeit");
 
 	let state = db.read(async |t| t.get_user_vtxo_by_id(vtxo.id()).await).await.expect("vtxo found");
 	assert_eq!(state.spent_in_round, Some(round_id));
@@ -366,11 +366,11 @@ async fn round_forfeit_without_round_spend_fails() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert");
 
 	let err = VtxoTreeUpdate::new()
 		.mark_vtxos_round_forfeited([(vtxo.id(), dummy_txid(0xcd))]);
-	let err = db.write(async |t| t.execute_vtxo_tree_update(err, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.unwrap_err();
+	let err = db.write(async |t| t.execute_vtxo_tree_update(err).await).await.unwrap_err();
 	assert!(
 		err.to_alt_string().contains("vtxo not round-spent or already forfeited differently"),
 		"got: {}", err,
@@ -385,11 +385,11 @@ async fn unclaimed_then_claimed() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_unclaimed_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert unclaimed");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert unclaimed");
 
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_claimed([vtxo.id()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("claim");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("claim");
 }
 
 #[tokio::test]
@@ -400,16 +400,16 @@ async fn claim_is_idempotent() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_unclaimed_vtxos([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert unclaimed");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert unclaimed");
 
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_claimed([vtxo.id()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("first claim");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("first claim");
 
 	// Already claimed — should still succeed
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_claimed([vtxo.id()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("idempotent claim");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("idempotent claim");
 }
 
 #[tokio::test]
@@ -427,11 +427,11 @@ async fn provide_signatures_stores_full_vtxo() {
 		.insert_unspent_bare_vtxos(
 			[ServerVtxo::from(vtxo.clone()).to_bare()], SpendState::Unregistered,
 		);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert bare");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert bare");
 
 	let update = VtxoTreeUpdate::new()
 		.provide_signatures([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("provide signatures");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("provide signatures");
 
 	let state = db.read(async |t| t.get_user_vtxo_by_id(vtxo.id()).await).await.expect("readback");
 	assert!(state.vtxo.has_all_witnesses(), "stored vtxo should be fully signed");
@@ -447,18 +447,18 @@ async fn provide_signatures_is_idempotent() {
 		.insert_unspent_bare_vtxos(
 			[ServerVtxo::from(vtxo.clone()).to_bare()], SpendState::Unregistered,
 		);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert bare");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert bare");
 
 	let update = VtxoTreeUpdate::new()
 		.provide_signatures([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("first provide");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("first provide");
 
 	// Re-applying the same signatures should succeed: a registration can be
 	// applied server-side without the wallet recording it (e.g. it crashed
 	// before marking the vtxo registered), so a later sync re-sends it.
 	let update = VtxoTreeUpdate::new()
 		.provide_signatures([vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("idempotent provide");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("idempotent provide");
 
 	let state = db.read(async |t| t.get_user_vtxo_by_id(vtxo.id()).await).await.expect("readback");
 	assert!(state.vtxo.has_all_witnesses(), "stored vtxo should be fully signed");
@@ -474,12 +474,12 @@ async fn provide_signatures_duplicate_in_batch() {
 		.insert_unspent_bare_vtxos(
 			[ServerVtxo::from(vtxo.clone()).to_bare()], SpendState::Unregistered,
 		);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert bare");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert bare");
 
 	// The same vtxo twice in one batch must not trip the existence check.
 	let update = VtxoTreeUpdate::new()
 		.provide_signatures([vtxo.clone(), vtxo.clone()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await
 		.expect("duplicate in batch should succeed");
 
 	let state = db.read(async |t| t.get_user_vtxo_by_id(vtxo.id()).await).await.expect("readback");
@@ -500,11 +500,11 @@ async fn provide_signatures_unknown_vtxos_fail() {
 		.insert_unspent_bare_vtxos(
 			[ServerVtxo::from(known.clone()).to_bare()], SpendState::Unregistered,
 		);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert bare");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert bare");
 
 	let update = VtxoTreeUpdate::new()
 		.provide_signatures([known.clone(), unknown1.clone(), unknown2.clone()]);
-	let err = db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.unwrap_err();
+	let err = db.write(async |t| t.execute_vtxo_tree_update(update).await).await.unwrap_err();
 	let msg = err.to_alt_string();
 	assert!(msg.contains("cannot provide signatures for unknown vtxo"), "got: {}", msg);
 	assert!(msg.contains(&unknown1.id().to_string()), "got: {}", msg);
@@ -533,18 +533,18 @@ async fn provide_signatures_does_not_resurrect_spent_vtxo() {
 
 	let update = VtxoTreeUpdate::new()
 		.insert_spendable_vtxos([ServerVtxo::from(vtxo.clone())]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("insert");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("insert");
 
 	let update = VtxoTreeUpdate::new()
 		.mark_vtxos_oor_spent([(vtxo.id(), dummy_txid(0xaa))]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("spend");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("spend");
 
 	// Re-registration of a spent vtxo, like a stale wallet re-asserting its
 	// recovery state, overwrites the stored bytes but must keep it spent.
 	let update = VtxoTreeUpdate::new()
 		.provide_signatures([vtxo.clone()])
 		.mark_vtxos_registered([vtxo.id()]);
-	db.write(async |t| t.execute_vtxo_tree_update(update, Some((bitcoin::Network::Regtest, super::super::test_server_mailbox_key()))).await).await.expect("re-register");
+	db.write(async |t| t.execute_vtxo_tree_update(update).await).await.expect("re-register");
 
 	let state = db.read(async |t| {
 		let row = t.query_one(

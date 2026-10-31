@@ -132,16 +132,16 @@ async fn registered_receive_fallback() {
 	let proxy = srv.start_proxy_with_mailbox((), outage.clone()).await;
 	let provider = ctx.bark_sdk("provider", &proxy).cfg(|config| config.daemon_manual_sync = true).create().await;
 	provider.stop_daemon_wait().await.unwrap();
-	let provider_destination = provider.fallback_destination().await.unwrap();
+	let provider_destination = provider.fallback_script();
 	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|config| config.daemon_manual_sync = true).create().await;
 	recipient.stop_daemon_wait().await.unwrap();
 	let address = recipient.new_address().await.unwrap();
-	let destination = recipient.fallback_destination().await.unwrap();
+	let destination = recipient.fallback_script();
 	let recipient_mailbox = recipient.mailbox_keypair().public_key().to_string();
 	assert_ne!(recipient.mailbox_identifier(), provider.mailbox_identifier());
-	assert_ne!(destination.spk, provider_destination.spk);
-	assert_ne!(destination.spk, operator_script);
-	assert_ne!(provider_destination.spk, operator_script);
+	assert_ne!(destination, provider_destination);
+	assert_ne!(destination, operator_script);
+	assert_ne!(provider_destination, operator_script);
 	let seed = bip39::Mnemonic::from_str(tokio::fs::read_to_string(ctx.datadir.join("recipient/mnemonic"))
 		.await.unwrap().trim()).unwrap();
 	let secp = Secp256k1::new();
@@ -151,10 +151,10 @@ async fn registered_receive_fallback() {
 	let expected_fallback_script = Address::p2tr(
 		&secp, fallback_key.x_only_public_key().0, None, Network::Regtest,
 	).script_pubkey();
-	assert_eq!(destination.spk, expected_fallback_script, "the native fallback must use the seed-derived BIP86 destination");
-	assert!(destination.spk.is_p2tr());
-	destination.verify(Network::Regtest, recipient.mailbox_keypair().public_key()).unwrap();
-	provider_destination.verify(Network::Regtest, provider.mailbox_keypair().public_key()).unwrap();
+	assert_eq!(destination, expected_fallback_script, "the native fallback must use the seed-derived BIP86 destination");
+	assert!(destination.is_p2tr());
+
+
 	// B has an independent key and no SDK wallet. Its genuine issuance is
 	// followed by deliberate attribution-evidence corruption.
 	let unknown_identity = Keypair::new(&secp, &mut bitcoin::secp256k1::rand::thread_rng());
@@ -165,14 +165,10 @@ async fn registered_receive_fallback() {
 		.mailbox_joint(bitcoin::Network::Regtest, srv.ark_info().await.mailbox_pubkey, &unknown_identity, &unknown_identity).unwrap()
 		.into_address().unwrap();
 	provider.validate_arkoor_address(&unknown_address).await.unwrap();
-	let registry_before = db.read(async |tx| Ok(tx.query(
-		"SELECT mailbox_pk,mailbox_sig,spk FROM fallback_record ORDER BY mailbox_pk", &[],
-	).await?.into_iter().map(|row| (row.get::<_, String>(0), row.get::<_, String>(1),
-		row.get::<_, String>(2))).collect::<Vec<_>>())).await.unwrap();
-	assert_eq!(registry_before.len(), 4);
-	assert_eq!(registry_before.iter().map(|record| record.0.clone()).collect::<BTreeSet<_>>(),
-		BTreeSet::from([recipient_mailbox.clone(), provider.mailbox_keypair().public_key().to_string(),
-			recipient.recovery_mailbox_identifier().to_string(), provider.recovery_mailbox_identifier().to_string()]));
+	let fresh_keys = [address.policy().user_pubkey().to_string(), unknown_key.to_string()];
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM owner_key WHERE user_pubkey=ANY($1)",
+		&[&fresh_keys.as_slice()]).await?.get::<_,i64>(0))).await.unwrap(), 0,
+		"address creation does not fabricate an admitted owner binding");
 	assert_eq!(recipient.balance().await.unwrap().spendable, sat(0));
 	drop(recipient);
 	// The original recipient is never reopened, synced, delivered to or
@@ -255,11 +251,9 @@ async fn registered_receive_fallback() {
 	// Deliberately lose attribution evidence after genuine signed admission.
 	// This is not a supported restore. No coin, entitlement, attempt, receive
 	// binding, transaction, amount or payout row is changed.
-	assert!(matches!(db.read(async |tx| tx.expiry_owner(unknown_key, Network::Regtest,
-		&srv.mailbox_keypair()).await).await.unwrap(), server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. } if mailbox_pk == unknown_key));
+	assert!(matches!(db.read(async |tx| tx.expiry_owner(unknown_key).await).await.unwrap(), server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. } if mailbox_pk == unknown_key));
 	db.write(async |tx| {
-		tx.execute("DELETE FROM expiry_owner_key WHERE user_pubkey=$1", &[&unknown_key.to_string()]).await?;
-		tx.execute("DELETE FROM fallback_record WHERE mailbox_pk=$1", &[&unknown_key.to_string()]).await?;
+		tx.execute("DELETE FROM owner_key WHERE user_pubkey=$1", &[&unknown_key.to_string()]).await?;
 		Ok(())
 	}).await.unwrap();
 	unknown_source.validate(&shared_funding).unwrap();
@@ -485,9 +479,9 @@ async fn registered_receive_fallback() {
 					let input = recipient_path.get(&point).expect("A must use its authentic signed source path");
 					assert!(!unknown_path.contains_key(&point), "A cannot use B's preserved backing");
 					assert_eq!(input.value, sat(10_000));
-					assert_eq!(payout_parent.output.iter().filter(|output| output.script_pubkey == destination.spk).count(), 1);
+					assert_eq!(payout_parent.output.iter().filter(|output| output.script_pubkey == destination).count(), 1);
 					for output in &payout_parent.output {
-						if output.script_pubkey == destination.spk { assert_eq!(output.value, sat(9_000)); }
+						if output.script_pubkey == destination { assert_eq!(output.value, sat(9_000)); }
 						else { assert!(output.script_pubkey == operator_script || output.is_p2a_fee_anchor()); }
 					}
 					assert_eq!(input.value, payout_parent.output.iter().map(|output| output.value).sum::<Amount>());
@@ -549,7 +543,7 @@ async fn registered_receive_fallback() {
 		}
 	}).await.expect("native expiry path must pay the absent recipient without its forwarding provider");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	let outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination.spk)
+	let outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination)
 		.collect::<Vec<_>>();
 	assert_eq!(outputs.len(), 1);
 	let (vout, output) = outputs[0];
@@ -581,7 +575,7 @@ async fn registered_receive_fallback() {
 	let actual = ctx.bitcoind().sync_client().get_tx_out(&payout.txid, payout.vout, Some(true)).unwrap().unwrap();
 	assert!(actual.confirmations >= 6);
 	assert_eq!(actual.value, expected);
-	assert_eq!(actual.script_pub_key.script().unwrap(), destination.spk);
+	assert_eq!(actual.script_pub_key.script().unwrap(), destination);
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let paid = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_allocation \
@@ -628,11 +622,9 @@ async fn registered_receive_fallback() {
 			&[&unknown_grants],
 		).await?.get::<_, i64>(0))).await.unwrap();
 		assert_eq!(appropriated, 0, "neither B nor its fulfilled grant ancestors may become operator income or another payout");
-		let registry = db.read(async |tx| Ok(tx.query(
-			"SELECT mailbox_pk,mailbox_sig,spk FROM fallback_record ORDER BY mailbox_pk", &[],
-		).await?.into_iter().map(|row| (row.get::<_, String>(0), row.get::<_, String>(1),
-			row.get::<_, String>(2))).collect::<Vec<_>>())).await.unwrap();
-		assert_eq!(registry, registry_before, "no mailbox registration may be fabricated to free this backing");
+		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM owner_key WHERE user_pubkey=$1",
+			&[&unknown_key.to_string()]).await?.get::<_,i64>(0))).await.unwrap(), 0,
+			"unresolved backing must not synthesize mailbox authorization");
 		let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.owner_mailbox,c.user_pubkey,c.spk, \
 			c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active,a.sweep_txid,a.status FROM expiry_allocation_coin c \
 			JOIN expiry_allocation a ON a.id=c.allocation_id \
@@ -644,7 +636,7 @@ async fn registered_receive_fallback() {
 		assert_eq!(row.get::<_, String>("vtxo_id"), source_id);
 		assert_eq!(row.get::<_, String>("owner_mailbox"), recipient_mailbox);
 		assert_eq!(row.get::<_, String>("user_pubkey"), source.policy().user_pubkey().to_string());
-		assert_eq!(row.get::<_, String>("spk"), destination.spk.as_bytes().to_lower_hex_string());
+		assert_eq!(row.get::<_, String>("spk"), destination.as_bytes().to_lower_hex_string());
 		assert_eq!(row.get::<_, i64>("gross_sat"), source.amount().to_sat() as i64);
 		assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
 		assert_eq!(row.get::<_, i64>("payout_sat"), expected.to_sat() as i64);
@@ -666,8 +658,8 @@ async fn registered_receive_fallback() {
 			assert!(info.confirmations.unwrap() >= 6);
 			assert_eq!(ctx.bitcoind().await_transaction(txid).await, recorded);
 			for (index, output) in recorded.output.iter().enumerate() {
-				assert_ne!(output.script_pubkey, provider_destination.spk, "a registered recipient receive is never a provider refund");
-				if output.script_pubkey == destination.spk {
+				assert_ne!(output.script_pubkey, provider_destination, "a registered recipient receive is never a provider refund");
+				if output.script_pubkey == destination {
 					assert!(customer_outputs.insert(OutPoint::new(txid, index as u32), output.value).is_none());
 				}
 			}
@@ -680,7 +672,7 @@ async fn registered_receive_fallback() {
 	// seed and genesis birthday, never its unseen VTXO or payout transaction.
 	let restored = ctx.bark("recipient-seed-only", &srv).mnemonic(seed).create().await;
 	let client = restored.client().await;
-	assert_eq!(client.fallback_destination().await.unwrap(), destination);
+	assert_eq!(client.fallback_script(), destination);
 	client.sync_fallback_payouts().await.unwrap();
 	assert_eq!(client.verify_fallback_output(payout).await.unwrap(), expected);
 	let history = client.history().await.unwrap();
@@ -807,8 +799,8 @@ async fn registered_receive_fallback() {
 		for tx in block.txdata {
 			let txid = tx.compute_txid();
 			for (vout, output) in tx.output.iter().enumerate() {
-				assert_ne!(output.script_pubkey, provider_destination.spk, "no canonical provider refund may hide outside the selected allocations");
-				if output.script_pubkey == destination.spk {
+				assert_ne!(output.script_pubkey, provider_destination, "no canonical provider refund may hide outside the selected allocations");
+				if output.script_pubkey == destination {
 					assert!(canonical_payouts.insert(OutPoint::new(txid, vout as u32), output.value).is_none());
 				}
 			}
@@ -870,7 +862,7 @@ async fn registered_receive_fallback() {
 				}
 				for (vout, output) in tx.output.iter().enumerate() {
 					if output.is_p2a_fee_anchor() { assert_eq!(output.value, Amount::ZERO); continue; }
-					if output.script_pubkey == destination.spk {
+					if output.script_pubkey == destination {
 						assert_eq!(OutPoint::new(txid, vout as u32), payout);
 						assert_eq!(output.value, expected);
 					} else {
@@ -958,8 +950,8 @@ async fn registered_receive_fallback() {
 	// remain the precondition. This is B's raw-key MANUAL exit, not automatic
 	// unregistered fallback or seed recovery; the provider stays absent.
 	let owner_script = Address::p2tr(&secp, unknown_identity.x_only_public_key().0, None, Network::Regtest).script_pubkey();
-	assert_ne!(owner_script, destination.spk);
-	assert_ne!(owner_script, provider_destination.spk);
+	assert_ne!(owner_script, destination);
+	assert_ne!(owner_script, provider_destination);
 	assert_ne!(owner_script, operator_script);
 	let whole_cut = || {
 		let mut cut = initial_roots.clone();
@@ -970,8 +962,8 @@ async fn registered_receive_fallback() {
 			let block = core.get_block(&core.get_block_hash(height).unwrap()).unwrap();
 			for tx in block.txdata {
 				for (vout, output) in tx.output.iter().enumerate() {
-					assert_ne!(output.script_pubkey, provider_destination.spk);
-					if output.script_pubkey == destination.spk {
+					assert_ne!(output.script_pubkey, provider_destination);
+					if output.script_pubkey == destination {
 						assert_eq!(OutPoint::new(tx.compute_txid(), vout as u32), payout);
 						assert_eq!(output.value, expected);
 					}

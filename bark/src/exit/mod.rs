@@ -216,6 +216,9 @@ impl ExitInner {
 		if vtxos.is_empty() {
 			return Ok(());
 		}
+		let claims = self.persister.get_fallback_receipts().await?;
+		ensure!(!vtxos.iter().any(|coin| claims.iter().any(|claim| claim.affects(coin.borrow().id()))),
+			"a committed fallback source cannot be exited");
 		let tip = self.chain_source.tip().await?;
 		let params = Params::new(self.chain_source.network());
 		for vtxo in vtxos {
@@ -796,7 +799,14 @@ impl Exit {
 		ev: &ExitVtxo,
 		state_changed: bool,
 	) {
-		if ev.state().warrants_exited_vtxo() {
+		let paid_fallback = match wallet.inner.db.get_fallback_receipts().await {
+			Ok(receipts) => receipts.iter().any(|receipt| receipt.affects(ev.id()) && receipt.retired_block.is_some()),
+			Err(error) => {
+				error!("Could not check fallback retirement for exit {}: {error:#}", ev.id());
+				return;
+			},
+		};
+		if ev.state().warrants_exited_vtxo() && !paid_fallback {
 			if let Err(e) = wallet.mark_vtxos_as_exited([ev.id()]).await {
 				error!("Failed to mark VTXO {} as Exited: {:#}", ev.id(), e);
 			}
@@ -1150,6 +1160,11 @@ impl Exit {
 					// Never exited: the wallet state still records a VTXO consumed outside
 					// the exit flow (e.g. forfeited in a round, or recovered as exited).
 					None => {
+						let claims = guard.persister.get_fallback_receipts().await
+							.map_err(|error| ExitError::InvalidWalletState { error: error.to_string() })?;
+						if claims.iter().any(|r| r.affects(vtxo_id)) {
+							return Err(ExitError::InvalidWalletState { error: "a committed fallback source cannot be exited".into() });
+						}
 						let state = guard.persister.get_wallet_vtxo(vtxo_id).await
 							.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?
 							.ok_or(ExitError::UnknownVtxo { vtxo: vtxo_id })?

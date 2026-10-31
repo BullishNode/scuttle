@@ -235,9 +235,11 @@ impl Wallet {
 		// read. The scan ends when the server has no more messages.
 		let mut checkpoint = 0u64;
 		let mut iteration = 0usize;
+		let mut fallback_cursor = None;
 		loop {
 			iteration += 1;
 			let req = protos::mailbox_server::MailboxRequest {
+				fallback_cursor: fallback_cursor.clone(),
 				mailbox_id: mailbox_id.serialize(),
 				authorization: Some(auth.serialize()),
 				checkpoint,
@@ -247,6 +249,8 @@ impl Wallet {
 
 			debug!("Mailbox returned {} messages on recovery iteration {iteration}",
 				resp.messages.len());
+			let prev_fallback_cursor = fallback_cursor.clone();
+			fallback_cursor = self.process_mailbox_fallback_claims(&resp, fallback_cursor.as_deref()).await?;
 
 			let prev_checkpoint = checkpoint;
 			let mut candidates = Vec::new();
@@ -289,14 +293,14 @@ impl Wallet {
 			// One batch per page bounds the memory to what the server sends at once.
 			self.recover_candidates(report, candidates, gap_limit).await?;
 
-			if !resp.have_more {
+			if !resp.have_more && !resp.have_more_fallback_claims {
 				break;
 			}
 
 			// The server wants us to keep paging, but the checkpoint didn't
 			// advance, so the next request would be identical and we'd loop
 			// forever. Stop rather than spin on the same page.
-			if checkpoint == prev_checkpoint {
+			if checkpoint == prev_checkpoint && fallback_cursor == prev_fallback_cursor {
 				warn!("Mailbox recovery iteration {iteration} made no progress \
 					at checkpoint {checkpoint}; stopping");
 				break;
@@ -515,7 +519,7 @@ impl Wallet {
 			match adoption {
 				Ok(ServerStatusAdoption::Spendable) => spendable.push(vtxo),
 				Ok(ServerStatusAdoption::Spent) => spent.push(vtxo),
-				Ok(ServerStatusAdoption::FallbackPending) => fallback_pending.push(vtxo),
+				Ok(ServerStatusAdoption::FallbackPending | ServerStatusAdoption::Forfeited) => fallback_pending.push(vtxo),
 				Ok(ServerStatusAdoption::InFlight(VtxoSpendState::Unclaimed))
 					if vtxo.unlock_hash().is_some() => unclaimed.push(vtxo),
 				// Finishing the flow the VTXO is stuck in is what decides where it
@@ -612,19 +616,6 @@ impl Wallet {
 		if !locked.is_empty() {
 			warn!("Could not get the status of {} recovery vtxos, keeping them locked until \
 				it is known", locked.len());
-			let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
-			let mut snapshot = self.inner.db.get_fallback_snapshot().await?;
-			for vtxo in &locked {
-				// Missing status cannot erase a previously validated owned source
-				// or count it again beside its real signed change. New unanswered
-				// history remains locked and acquires no positive principal.
-				if !snapshot.adopted_payout_vtxos.contains(&vtxo.id())
-					&& self.inner.db.get_wallet_vtxo(vtxo.id()).await?
-						.is_some_and(|stored| stored.state == VtxoState::Spendable) {
-					snapshot.awaiting_settlement.insert(vtxo.id());
-				}
-			}
-			self.inner.db.store_fallback_snapshot(&snapshot).await?;
 			self.store_vtxos(locked.iter(), &VtxoState::Locked { holder: None }).await?;
 			for vtxo in &locked {
 				report.push_failed(vtxo.id(), Some(vtxo.amount()));
@@ -718,12 +709,17 @@ impl Wallet {
 				}
 				max_index = max_index.max(Some(index));
 
-				let adoption = VtxoSpendState::try_from(entry.spend_state)
-					.map_err(|_| anyhow::anyhow!(
-						"server returned unknown spend state {}; this wallet may need updating",
-						entry.spend_state,
-					))
-					.and_then(ServerStatusAdoption::from_spend_state);
+				if bitcoin::secp256k1::PublicKey::from_slice(&entry.owner_mailbox).ok()
+					!= Some(self.mailbox_keypair().public_key()) {
+					warn!("Recovery coin {} belongs to another or unknown mailbox", vtxo.id());
+					report.push_foreign(&vtxo);
+					continue;
+				}
+				let adoption = match VtxoSpendState::try_from(entry.spend_state) {
+					Ok(state) => self.observe_server_vtxo_status(vtxo.id(), &entry.owner_mailbox, state, entry.fallback_claim).await
+						.and_then(ServerStatusAdoption::from_spend_state),
+					Err(_) => Err(anyhow::anyhow!("server returned an unknown spend state")),
+				};
 				vtxos.push((vtxo, adoption));
 			}
 

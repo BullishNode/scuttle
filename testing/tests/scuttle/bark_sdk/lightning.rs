@@ -11,7 +11,7 @@ use ark::ProtocolEncoding;
 use bitcoin_ext::{BlockDelta, TxOutExt};
 use ark_testing::{TestContext, btc, util::{FutureExt, poll_interval}};
 use ark_testing::balance::assert_balance_consistent;
-use ark_testing::onchain::AppBip84Wallet;
+use ark_testing::onchain::AppBip86Wallet;
 
 use bark::actions::lightning::pay::LightningSendState;
 use bark::actions::lightning::receive::LightningReceiveState;

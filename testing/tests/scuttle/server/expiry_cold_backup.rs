@@ -98,9 +98,9 @@ async fn cold_backup() {
 	assert!(!change.is_empty());
 	assert!(change.keys().all(|point| point.txid == root.txid && *point != root));
 	assert_eq!(change.values().copied().sum::<Amount>() + sat(100_000) + upfront_fee, sat(200_000));
-	let registration = client.fallback_destination().await.unwrap();
+	let registration = client.fallback_script();
 	let mailbox = client.mailbox_identifier().as_pubkey();
-	registration.verify(Network::Regtest, mailbox).unwrap();
+
 	let secp = Secp256k1::new();
 	let master = Xpriv::new_master(Network::Regtest, &seed.to_seed("")).unwrap();
 	let path = DerivationPath::from_str("m/86'/1'/0'/0/0").unwrap();
@@ -108,8 +108,8 @@ async fn cold_backup() {
 	let expected_fallback_script = Address::p2tr(
 		&secp, fallback_key.x_only_public_key().0, None, Network::Regtest,
 	).script_pubkey();
-	assert_eq!(registration.spk, expected_fallback_script, "the native fallback must use the seed-derived BIP86 destination");
-	assert!(registration.spk.is_p2tr());
+	assert_eq!(registration, expected_fallback_script, "the native fallback must use the seed-derived BIP86 destination");
+	assert!(registration.is_p2tr());
 	let owner_key = client.get_vtxo_key(&coin).await.unwrap().public_key();
 	drop(client);
 	drop(wallet); // No original owner handle or wallet command is used again.
@@ -139,7 +139,14 @@ async fn cold_backup() {
 	original.stop().await.unwrap();
 	// Capture the final committed changesets after both product processes stop.
 	let db = Db::connect(&server_config.postgres, bitcoin::Network::Regtest).await.unwrap();
-	assert_eq!(db.read(async |tx| tx.get_fallback(mailbox).await).await.unwrap(), Some(registration.clone()));
+	assert_eq!(db.read(async |tx| tx.expiry_owner(owner_key).await).await.unwrap(),
+		server::database::expiry_attribution::Attribution::Owned { mailbox_pk: mailbox, spk: registration.clone() });
+	let ownership_before = db.read(async |tx| {
+		let row = tx.query_one("SELECT
+			(SELECT COALESCE(jsonb_agg(to_jsonb(k) ORDER BY user_pubkey),'[]')::TEXT FROM owner_key k),
+			(SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY vtxo_id),'[]')::TEXT FROM coin_owner c)", &[]).await?;
+		Ok((row.get::<_,String>(0),row.get::<_,String>(1)))
+	}).await.unwrap();
 	let changesets = db.read(async |tx| Ok(tx.query("SELECT id,content FROM wallet_changeset WHERE kind='watchman' ORDER BY id", &[])
 		.await?.into_iter().map(|row| (row.get::<_, i64>(0), row.get::<_, Vec<u8>>(1))).collect::<Vec<_>>())).await.unwrap();
 	assert!(!changesets.is_empty());
@@ -182,7 +189,14 @@ async fn cold_backup() {
 	let restored_changesets = db.read(async |tx| Ok(tx.query("SELECT id,content FROM wallet_changeset WHERE kind='watchman' ORDER BY id", &[])
 		.await?.into_iter().map(|row| (row.get::<_, i64>(0), row.get::<_, Vec<u8>>(1))).collect::<Vec<_>>())).await.unwrap();
 	assert_eq!(restored_changesets, changesets, "physical restore must retain the actual watch-wallet journal");
-	assert_eq!(db.read(async |tx| tx.get_fallback(mailbox).await).await.unwrap(), Some(registration.clone()));
+	assert_eq!(db.read(async |tx| {
+		let row = tx.query_one("SELECT
+			(SELECT COALESCE(jsonb_agg(to_jsonb(k) ORDER BY user_pubkey),'[]')::TEXT FROM owner_key k),
+			(SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY vtxo_id),'[]')::TEXT FROM coin_owner c)", &[]).await?;
+		Ok((row.get::<_,String>(0),row.get::<_,String>(1)))
+	}).await.unwrap(), ownership_before, "cold restore preserves complete ownership and first proofs");
+	assert_eq!(db.read(async |tx| tx.expiry_owner(owner_key).await).await.unwrap(),
+		server::database::expiry_attribution::Attribution::Owned { mailbox_pk: mailbox, spk: registration.clone() });
 	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement", &[]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 	server_config.postgres = config.clone();
 	server_config.data_dir = restored_root.join("server");
@@ -195,7 +209,8 @@ async fn cold_backup() {
 	restored.attach_watchmand(watchman);
 	ctx.register_test_captaind(restored.clone());
 	assert_eq!(restored.ark_info().await.server_pubkey, public_key);
-	assert_eq!(db.read(async |tx| tx.get_fallback(mailbox).await).await.unwrap(), Some(registration.clone()));
+	assert_eq!(db.read(async |tx| tx.expiry_owner(owner_key).await).await.unwrap(),
+		server::database::expiry_attribution::Attribution::Owned { mailbox_pk: mailbox, spk: registration.clone() });
 	wait_watchman_coins(restored.watchmand(), &BTreeSet::from([sponsor])).await;
 
 	let height = ctx.bitcoind().get_block_count().await as u32;
@@ -222,12 +237,12 @@ async fn cold_backup() {
 	assert_eq!(parent.version.0, 3);
 	assert!(parent.vsize() <= 10_000);
 	assert_eq!(actual_fee(&ctx, &parent).await, Amount::ZERO);
-	let customer_outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == registration.spk).collect::<Vec<_>>();
+	let customer_outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == registration).collect::<Vec<_>>();
 	assert_eq!(customer_outputs.len(), 1);
 	assert_eq!(customer_outputs[0].1.value, sat(99_000));
 	let payout = OutPoint::new(parent.compute_txid(), customer_outputs[0].0 as u32);
-	assert_eq!(parent.output.iter().filter(|output| output.script_pubkey != registration.spk).map(|output| output.value).sum::<Amount>(), sat(1_000));
-	for output in parent.output.iter().filter(|output| output.script_pubkey != registration.spk) {
+	assert_eq!(parent.output.iter().filter(|output| output.script_pubkey != registration).map(|output| output.value).sum::<Amount>(), sat(1_000));
+	for output in parent.output.iter().filter(|output| output.script_pubkey != registration) {
 		assert!(output.is_p2a_fee_anchor() || output.script_pubkey == operator_script);
 	}
 	let anchors = parent.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor())
@@ -243,7 +258,7 @@ async fn cold_backup() {
 	let package_fee = actual_fee(&ctx, &child).await;
 	assert!(package_fee > Amount::ZERO);
 	let graph = BTreeMap::from([(parent.compute_txid(), parent.clone()), (child.compute_txid(), child.clone())]);
-	assert_eq!(graph.values().flat_map(|tx| tx.output.iter()).filter(|output| output.script_pubkey == registration.spk).count(), 1);
+	assert_eq!(graph.values().flat_map(|tx| tx.output.iter()).filter(|output| output.script_pubkey == registration).count(), 1);
 	let mut spent = BTreeSet::new();
 	let mut external = BTreeSet::new();
 	for tx in graph.values() {
@@ -290,7 +305,7 @@ async fn cold_backup() {
 	assert_eq!(row.get::<_, String>("disposition"), "customer");
 	assert_eq!(row.get::<_, String>("owner_mailbox"), mailbox.to_string());
 	assert_eq!(row.get::<_, String>("user_pubkey"), owner_key.to_string());
-	assert_eq!(row.get::<_, String>("spk"), registration.spk.as_bytes().to_lower_hex_string());
+	assert_eq!(row.get::<_, String>("spk"), registration.as_bytes().to_lower_hex_string());
 	for field in ["gross_sat", "entitlement_gross_sat"] { assert_eq!(row.get::<_, i64>(field), 100_000); }
 	assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
 	assert_eq!(row.get::<_, i64>("payout_sat"), 99_000);
@@ -305,7 +320,7 @@ async fn cold_backup() {
 	let payees = db.read(async |tx| Ok(tx.query("SELECT output_index,spk,amount_sat FROM expiry_allocation_payout WHERE allocation_id=$1", &[&allocation]).await?)).await.unwrap();
 	assert_eq!(payees.len(), 1);
 	assert_eq!(payees[0].get::<_, i32>(0), i32::try_from(payout.vout).unwrap());
-	assert_eq!(payees[0].get::<_, String>(1), registration.spk.as_bytes().to_lower_hex_string());
+	assert_eq!(payees[0].get::<_, String>(1), registration.as_bytes().to_lower_hex_string());
 	assert_eq!(payees[0].get::<_, i64>(2), 99_000);
 	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_split_request", &[]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 	assert_eq!(db.read(async |tx| tx.get_user_vtxo_by_id(coin.id()).await).await.unwrap().spend_state, SpendState::Spent);
@@ -317,9 +332,9 @@ async fn cold_backup() {
 		.cfg(|config| config.daemon_manual_sync = true).create()).await;
 	let client = Box::pin(recovered.client()).await;
 	assert_eq!(client.mailbox_identifier().as_pubkey(), mailbox);
-	let rebound = client.fallback_destination().await.unwrap();
-	rebound.verify(Network::Regtest, mailbox).unwrap();
-	assert!(rebound.same_binding(&registration));
+	let rebound = client.fallback_script();
+
+	assert_eq!(rebound, registration);
 	drop(client);
 	let recovered_inputs = recovered.onchain_utxos().await.into_iter().map(|utxo| (utxo.outpoint, utxo.amount)).collect::<BTreeMap<_, _>>();
 	let mut expected_inputs = change.clone();
