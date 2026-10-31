@@ -13,6 +13,11 @@
   `captaind rpc expiry-holds`. Holds remain alarmed and counted until an actual
   decision clears them; listing cannot change a payment or release held funds.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Confine invalid expiry ownership to its own terminal and preserve unrelated
+  ready outputs when signed split preparation is unavailable. Database and
+  allocation failures still propagate. Operator-only sweeps continue without a
+  customer payout view, and watchmand refuses Bitcoin nodes without txindex.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
 - Derive fallback payouts from admitted joint coin/mailbox bindings and the
   existing stage-entitlement rules. Authenticated mailbox receipts also discover
   provisional input-owner and unmaterialized recipient claims.

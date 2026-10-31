@@ -3050,7 +3050,16 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 }
 
 pub(super) async fn watchman_sweeps_offboard_forfeit_after_confiscation() {
-	let ctx = TestContext::new("server/watchman_sweeps_offboard_forfeit_after_confiscation").await;
+	sweep_offboard_forfeit(false).await;
+}
+
+pub(super) async fn operator_sweeps_run_while_captaind_is_down() {
+	sweep_offboard_forfeit(true).await;
+}
+
+async fn sweep_offboard_forfeit(captaind_down: bool) {
+	let ctx = TestContext::new(if captaind_down { "server/operator_sweeps_run_while_captaind_is_down" }
+		else { "server/watchman_sweeps_offboard_forfeit_after_confiscation" }).await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).funded(btc(10)).cfg(|cfg| {
 		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.vtxopool.vtxo_targets = vec![];
@@ -3138,7 +3147,19 @@ pub(super) async fn watchman_sweeps_offboard_forfeit_after_confiscation() {
 		"the watchman should have confiscated the exit output",
 	);
 
-	// Keep the original maturity stimulus; the final view and publication share the original clock.
+	// Keep the original maturity stimulus. The outage case leaves captaind
+	// down while the same watchmand store, database and Core remain available.
+	let stopped_rounds_balance = if captaind_down {
+		let balance = srv.wallet_status().await.rounds.total_balance;
+		srv.stop().await.unwrap();
+		// A real watchmand restart invalidates its old completed view. With
+		// captaind still down, no fresh paired acknowledgement can exist.
+		wm.stop().await.unwrap();
+		wm.start().await.unwrap();
+		wm.add_slog_handler(failures.clone());
+		log_claim = wm.subscribe_log::<ClaimBroadcast>();
+		Some(balance)
+	} else { None };
 	let tip = ctx.generate_blocks(200).await;
 	let operator_script = wm.config().sweep_address.clone().unwrap().require_network(Network::Regtest).unwrap().script_pubkey();
 	assert_ne!(operator_script, destination);
@@ -3151,17 +3172,22 @@ pub(super) async fn watchman_sweeps_offboard_forfeit_after_confiscation() {
 		inputs.checked_sub(tx.output.iter().map(|output| output.value).sum::<Amount>()).unwrap()
 	};
 	let (claim, msg, rounds_balance) = tokio::time::timeout(Duration::from_secs(15), async {
-		srv.wait_for_sync_height(tip).await;
+		if !captaind_down { srv.wait_for_sync_height(tip).await; }
 		wm.wait_for_sync_height(tip).await;
 		assert_eq!(client.get_block_count().unwrap(), u64::from(tip.to_u32()));
 		let hash = client.get_block_hash(u64::from(tip.to_u32())).unwrap();
-		loop {
-			if db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip
-					&& view.captaind.hash == hash && view.watchmand.hash == hash && tx.expiry_view_is_rebuilt(view).await?)
-			}).await.unwrap() { break; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
+		if captaind_down {
+			assert!(db.read(async |tx| tx.expiry_rebuild_token().await).await.unwrap().is_none(),
+				"stopped captaind must leave the customer view unavailable");
+		} else {
+			loop {
+				if db.read(async |tx| {
+					let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
+					Ok(view.captaind.height == tip && view.watchmand.height == tip
+						&& view.captaind.hash == hash && view.watchmand.hash == hash && tx.expiry_view_is_rebuilt(view).await?)
+				}).await.unwrap() { break; }
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
 		}
 		// The forfeit is Bare: its exclusive server key needs no invented Full path or customer allocation.
 		let stored = db.read(async |tx| tx.get_bare_vtxo_by_id(forfeit_id).await).await.unwrap();
@@ -3177,7 +3203,10 @@ pub(super) async fn watchman_sweeps_offboard_forfeit_after_confiscation() {
 		assert!(actual.confirmations >= 6);
 		assert_eq!(actual.value, stored.vtxo.amount());
 		assert_eq!(actual.script_pub_key.script().unwrap(), stored.vtxo.output_script_pubkey());
-		let rounds_balance = srv.wallet_status().await.rounds.total_balance;
+		let rounds_balance = match stopped_rounds_balance {
+			Some(balance) => balance,
+			None => srv.wallet_status().await.rounds.total_balance,
+		};
 		wm.trigger_sweep().await;
 		let msg = log_claim.recv().await.expect("native confiscation claim log");
 		assert_eq!(msg.vtxo_ids, vec![forfeit_id]);
@@ -3195,6 +3224,7 @@ pub(super) async fn watchman_sweeps_offboard_forfeit_after_confiscation() {
 		(claim, msg, rounds_balance)
 	}).await.expect("native operator claim must be visible within the original fifteen seconds");
 	let tip = ctx.generate_blocks(6).await;
+	if captaind_down { srv.start().await.unwrap(); }
 	srv.wait_for_sync_height(tip).await;
 	wm.wait_for_sync_height(tip).await;
 	assert_canonical_watchman_tx(&ctx, &claim);

@@ -402,10 +402,6 @@ impl Watchman {
 	/// Sweeps have no deadline, so this runs on the much longer
 	/// [Config::sweep_interval].
 	pub async fn process_sweeps(&self) -> anyhow::Result<()> {
-		// Expired customer backing never reaches upstream's drain-only claim
-		// builder. Only committed financial groups can authorize these spends.
-		let Some(view) = self.rebuild_expiry_state().await? else { return Ok(()); };
-		self.process_expiry_payouts(view).await?;
 		// Confiscated OffboardForfeit outputs are exclusively server-owned.
 		// Their Bare encoding needs no customer genesis or payout allocation.
 		// Use the original native claim: its miner fee comes from operator
@@ -436,6 +432,19 @@ impl Watchman {
 			}
 		}
 		if !claims.is_empty() { self.process_claims(claims).await?; }
+		// Exclusive operator claims do not depend on a live customer payout
+		// view. Missing/failed reconstruction holds only that financial branch.
+		let view = match self.rebuild_expiry_state().await {
+			Ok(Some(view)) => view,
+			Ok(None) => return Ok(()),
+			Err(error) => {
+				warn!(error = %format!("{error:#}"), "Expiry reconstruction failed; retrying once after operator claims");
+				let Some(view) = self.rebuild_expiry_state().await? else { return Ok(()); };
+				view
+			},
+		};
+		// Expired customer backing never reaches upstream's drain-only builder.
+		self.process_expiry_payouts(view).await?;
 		let splits = self.db.read(async |t| t.pending_expiry_splits().await).await?;
 		for (txid, root) in splits {
 			view.verify(&self.bitcoind).await?;
