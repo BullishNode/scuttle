@@ -1333,7 +1333,6 @@ async fn persist_round(
 					trace!("Posted round VTXO {} to mailbox", vtxo.id());
 				}
 				Err(e) => {
-					if e.is::<crate::error::OwnershipRefusal>() { return Err(e); }
 					// Log but don't fail the round - mailbox delivery is best-effort
 					warn!("Failed to post round VTXO {} to mailbox: {:#}", vtxo.id(), e);
 				}
@@ -1350,7 +1349,10 @@ async fn persist_round(
 	telemetry::set_round_step_duration(round_step);
 
 	if let Err(e) = result {
-		if e.is::<crate::error::OwnershipRefusal>() {
+		// Nothing was stored and the funding tx is not signed yet, so the
+		// round can be abandoned. An expiry decision can take an input while
+		// we collect signatures, just like an onchain exit can.
+		if e.is::<crate::error::OwnershipRefusal>() || e.is::<crate::error::FallbackRefusal>() {
 			return Err(RoundError::Recoverable(e));
 		}
 		// An input can exit onchain while we collect signatures. A rejected
