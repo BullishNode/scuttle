@@ -228,7 +228,7 @@ async fn tiny_group() {
 		let output_amount = if index < 3 { 500 } else { 97_500 };
 		assert_eq!(ledger.get::<_, i64>("amount_sat"), output_amount);
 		assert_eq!(parent.output[output_index as usize].value, sat(output_amount as u64));
-		assert_eq!(parent.output[output_index as usize].script_pubkey, binding);
+		assert_eq!(&parent.output[output_index as usize].script_pubkey, binding);
 		if index < 3 {
 			let group = (row.get::<_, i64>("id"), OutPoint::new(txid, output_index));
 			if let Some(previous) = tiny_group { assert_eq!(previous, group); }

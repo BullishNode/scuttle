@@ -10,7 +10,7 @@ use ark::attestations::RoundParticipationStatusAttestation;
 use ark::lightning::{PaymentHash, Preimage};
 use ark::fallback::OwnerLink;
 use ark::mailbox::MailboxIdentifier;
-use ark::{ProtocolEncoding, VtxoPolicy};
+use ark::{ProtocolEncoding, VtxoPolicy, SECP};
 use ark::test_util::VTXO_VECTORS;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Keypair, PublicKey};

@@ -333,7 +333,7 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 	assert_eq!(expected_sources.len(), 4);
 	let operator_script = wm.config().sweep_address.clone().unwrap()
 		.require_network(Network::Regtest).unwrap().script_pubkey();
-	assert!(destinations.iter().all(|destination| destination != operator_script));
+	assert!(destinations.iter().all(|destination| destination != &operator_script));
 	let scan_from = u64::from(originals.iter().map(|coin| coin.expiry_height().to_u32()).min().unwrap());
 	let tip = ctx.generate_blocks(150).await;
 	assert!(originals.iter().chain(replacements.iter()).all(|coin| coin.expiry_height() < tip));
@@ -415,7 +415,7 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 			if output.is_p2a_fee_anchor() {
 				assert_eq!(output.value, Amount::ZERO);
 				anchors.push(point);
-			} else if let Some(owner) = destinations.iter().position(|destination| destination == output.script_pubkey) {
+			} else if let Some(owner) = destinations.iter().position(|destination| destination == &output.script_pubkey) {
 				assert_eq!(output.value, sat(198_000));
 				assert!(payouts.insert(owner, (point, output.value, *allocation)).is_none());
 				assert!(actual_payouts.insert(index as i32, output.clone()).is_none());
@@ -551,7 +551,7 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 		let hash = core.get_block_hash(height).unwrap();
 		for tx in core.get_block(&hash).unwrap().txdata {
 			for (index, output) in tx.output.iter().enumerate() {
-				if destinations.iter().any(|destination| destination == output.script_pubkey) {
+				if destinations.iter().any(|destination| destination == &output.script_pubkey) {
 					observed.insert(OutPoint::new(tx.compute_txid(), index as u32), output.value);
 				}
 			}
@@ -1509,7 +1509,7 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 	}
 	let operator_script = wm.config().sweep_address.clone().unwrap()
 		.require_network(Network::Regtest).unwrap().script_pubkey();
-	assert!(destinations.iter().all(|destination| destination != operator_script));
+	assert!(destinations.iter().all(|destination| destination != &operator_script));
 	let scan_from = u64::from(boards.iter().map(|coin| coin.expiry_height().to_u32())
 		.chain(std::iter::once(initial_pool[0].expiry_height().to_u32())).min().unwrap());
 	let tip = ctx.generate_blocks(150).await;
@@ -1614,7 +1614,7 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 			assert!(operators.insert(coin.id().to_string(), coin.inner().clone()).is_none());
 		}
 		for (owner, destination) in destinations.iter().enumerate() {
-			assert_eq!(*destination, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailboxes[owner].as_pubkey().x_only_public_key().0, None));
+			assert_eq!(*destination, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailboxes[owner].x_only_public_key().0, None));
 			assert!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM owner_key WHERE mailbox_pk=$1",
 				&[&mailboxes[owner].to_string()]).await?.get::<_,i64>(0))).await.unwrap() > 0);
 		}
@@ -1723,7 +1723,7 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 			if output.is_p2a_fee_anchor() {
 				assert_eq!(output.value, Amount::ZERO);
 				anchors.push(point);
-			} else if let Some(owner) = destinations.iter().position(|destination| destination == output.script_pubkey) {
+			} else if let Some(owner) = destinations.iter().position(|destination| destination == &output.script_pubkey) {
 				assert!(output.value > Amount::ZERO);
 				assert!(owners.insert(owner), "one actual output per customer script in each parent");
 				assert!(payouts.insert(point, (output.value, owner, *allocation)).is_none());
@@ -1887,7 +1887,7 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 	for height in scan_from..=ctx.bitcoind().get_block_count().await {
 		for tx in core.get_block(&core.get_block_hash(height).unwrap()).unwrap().txdata {
 			for (index, output) in tx.output.iter().enumerate() {
-				if destinations.iter().any(|destination| destination == output.script_pubkey) {
+				if destinations.iter().any(|destination| destination == &output.script_pubkey) {
 					observed.insert(OutPoint::new(tx.compute_txid(), index as u32), output.value);
 				}
 			}
@@ -2023,7 +2023,7 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 	let backing_anchors = originals.iter().chain(replacements.iter()).map(|coin| coin.chain_anchor().to_string())
 		.collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
 	let operator_script = wm.config().sweep_address.clone().unwrap().require_network(Network::Regtest).unwrap().script_pubkey();
-	assert!(destinations.iter().all(|destination| destination != operator_script));
+	assert!(destinations.iter().all(|destination| destination != &operator_script));
 	let tip = ctx.generate_blocks(150).await;
 	let (packages, roots, expected) = tokio::time::timeout(Duration::from_secs(15), async {
 		// Attribution, completed view and all funded publication share the original clock.
@@ -2302,7 +2302,7 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 				if native_fee_child { assert!(fee > Amount::ZERO); }
 			}
 			for (index, output) in tx.output.iter().enumerate().filter(|(_, output)|
-				destinations.iter().any(|destination| destination == output.script_pubkey) || output.script_pubkey == claim_address.script_pubkey()) {
+				destinations.iter().any(|destination| destination == &output.script_pubkey) || output.script_pubkey == claim_address.script_pubkey()) {
 				// Upstream CPFP can return wallet change to this unused claim
 				// address. It spends a known exit anchor, not another Ark claim.
 				if native_fee_child && output.script_pubkey == claim_address.script_pubkey() { continue; }
@@ -2320,7 +2320,7 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 	assert!(claim_fee > Amount::ZERO);
 	assert_eq!(claim.output[0].value + claim_fee, sat(200_000));
 	assert_canonical_watchman_tx(&ctx, claim);
-	let mut wanted = terminal_outputs.iter().filter(|(_, output)| destinations.iter().any(|destination| destination == output.script_pubkey))
+	let mut wanted = terminal_outputs.iter().filter(|(_, output)| destinations.iter().any(|destination| destination == &output.script_pubkey))
 		.map(|(point, output)| (*point, output.clone())).collect::<BTreeMap<_, _>>();
 	assert_eq!(wanted.len(), 8);
 	assert_eq!(wanted.values().map(|output| output.value).sum::<Amount>(), sat(1_584_000));
@@ -2439,7 +2439,7 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 		assert_eq!(total, sat(if owner == 0 { 250_000 } else { 350_000 }));
 	}
 	assert_ne!(destinations[0], destinations[1]);
-	assert!(destinations.iter().all(|destination| destination != operator_script));
+	assert!(destinations.iter().all(|destination| destination != &operator_script));
 	let incoming = db.read(async |tx| Ok(tx.query("SELECT l.vtxo_id,h.direction::TEXT,h.offchain_resolution::TEXT \
 		FROM lightning_payment_attempt a \
 		JOIN lightning_payment_attempt_htlc_vtxo l ON l.lightning_payment_attempt_id=a.id \
@@ -2670,7 +2670,7 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 	for height in first as u64..=u64::from(final_tip.to_u32()) {
 		let block = core.get_block(&core.get_block_hash(height).unwrap()).unwrap();
 		for tx in block.txdata.into_iter().filter(|tx| !tx.is_coinbase()) {
-			assert!(tx.output.iter().all(|output| destinations.iter().all(|destination| destination != output.script_pubkey)),
+			assert!(tx.output.iter().all(|output| destinations.iter().all(|destination| destination != &output.script_pubkey)),
 				"neither customer exit may also receive a canonical fallback payment, including outside the declared capital graph");
 			if tx.input.iter().any(|input| reached.contains(&input.previous_output)) {
 				for input in &tx.input {
@@ -3548,7 +3548,7 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 	}).await.expect("real progress and its funded Core child must appear within the original ten seconds");
 	let tip = ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32() - 2 * ROUND_CONFIRMATIONS + 3).await;
 	let operator_script = wm.config().sweep_address.clone().unwrap().require_network(Network::Regtest).unwrap().script_pubkey();
-	assert!(destinations.iter().all(|destination| destination != operator_script));
+	assert!(destinations.iter().all(|destination| destination != &operator_script));
 	assert_ne!(destinations[0], destinations[1]);
 	let replacement_mature = replacement.expiry_height() <= tip;
 	let (packages, roots, expected, available) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -3896,12 +3896,12 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 	let mut observed = BTreeMap::new();
 	for height in scan_from..=ctx.bitcoind().get_block_count().await {
 		for tx in core.get_block(&core.get_block_hash(height).unwrap()).unwrap().txdata {
-			for (index, output) in tx.output.iter().enumerate().filter(|(_, output)| destinations.iter().any(|destination| destination == output.script_pubkey)) {
+			for (index, output) in tx.output.iter().enumerate().filter(|(_, output)| destinations.iter().any(|destination| destination == &output.script_pubkey)) {
 				observed.insert(OutPoint::new(tx.compute_txid(), index as u32), output.clone());
 			}
 		}
 	}
-	let wanted = expected_outputs.iter().filter(|(_, output)| destinations.iter().any(|destination| destination == output.script_pubkey))
+	let wanted = expected_outputs.iter().filter(|(_, output)| destinations.iter().any(|destination| destination == &output.script_pubkey))
 		.map(|(point, output)| (*point, output.clone())).collect::<BTreeMap<_, _>>();
 	assert_eq!(observed, wanted, "all rightful outputs once; no spent ancestor or stale attacker refund");
 	if !replacement_mature {
