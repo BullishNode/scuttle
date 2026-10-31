@@ -212,19 +212,22 @@ impl Wallet {
 					&[VtxoStateKind::Spendable, VtxoStateKind::Spent]).await?;
 			}
 		}
+		// Ordinary wallet flows associate their outputs with a movement. Recovery
+		// can also retain already-Spent bodies without adopting Ark principal;
+		// their later presence alone must not turn a receipt into a new debit.
+		let recorded_outputs = self.inner.db.get_all_movements().await?.into_iter()
+			.flat_map(|movement| movement.output_vtxos).collect::<BTreeSet<_>>();
+		let source_ids = local_sources.iter().map(|source| source.id())
+			.filter(|id| recorded_outputs.contains(id)).collect::<Vec<_>>();
 		let movement = self.inner.movements.get_or_create_movement_with_action(Subsystem::FALLBACK,
 			"fallback", &format!("fallback:{}", receipt.vtxo_id), MovementUpdate::new()
-				.consumed_vtxos(local_sources.iter().map(|source| source.id()))).await?;
+				.consumed_vtxos(source_ids.iter().copied())).await?;
 		let status = if receipt.retired_block.is_some() { MovementStatus::Successful } else { MovementStatus::Pending };
-		// An authenticated payout may be discovered before its Ark output ever
-		// existed in this wallet. Keep that receipt and fee, but only debit Ark
-		// principal when this receipt actually retires a retained local source.
-		let effective = if receipt.retired_block.is_some() && !local_sources.is_empty() {
+		let effective = if receipt.retired_block.is_some() && !source_ids.is_empty() {
 			-receipt.gross.to_signed()?
 		} else { bitcoin::SignedAmount::ZERO };
 		let metadata = serde_json::to_value(&receipt)?;
 		let current = self.inner.db.get_movement_by_id(movement).await?;
-		let source_ids = local_sources.iter().map(|source| source.id()).collect::<Vec<_>>();
 		// Persisters expose the consumed IDs as a set, not the receipt's key
 		// iteration order. Reordering alone must not rewrite completion times.
 		let same_sources = current.input_vtxos.len() == source_ids.len()
