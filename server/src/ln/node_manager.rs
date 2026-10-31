@@ -356,6 +356,7 @@ impl LightningManager {
 			let max_cltv_expiry_delta = htlc_send_expiry_height
 				.checked_blocks_since(tip + self.htlc_expiry_delta)
 				.context("HTLC expiry height is too soon to perform a lightning payment")?;
+			ensure!(max_cltv_expiry_delta > 0, "no HTLC delay remains to perform a lightning payment");
 			let max_cltv_expiry_delta = BlockDelta::try_from(max_cltv_expiry_delta)
 				.unwrap_or(BlockDelta::MAX);
 
