@@ -1,5 +1,6 @@
 - Keep an outgoing Lightning attempt pending while its own native payment is pending.
   An xpay error no longer marks that unresolved payment failed.
+  An empty own-payment lookup also retains the current open status and custody.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
 - Resume an intra-Ark receive after its sender already settled.
   A restart between the sender and receive commits no longer retries a cancelled
