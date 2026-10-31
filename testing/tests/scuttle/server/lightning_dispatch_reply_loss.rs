@@ -309,6 +309,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 			let height = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 			assert!(zero_tip > height, "the genuinely issued source must initially have positive room");
 			ctx.generate_blocks(zero_tip.checked_blocks_since(height).unwrap()).await;
+			lightning.internal.wait_for_block(zero_tip).await;
 			let info = lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner();
 			assert_eq!(info.blockheight, zero_tip.to_u32());
 			assert_eq!(info.id, lightning.internal.id().await);
