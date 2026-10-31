@@ -141,7 +141,7 @@ impl Server {
 		let tip = i32::try_from(view.captaind.height.min(view.watchmand.height).to_u32())?;
 		let rows = self.db.read(async |t| Ok(t.query(
 			"
-				SELECT v.id,v.vtxo
+				SELECT v.id,v.vtxo_id
 				FROM vtxo v
 				WHERE v.id>$1 AND v.expiry<=$2
 				AND v.frontier_at IS NOT NULL
@@ -163,7 +163,8 @@ impl Server {
 		let next = rows.last().expect("nonempty above").get("id");
 		let mut anchors = BTreeMap::<OutPoint, Vec<ServerVtxo>>::new();
 		for row in rows {
-			let root = ServerVtxo::deserialize(row.get("vtxo"))?;
+			let id: VtxoId = row.get::<_, &str>("vtxo_id").parse()?;
+			let root = self.db.read(async |tx| tx.get_bare_vtxo_by_id(id).await).await?.vtxo;
 			anchors.entry(root.chain_anchor()).or_default().push(root);
 		}
 		let mut ready = BTreeMap::<BlockHeight, Vec<ReadyOutput>>::new();
@@ -209,16 +210,14 @@ impl Server {
 		self: &Arc<Self>,
 		view: ExpiryViewToken,
 		anchor: OutPoint,
-		roots: Vec<ServerVtxo>,
+		_roots: Vec<ServerVtxo>,
 		ready: &mut BTreeMap<BlockHeight, Vec<ReadyOutput>>,
 		prepared_bytes: &mut usize,
 	) -> anyhow::Result<()> {
-		// One immutable inventory per anchor per pass, including after a split.
-		// Repeating the whole anchor SQL query once per child is quadratic work.
-		let (snapshot, roots) = self.db.read(async |t| {
-			let snapshot = t.backing_snapshot(&roots, INVENTORY_LIMITS).await?;
-			// The cursor selects anchors. Revisit held roots at the same anchor
-			// so a later cursor page does not pay their siblings separately.
+		// Select frontier identities with metadata only. Payload budgets apply
+		// separately to each actual physical subtree below, never its whole
+		// historical anchor inventory.
+		let roots = self.db.read(async |t| {
 			let tip = i32::try_from(view.captaind.height.min(view.watchmand.height).to_u32())?;
 			let limit = i64::try_from(INVENTORY_LIMITS.max_rows)?.checked_add(1)
 				.context("expiry root row budget overflow")?;
@@ -234,26 +233,14 @@ impl Server {
 				LIMIT $3
 			", &[&anchor.to_string(), &tip, &limit]).await?;
 			ensure!(eligible.len() <= INVENTORY_LIMITS.max_rows, "expiry frontier exceeds row budget");
-			let inventory = snapshot.regular.iter().map(|fact|
-				(fact.state.vtxo_id.to_string(), &fact.state.vtxo)
-			).collect::<BTreeMap<_, _>>();
-			let roots = eligible.into_iter().map(|row| {
-				let id = row.get::<_, String>("vtxo_id");
-				inventory.get(&id).map(|root| (*root).clone())
-					.context("expiry frontier changed after the anchor inventory was read")
-			}).collect::<anyhow::Result<Vec<_>>>()?;
-			Ok((snapshot, roots))
+			let mut selected = Vec::with_capacity(eligible.len());
+			for row in eligible {
+				selected.push(t.get_bare_vtxo_by_id(row.get::<_, &str>("vtxo_id").parse()?).await?.vtxo);
+			}
+			Ok(selected)
 		}).await?;
 		let funding = self.bitcoind.get_raw_transaction_verbosity_zero(&anchor.txid).await?.0;
 		ensure!(funding.compute_txid() == anchor.txid, "expiry funding transaction differs from its anchor");
-		// Path validation can traverse a large signed tree. Keep it outside
-		// both database transactions and the async executor's worker threads.
-		let (snapshot, funding, transitions) = tokio::task::spawn_blocking(move || {
-			let transitions = source_transitions(&snapshot, &funding)?;
-			Ok::<_, anyhow::Error>((snapshot, funding, transitions))
-		}).await.context("expiry source validation task failed")??;
-		let snapshot = Arc::new(snapshot);
-		let transitions = Arc::new(transitions);
 		for root in roots {
 			let result = async {
 				ensure!(root.server_pubkey() == self.server_pubkey, "expiry backing belongs to a different server key");
@@ -263,22 +250,23 @@ impl Server {
 					return Ok(());
 				}
 				let Some(output) = self.bitcoind.try_get_tx_out(root.point(), true).await? else {
-					self.db.write(async |tx| tx.record_expiry_hold(root.id(), "backing_output_unavailable").await).await?;
+					self.request_held_expiry_split(view, &root, "backing_output_unavailable").await?;
 					return Ok(());
 				};
 				ensure!(output.confirmations > 0 && output.value == root.amount()
 					&& output.script_pub_key.script()? == root.txout().script_pubkey,
 					"expiry physical backing differs from the confirmed output");
-				let cut = {
-					let snapshot = Arc::clone(&snapshot);
-					let transitions = Arc::clone(&transitions);
+				let snapshot = self.db.read(async |t| t.backing_subtree_snapshot(
+					std::slice::from_ref(&root), INVENTORY_LIMITS).await).await?;
+				// Traverse only this physical subtree outside DB/async workers.
+				let (snapshot, cut) = {
 					let funding = funding.clone();
 					let root = root.clone();
-					// Building the current economic cut also traverses the complete
-					// inventory. It must not starve unrelated async RPC work.
-					tokio::task::spawn_blocking(move || economic_cut(
-						&snapshot, &root, &funding, &transitions, INVENTORY_LIMITS,
-					)).await.context("expiry economic cut task failed")??
+					tokio::task::spawn_blocking(move || {
+						let transitions = source_transitions(&snapshot, &funding)?;
+						let cut = economic_cut(&snapshot, &root, &funding, &transitions, INVENTORY_LIMITS)?;
+						Ok::<_, anyhow::Error>((snapshot, cut))
+					}).await.context("expiry subtree validation task failed")??
 				};
 				let mut coins = Vec::with_capacity(cut.terminals.len());
 				let mut hold = false;

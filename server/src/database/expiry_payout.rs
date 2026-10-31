@@ -56,6 +56,12 @@ struct SplitRecoveryPaths {
 	keys: BTreeSet<PublicKey>,
 }
 
+fn retained_server_recovery(vtxo: &ServerVtxo) -> bool {
+	matches!(vtxo.policy(), ServerVtxoPolicy::ServerOwned | ServerVtxoPolicy::Expiry(_)
+		| ServerVtxoPolicy::Checkpoint(_) | ServerVtxoPolicy::HarkLeaf(_) | ServerVtxoPolicy::HarkLeaf_v0(_)
+		| ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcRecv(_) | VtxoPolicy::ServerHtlcRecv_v0(_)))
+}
+
 /// A signed next transaction alone is insufficient. For example, a board's
 /// next transaction ends at a user-only leaf: publishing it would destroy our
 /// expiry path for an abandoned wallet. Follow every branch until there is an
@@ -82,23 +88,17 @@ fn split_recovery_paths(
 			return Ok(None);
 		}
 		if point != root.point() {
-			match vtxo.policy() {
-				ServerVtxoPolicy::ServerOwned | ServerVtxoPolicy::Expiry(_)
-					| ServerVtxoPolicy::Checkpoint(_) | ServerVtxoPolicy::HarkLeaf(_)
-					| ServerVtxoPolicy::HarkLeaf_v0(_) => continue,
-				// Receive contracts retain the server's timeout signature path.
-				// Send contracts instead refund to the user's key; an unknown
-				// preimage cannot be substituted for a server recovery path.
-				ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcRecv(_)
-					| VtxoPolicy::ServerHtlcRecv_v0(_)) => continue,
-				ServerVtxoPolicy::User(VtxoPolicy::Pubkey(policy)) if fact.state.oor_spent_txid.is_none() => {
+			// These exact policy kinds also delimit the metadata-only recovery
+			// inventory. Every decoded policy is validated before trusting it.
+			if retained_server_recovery(vtxo) { continue; }
+			if let ServerVtxoPolicy::User(VtxoPolicy::Pubkey(policy)) = vtxo.policy() {
+				if fact.state.oor_spent_txid.is_none() {
 					if policy.user_pubkey == root.server_pubkey() { continue; }
 					if owned.contains(&policy.user_pubkey) {
 						keys.insert(policy.user_pubkey);
 						continue;
 					}
-				},
-				_ => {},
+				}
 			}
 		}
 		let Some(next) = fact.state.oor_spent_txid.and_then(|id| signed.get(&id)) else { return Ok(None); };
@@ -342,8 +342,9 @@ impl Tx<'_> {
 		// Prepare without coin or chain-view locks. Only the short recheck below
 		// serializes against a new obligation, a key drop or a changed chain view.
 		let limits = INVENTORY_LIMITS;
-		let snapshot = self.backing_snapshot(std::slice::from_ref(root), limits).await?;
-		let txids = snapshot.regular.iter().filter_map(|f| f.state.oor_spent_txid)
+		let snapshot = self.backing_recovery_snapshot(root, limits).await?;
+		let txids = snapshot.regular.iter().filter(|f| f.state.vtxo_id == root.id() || !retained_server_recovery(&f.state.vtxo))
+			.filter_map(|f| f.state.oor_spent_txid)
 			.map(|id| id.to_string()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
 		// Bound the returned bytes before loading transaction blobs. This is a
 		// single statement, so a concurrent registration cannot change its size
@@ -506,7 +507,23 @@ impl Tx<'_> {
 	/// keep these locks through broadcast, including when the root is not itself
 	/// one of the economic customer terminals.
 	pub async fn lock_unallocated_watchman_inputs(&self, ids: &[ark::VtxoId]) -> anyhow::Result<()> {
-		super::expiry_guard::guard_obligation_changes(self, ids).await
+		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
+		// Physical reservations survive while pending/confirmed. A conflicted
+		// operator-only decision does not permanently forbid signed recovery.
+		// Customer entitlements remain irreversible even across a conflict;
+		// the off-chain obligation guard retains its separate stronger fence.
+		if let Some(row) = self.query_opt("SELECT vtxo_id FROM ( \
+			SELECT i.vtxo_id FROM expiry_allocation_input i JOIN expiry_allocation a ON a.id=i.allocation_id \
+				WHERE i.vtxo_id=ANY($1) AND a.status<>'conflicted' \
+			UNION SELECT e.vtxo_id FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1) AND ( \
+				e.irreversible_facts ? 'customer_key' \
+				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND c.disposition='customer') \
+				OR EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id))) fenced \
+			ORDER BY vtxo_id LIMIT 1", &[&ids]).await? {
+			return Err(crate::error::FallbackRefusal::DecidedForFallback(row.get::<_, &str>("vtxo_id").parse()?).into());
+		}
+		Ok(())
 	}
 }
 

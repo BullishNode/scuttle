@@ -44,3 +44,9 @@
   Only committed groups affect pass inclusion, and dropped groups leave their
   unfinished round participations unchanged.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Prepare expiry payouts within each physical subtree's inventory budget and
+  use the existing signed recovery prefix when the larger tree needs splitting.
+  A known mempool prefix can receive its watchman fee bump; a different spender
+  stays held. Conflicted operator reservations no longer permanently block that
+  progress, while customer and off-chain fences remain protected.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)

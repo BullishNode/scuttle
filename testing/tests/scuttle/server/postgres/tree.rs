@@ -6,7 +6,8 @@ use bitcoin::secp256k1::{rand, Keypair};
 use chrono::{DateTime, Local};
 use bitcoin::hashes::Hash;
 
-use ark::{ServerVtxo, VtxoId};
+use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
+use ark::arkoor::{ArkoorDestination, package::ArkoorPackageBuilder};
 use ark::board::BoardBuilder;
 use ark::vtxo::Full;
 use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef, TxOutExt};

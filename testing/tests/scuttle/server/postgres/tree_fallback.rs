@@ -402,3 +402,84 @@ async fn dropped_group_leaves_no_cancellation() {
 		&[&participation]).await?.get::<_, i64>(0))).await.unwrap(), 1,
 		"only the final selected decision may cancel the original participation");
 }
+
+#[tokio::test]
+async fn over_budget_tree_is_split_not_frozen() {
+	let (_ctx, db) = test_db("over_budget_tree_uses_bounded_recovery_prefix").await;
+	let board = dust_decision_board(&db, 92, 10_000, false).await;
+	let server = super::super::test_server_mailbox_key();
+	let package = ArkoorPackageBuilder::new_with_checkpoints(
+		[board.leaf.clone().try_into_user_vtxo().unwrap()], vec![
+			ArkoorDestination { total_amount: Amount::from_sat(5_000), policy: VtxoPolicy::new_pubkey(board.key.public_key()) },
+			ArkoorDestination { total_amount: Amount::from_sat(5_000), policy: VtxoPolicy::new_server_htlc_send(
+				board.key.public_key(), ark::lightning::PaymentHash::from([92; 32]), BlockHeight::new(120)) },
+		],
+	).unwrap().cosign_both(&[board.key], server).unwrap();
+	let internal = package.build_signed_internal_vtxos();
+	let checkpoint = internal.iter().find(|(vtxo, _)| matches!(vtxo.policy(), ServerVtxoPolicy::Checkpoint(_))).unwrap().0.to_bare();
+	let signed = package.signed_virtual_transactions();
+	let spends = package.input_spend_info().collect::<Vec<_>>();
+	let leaves = package.build_signed_vtxos();
+	for leaf in &leaves { leaf.validate(&board.funding).unwrap(); }
+	db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+		.upsert_funding_tx(&board.funding)
+		.upsert_signed_tx(board.leaf.transactions().map(|step| step.tx).chain(signed))
+		.insert_oor_spent_vtxos(internal)
+		.insert_spendable_vtxos(leaves.into_iter().map(ServerVtxo::from))
+		.mark_vtxos_oor_spent(spends)).await).await.unwrap();
+	let limits = BackingSnapshotLimits { max_rows: 4, max_serialized_bytes: 1_000_000 };
+	assert!(db.read(async |tx| tx.backing_subtree_snapshot(std::slice::from_ref(&board.root), limits).await).await.is_err(),
+		"the actual economic subtree must exceed this unchanged test budget");
+	let child = db.read(async |tx| tx.backing_subtree_snapshot(std::slice::from_ref(&checkpoint),
+		BackingSnapshotLimits { max_rows: 2, ..limits }).await).await.unwrap();
+	assert_eq!(child.regular.len(), 2, "ancestors and unrelated siblings are not this physical child's payload budget");
+	let recovery = db.read(async |tx| tx.backing_recovery_snapshot(&board.root, limits).await).await.unwrap();
+	assert_eq!(recovery.regular.len(), 4, "stop at the two actual server-recoverable checkpoints");
+	assert!(!recovery.regular.iter().any(|fact| matches!(fact.state.vtxo.policy(),
+		ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcSend(_)))));
+	let view = dust_decision_view(&db, 104, 104).await;
+	assert!(db.write(async |tx| tx.request_expiry_split(view, &board.root).await).await.unwrap());
+	let requests = db.read(async |tx| tx.pending_expiry_splits().await).await.unwrap();
+	assert_eq!(requests.len(), 1);
+	assert_eq!(requests[0].0, board.leaf.point().txid);
+	assert_eq!(requests[0].1.id(), board.root.id());
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM expiry_entitlement", &[]).await?.get::<_, i64>(0))).await.unwrap(), 0,
+		"preparing the signed prefix creates no financial entitlement or HTLC outcome");
+}
+
+#[tokio::test]
+async fn conflicted_allocation_input_can_be_split() {
+	let (_ctx, db) = test_db("conflicted_operator_reservation_is_not_an_offchain_unlock").await;
+	let board = dust_decision_board(&db, 93, 2_000, false).await;
+	// These rows isolate the reservation predicate, not a native payout or
+	// an assertion that this operator history is a new ownership decision.
+	let allocation: i64 = db.write(async |tx| {
+		let allocation: i64 = tx.query_one("INSERT INTO expiry_allocation(expiry_height,status) VALUES(100,'conflicted') RETURNING id", &[]).await?.get(0);
+		tx.execute("INSERT INTO expiry_allocation_input(allocation_id,vtxo_id) VALUES($1,$2)",
+			&[&allocation, &board.root.id().to_string()]).await?;
+		tx.execute("INSERT INTO expiry_entitlement(vtxo_id,gross_sat,irreversible_facts) VALUES($1,2000,'{\"operator\":true}')",
+			&[&board.root.id().to_string()]).await?;
+		Ok(allocation)
+	}).await.unwrap();
+	db.write(async |tx| tx.lock_unallocated_watchman_inputs(&[board.root.id()]).await).await.unwrap();
+	db.write(async |tx| Ok(tx.execute("UPDATE expiry_allocation SET status='pending' WHERE id=$1", &[&allocation]).await?)).await.unwrap();
+	let pending = db.write(async |tx| tx.lock_unallocated_watchman_inputs(&[board.root.id()]).await).await.unwrap_err();
+	assert!(format!("{pending:#}").contains(&format!("vtxo {} is reserved for expiry recovery", board.root.id())));
+	db.write(async |tx| Ok(tx.execute("UPDATE expiry_allocation SET status='conflicted' WHERE id=$1", &[&allocation]).await?)).await.unwrap();
+	db.write(async |tx| {
+		tx.execute("INSERT INTO expiry_entitlement(vtxo_id,gross_sat,irreversible_facts) VALUES($1,2000, \
+			jsonb_build_object('customer_key',$2::TEXT,'kind','pubkey'))", &[&board.leaf.id().to_string(), &board.key.public_key().to_string()]).await?;
+		Ok(())
+	}).await.unwrap();
+	let customer = db.write(async |tx| tx.lock_unallocated_watchman_inputs(&[board.leaf.id()]).await).await.unwrap_err();
+	assert!(format!("{customer:#}").contains(&format!("vtxo {} is reserved for expiry recovery", board.leaf.id())));
+	// The general off-chain guard is deliberately stronger and unchanged.
+	let output = server::database::rounds::StoredRoundOutput {
+		vtxo_request: ark::VtxoRequest { policy: VtxoPolicy::new_pubkey(board.key.public_key()), amount: Amount::from_sat(2_000) },
+		unblinded_mailbox_id: Some(MailboxIdentifier::from(board.mailbox.public_key())),
+	};
+	let offchain = db.write(async |tx| tx.try_store_round_participation(BlockHeight::ZERO, [93; 32],
+		&[board.root.id()], std::iter::once(&output), None).await).await.unwrap_err();
+	assert!(format!("{offchain:#}").contains(&format!("vtxo {} is reserved for expiry recovery", board.root.id())),
+		"conflicted progress is not permission to spend off chain: {offchain:#}");
+}
