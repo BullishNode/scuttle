@@ -1,6 +1,10 @@
 -- Initial schema for fresh matched Scuttle stores.
 SET LOCAL search_path TO scuttle, public;
 
+-- The original signed request is required to bind a future same-node resume.
+-- NULL is unqualified evidence, never permission to reconstruct an invoice.
+ALTER TABLE public.cln_xpay ADD COLUMN signed_invoice TEXT;
+
 CREATE INDEX expiry_vtxo_anchor_point_ix ON vtxo (anchor_point, vtxo_id);
 
 CREATE TABLE expiry_entitlement (

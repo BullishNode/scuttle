@@ -1838,6 +1838,7 @@ fn new_cln_xpay(node_id: i64, payment_hash: PaymentHash) -> NewClnXpay {
 		htlc_expiry: Some(BlockHeight::new(900)),
 		label: None,
 		payment_hash,
+		signed_invoice: None,
 		user_fee_msat: Some(1000),
 		user_agent: None,
 	}

@@ -8,9 +8,9 @@
 //! ones: `attempt_expiry` replaces `retry_for` and `htlc_expiry` replaces
 //! `maxdelay`. The conversion happens when we call `xpay`.
 //!
-//! `attempt_expiry` is the one request column every attempt must have: it is
-//! the moment xpay stops retrying, which is what tells a final failure from a
-//! failure xpay may still turn around.
+//! `attempt_expiry` records the original wall retry budget. CLN takes a relative
+//! duration; an elapsed local timestamp does not certify that a remote call
+//! ended or never began. Automatic re-drive is not enabled by this record.
 //!
 //! A row is written in the same transaction as the `lightning_payment_attempt`
 //! it belongs to and ended in the same transaction as that attempt's final
@@ -30,7 +30,7 @@ use postgres_types::{FromSql, ToSql};
 use tokio_postgres::{GenericClient, Row};
 use tokio_postgres::types::Type;
 
-use ark::lightning::PaymentHash;
+use ark::lightning::{Invoice, PaymentHash};
 use bitcoin_ext::BlockHeight;
 
 use crate::database::ln::LightningNodeId;
@@ -40,7 +40,7 @@ use crate::database::ln::LightningNodeId;
 const XPAY_COLUMNS: &str = "
 	id, lightning_node_id, payment_amount_msat, max_routing_fee_msat,
 	attempt_expiry, partial_msat, htlc_expiry, label, payment_hash,
-	user_fee_msat, user_agent, status,
+	user_fee_msat, user_agent, signed_invoice, status,
 	routing_fee_msat, error_code, created_at, updated_at
 ";
 
@@ -94,6 +94,9 @@ pub struct ClnXpayRecord {
 	pub label: Option<String>,
 
 	pub payment_hash: PaymentHash,
+	/// Exact signed invoice sent in this request. A missing value cannot be
+	/// replaced from a hash, a later invoice or the node's aggregate outcome.
+	pub signed_invoice: Option<String>,
 
 	/// The fee we quoted the user at initiation, which is ours to keep.
 	pub user_fee_msat: Option<u64>,
@@ -116,6 +119,17 @@ pub struct ClnXpayRecord {
 
 	pub created_at: DateTime<Local>,
 	pub updated_at: DateTime<Local>,
+}
+
+impl ClnXpayRecord {
+	pub fn original_invoice(&self) -> anyhow::Result<Invoice> {
+		let invoice: Invoice = self.signed_invoice.as_deref()
+			.context("xpay request has no original signed invoice")?.parse()
+			.context("xpay original invoice is invalid")?;
+		invoice.check_signature().context("xpay original invoice signature is invalid")?;
+		ensure!(invoice.payment_hash() == self.payment_hash, "xpay original invoice has a different payment hash");
+		Ok(invoice)
+	}
 }
 
 impl TryFrom<Row> for ClnXpayRecord {
@@ -143,6 +157,7 @@ impl TryFrom<Row> for ClnXpayRecord {
 			label: row.get("label"),
 			payment_hash: PaymentHash::from_str(row.get::<_, &str>("payment_hash"))
 				.context("error decoding payment hash from db")?,
+			signed_invoice: row.get("signed_invoice"),
 			user_fee_msat: row.get::<_, Option<i64>>("user_fee_msat")
 				.map(u64::try_from)
 				.transpose()
@@ -174,6 +189,7 @@ pub struct NewClnXpay {
 	pub label: Option<String>,
 
 	pub payment_hash: PaymentHash,
+	pub signed_invoice: Option<String>,
 
 	/// The fee we quoted the user at initiation, which is ours to keep.
 	pub user_fee_msat: Option<u64>,
@@ -191,13 +207,13 @@ pub async fn create_xpay<T: GenericClient>(
 		INSERT INTO cln_xpay (
 			lightning_node_id, payment_amount_msat, max_routing_fee_msat,
 			attempt_expiry, partial_msat, htlc_expiry, label, payment_hash,
-			user_fee_msat, user_agent
+			user_fee_msat, user_agent, signed_invoice
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING {XPAY_COLUMNS}
 	"), &[
 		Type::INT8, Type::INT8, Type::INT8, Type::TIMESTAMPTZ, Type::INT8,
-		Type::INT4, Type::TEXT, Type::TEXT, Type::INT8, Type::TEXT,
+		Type::INT4, Type::TEXT, Type::TEXT, Type::INT8, Type::TEXT, Type::TEXT,
 	]).await?;
 
 	let payment_amount_msat = i64::try_from(new.payment_amount_msat)
@@ -230,6 +246,7 @@ pub async fn create_xpay<T: GenericClient>(
 		&new.payment_hash.to_string(),
 		&user_fee_msat,
 		&new.user_agent,
+		&new.signed_invoice,
 	]).await.context("failed to create xpay")?;
 
 	ClnXpayRecord::try_from(row)
