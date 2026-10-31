@@ -51,7 +51,6 @@ impl Tx<'_> {
 			WHERE l.vtxo_id=$1 AND a.payment_hash=$2 ORDER BY a.id",
 			&[&source.to_string(), &hash.to_string()]).await?;
 		if attempts.is_empty() { return Ok(None); }
-		let completed = tip.min(watchman_tip).to_u32();
 		let mut scope = Vec::with_capacity(attempts.len());
 		let mut last = 0u32;
 		for attempt in attempts {
@@ -87,7 +86,9 @@ impl Tx<'_> {
 				};
 				let Some(height) = height else { return Ok(None); };
 				let height = u32::try_from(height)?;
-				if !height.checked_add(6).is_some_and(|required| required <= completed) { return Ok(None); }
+				if !super::htlc_vtxo::grant_reclamation_confirmed(BlockHeight::new(height), tip, Some(watchman_tip)) {
+					return Ok(None);
+				}
 				last = last.max(height);
 			}
 		}
