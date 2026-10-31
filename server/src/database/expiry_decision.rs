@@ -43,8 +43,8 @@ pub struct DustCandidate {
 
 const DUST_AGGREGATION_BLOCKS: BlockDelta = BlockDelta::new(144);
 
-fn dust_aggregation_open(expiry: BlockHeight, captaind: BlockHeight, watchmand: BlockHeight) -> bool {
-	captaind.min(watchmand) < expiry + DUST_AGGREGATION_BLOCKS
+fn dust_aggregation_open(expiry: BlockHeight, processed: BlockHeight) -> bool {
+	processed < expiry + DUST_AGGREGATION_BLOCKS
 }
 
 pub struct ReadyOutput {
@@ -199,8 +199,7 @@ impl Tx<'_> {
 		// Serialize fee history at this height before locking source rows.
 		// Two-integer advisory keys are separate from the upstream lock keys.
 		self.execute("SELECT pg_advisory_xact_lock($1,$2)", &[&5_i32, &i32::try_from(expiry.to_u32())?]).await?;
-		ensure!(outputs.iter().all(|o| o.root().expiry_height() <= view.captaind.height
-			&& o.root().expiry_height() <= view.watchmand.height), "expiry group is not mature in the completed view");
+		ensure!(outputs.iter().all(|o| o.root().expiry_height() <= view.processed.height), "expiry group is not mature in the completed view");
 		let mut ids = outputs.iter().flat_map(|o| o.snapshot.regular.iter().map(|f| f.state.vtxo_id.to_string())).collect::<Vec<_>>();
 		let participations = outputs.iter().flat_map(|o| o.coins.iter().flat_map(|c| c.ownership.cancellations.iter().copied())).collect::<Vec<_>>();
 		if !participations.is_empty() {
@@ -252,7 +251,7 @@ impl Tx<'_> {
 				let funding = output.funding.iter().find(|t| t.compute_txid() == fact.state.vtxo.chain_anchor().txid)
 					.context("ready coin funding disappeared")?;
 				let current = self.propose_expiry_ownership(
-					fact, funding, view.captaind.height, Some(view.watchmand.height),
+					fact, funding, view.processed.height, Some(view.processed.height),
 				).await?;
 				valid &= current.disposition == coin.ownership.disposition && current.evidence == coin.ownership.evidence
 					&& current.has_stored_preimage == coin.ownership.has_stored_preimage
@@ -305,7 +304,7 @@ impl Tx<'_> {
 			)))
 		}).collect::<anyhow::Result<BTreeMap<_, _>>>()?;
 		let mut plan = allocate(leaves, &paid)?;
-		if !plan.forfeits.is_empty() && dust_aggregation_open(expiry, view.captaind.height, view.watchmand.height) {
+		if !plan.forfeits.is_empty() && dust_aggregation_open(expiry, view.processed.height) {
 			loop {
 				let count = accepted.len();
 				let mut held = Vec::new();
@@ -433,7 +432,7 @@ impl Tx<'_> {
 		&self, view: ExpiryViewToken, expiry: BlockHeight, script: &ScriptBuf,
 		frontier: &[DustCandidate], included: &BTreeSet<VtxoId>,
 	) -> anyhow::Result<bool> {
-		let tip = i32::try_from(view.captaind.height.min(view.watchmand.height).to_u32())?;
+		let tip = i32::try_from(view.processed.height.to_u32())?;
 		for candidate in frontier {
 			let coin = &candidate.coin;
 			if candidate.expiry != expiry || included.contains(&coin.ownership.id)

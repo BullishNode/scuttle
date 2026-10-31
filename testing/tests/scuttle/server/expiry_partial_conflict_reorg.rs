@@ -504,8 +504,8 @@ async fn partial_conflict_reorg() {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("the actual conflict rollback must invalidate the durable generation");
-	assert!(db.read(async |tx| tx.expiry_rebuild_token().await).await.unwrap().is_none(),
-		"the stopped watchman's old acknowledgement cannot authorize this fork");
+	assert!(db.read(async |tx| tx.expiry_view().await).await.unwrap().is_none(),
+		"the stopped watchman's old completed view cannot authorize this fork");
 	assert_eq!(decided_obligations(&db, &coins).await, permanent);
 	srv.stop().await.unwrap();
 	// Existing isolated-node crash/restart helper; no database edits and no

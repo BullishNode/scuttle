@@ -1210,11 +1210,9 @@ async fn intra_ark_revoke_then_claim_does_not_drain_server() {
 				tokio::time::timeout(Duration::from_secs(10), async {
 					loop {
 						if db.read(async |t| {
-							let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-							let rebuilt = t.query_one("SELECT NOT invalid AND generation=$1 AND rebuilt_captaind_height=$2 \
-								AND rebuilt_captaind_hash=$3 AND rebuilt_watchmand_height=$2 AND rebuilt_watchmand_hash=$3 \
-								FROM expiry_chain_view WHERE id=1", &[&view.generation, &i64::from(point.height), &point.hash.to_string()]).await?.get::<_, bool>(0);
-							Ok(view.captaind == point && view.watchmand == point && rebuilt)
+							let Some(view) = t.expiry_view().await? else { return Ok(false); };
+							let rebuilt = t.expiry_view_is_current(view).await?;
+							Ok(view.processed == point && rebuilt)
 						}).await.unwrap() { break; }
 						tokio::time::sleep(Duration::from_millis(100)).await;
 					}

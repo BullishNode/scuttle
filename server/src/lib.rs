@@ -33,7 +33,6 @@ mod intman;
 pub mod ln;
 pub mod nursery;
 mod offboards;
-mod expiry_readiness;
 pub mod owner_proof;
 pub mod recovery;
 mod round;
@@ -423,9 +422,6 @@ impl Server {
 		// Captaind is the only process broadcasting via the nursery, so it
 		// also runs the follow-up.
 		listeners.push(Box::new(tx_nursery.clone()));
-		listeners.push(Box::new(database::expiry_chain::ExpiryChainListener::start(
-			db.clone(), BlockTable::Captaind,
-		).await?));
 
 		let sync_manager = Arc::new(SyncManager::start(
 			rtmgr.clone(),
@@ -517,7 +513,6 @@ impl Server {
 		srv.lightning_manager.spawn_hold_settler(srv.clone(), settlement_stream);
 
 		srv.clone().start_offboard_retry_task().await;
-		srv.clone().start_expiry_readiness();
 
 		let srv2 = srv.clone();
 		tokio::spawn(async move {

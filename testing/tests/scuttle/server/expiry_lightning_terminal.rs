@@ -578,7 +578,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 					JOIN lightning_payment_attempt_htlc_vtxo l ON l.lightning_payment_attempt_id=a.id
 					WHERE l.vtxo_id=$1", &[&source.to_string()]).await?;
 					Ok(row.get::<_, &str>("status") == "failed" && row.get::<_, &str>("subscription_status") == "canceled"
-						&& t.expiry_rebuild_token().await?.is_some())
+						&& t.expiry_view().await?.is_some())
 				}).await.unwrap();
 				if ready { break; }
 				tokio::time::sleep(Duration::from_millis(100)).await;
@@ -675,8 +675,8 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 		tokio::time::timeout(Duration::from_secs(10), async {
 			loop {
 				if db.read(async |t| {
-					let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-					Ok(view.captaind == point && view.watchmand == point && t.expiry_view_is_rebuilt(view).await?)
+					let Some(view) = t.expiry_view().await? else { return Ok(false); };
+					Ok(view.processed == point && t.expiry_view_is_current(view).await?)
 				}).await.unwrap() { break; }
 				tokio::time::sleep(Duration::from_millis(50)).await;
 			}
@@ -713,10 +713,10 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 		tokio::time::timeout(Duration::from_secs(10), async {
 			loop {
 				let proposal = db.read(async |t| {
-					let Some(view) = t.expiry_rebuild_token().await? else { return Ok(None); };
-					if view.captaind != point || view.watchmand != point { return Ok(None); }
+					let Some(view) = t.expiry_view().await? else { return Ok(None); };
+					if view.processed != point { return Ok(None); }
 					Ok(Some(t.propose_expiry_ownership(&fact, &funding,
-						view.captaind.height, Some(view.watchmand.height)).await?))
+						view.processed.height, Some(view.processed.height)).await?))
 				}).await.unwrap();
 				if let Some(proposal) = proposal {
 					if matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Customer { user_pubkey } if user_pubkey == key.public_key()) {
@@ -962,8 +962,8 @@ async fn expiry_internal_shared_incoming_root_refunds_both_absent_attempts() {
 			tokio::time::sleep(Duration::from_secs(1)).await;
 			if let Some(target) = maturity {
 				let mature_view = db.read(async |t| {
-					let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-					Ok(view.captaind.height>=target && view.watchmand.height>=target && t.expiry_view_is_rebuilt(view).await?)
+					let Some(view) = t.expiry_view().await? else { return Ok(false); };
+					Ok(view.processed.height>=target && t.expiry_view_is_current(view).await?)
 				}).await.unwrap();
 				if !mature_view { continue; }
 			}

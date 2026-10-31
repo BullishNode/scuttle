@@ -897,10 +897,10 @@ CREATE TABLE public.expiry_chain_view (
     id smallint NOT NULL,
     generation bigint DEFAULT 0 NOT NULL,
     invalid boolean DEFAULT true NOT NULL,
-    rebuilt_captaind_height bigint,
-    rebuilt_captaind_hash text,
-    rebuilt_watchmand_height bigint,
-    rebuilt_watchmand_hash text,
+    processed_height bigint,
+    processed_hash text,
+    CONSTRAINT expiry_chain_view_processed_height_check CHECK ((processed_height >= 0)),
+    CONSTRAINT expiry_chain_view_check CHECK (((processed_height IS NULL) = (processed_hash IS NULL))),
     CONSTRAINT expiry_chain_view_generation_check CHECK ((generation >= 0)),
     CONSTRAINT expiry_chain_view_id_check CHECK ((id = 1))
 );
@@ -979,19 +979,6 @@ CREATE TABLE public.expiry_split_request (
     vtxo_id text NOT NULL,
     progress_txid text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
--- Name: expiry_sync_ack; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.expiry_sync_ack (
-    process text NOT NULL,
-    generation bigint NOT NULL,
-    height bigint NOT NULL,
-    hash text NOT NULL,
-    CONSTRAINT expiry_sync_ack_process_check CHECK ((process = ANY (ARRAY['captaind'::text, 'watchmand'::text])))
 );
 
 
@@ -2724,14 +2711,6 @@ ALTER TABLE ONLY public.expiry_owner_key
 
 ALTER TABLE ONLY public.expiry_split_request
     ADD CONSTRAINT expiry_split_request_pkey PRIMARY KEY (vtxo_id);
-
-
---
--- Name: expiry_sync_ack expiry_sync_ack_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_sync_ack
-    ADD CONSTRAINT expiry_sync_ack_pkey PRIMARY KEY (process);
 
 
 --

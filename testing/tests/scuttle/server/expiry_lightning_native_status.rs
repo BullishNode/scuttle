@@ -25,9 +25,9 @@ async fn completed_view(ctx: &TestContext, srv: &Captaind, db: &Db) {
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			if db.read(async |t| {
-				let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip
-					&& view.captaind.hash == hash && view.watchmand.hash == hash && t.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = t.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip
+					&& view.processed.hash == hash && t.expiry_view_is_current(view).await?)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}

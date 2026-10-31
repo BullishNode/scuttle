@@ -109,9 +109,9 @@ async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 				let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
 				loop {
 					if db.read(async |tx| {
-						let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-						Ok(view.captaind.height == tip && view.watchmand.height == tip
-							&& view.captaind.hash == hash && view.watchmand.hash == hash && tx.expiry_view_is_rebuilt(view).await?)
+						let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+						Ok(view.processed.height == tip
+							&& view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
 					}).await.unwrap() { break; }
 					tokio::time::sleep(Duration::from_millis(50)).await;
 				}

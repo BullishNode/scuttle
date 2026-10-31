@@ -376,10 +376,10 @@ pub(super) async fn wait_partial_confirmation(
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let coherent = db.write(async |t| {
-				let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-				if view.captaind.height != height || view.watchmand.height != height
-					|| view.captaind.hash != expected_hash || view.watchmand.hash != expected_hash
-					|| !t.expiry_view_is_rebuilt(view).await?
+				let Some(view) = t.expiry_view().await? else { return Ok(false); };
+				if view.processed.height != height
+					|| view.processed.hash != expected_hash
+					|| !t.expiry_view_is_current(view).await?
 				{ return Ok(false); }
 				t.lock_valid_expiry_view(view).await?;
 				let recorded = t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
@@ -575,9 +575,9 @@ async fn all_terminal_returns(
 	tokio::time::timeout(Duration::from_secs(30),async {
 		loop {
 			let rebuilt=db.read(async |t| {
-				let Some(view)=t.expiry_rebuild_token().await? else {return Ok(false);};
-				Ok(view.captaind.height==height && view.watchmand.height==height
-					&& view.captaind.hash==expected_hash && view.watchmand.hash==expected_hash && t.expiry_view_is_rebuilt(view).await?)
+				let Some(view)=t.expiry_view().await? else {return Ok(false);};
+				Ok(view.processed.height==height
+					&& view.processed.hash==expected_hash && t.expiry_view_is_current(view).await?)
 			}).await.unwrap();
 			if rebuilt {break;}
 			tokio::time::sleep(Duration::from_millis(50)).await;

@@ -899,8 +899,8 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 			srv.wait_for_sync_height(point.height).await;
 			srv.watchmand().wait_for_sync_height(point.height).await;
 			let rebuilt = db.read(async |t| {
-				let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind == point && view.watchmand == point && t.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = t.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed == point && t.expiry_view_is_current(view).await?)
 			}).await.unwrap();
 			if !rebuilt { tokio::time::sleep(Duration::from_millis(50)).await; continue; }
 			let rows = db.read(async |t| Ok(t.query(

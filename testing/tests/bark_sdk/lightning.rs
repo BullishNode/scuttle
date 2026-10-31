@@ -310,9 +310,9 @@ async fn pay_hold_refused() {
 						let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
 						loop {
 							if db.read(async |tx| {
-								let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-								Ok(view.captaind.height == tip && view.watchmand.height == tip
-									&& view.captaind.hash == hash && view.watchmand.hash == hash && tx.query_one("SELECT COALESCE(NOT invalid AND generation=$1 AND rebuilt_captaind_height=$2 AND rebuilt_captaind_hash=$3 AND rebuilt_watchmand_height=$4 AND rebuilt_watchmand_hash=$5,FALSE) AS rebuilt FROM expiry_chain_view WHERE id=1", &[&view.generation,&i64::from(view.captaind.height),&view.captaind.hash.to_string(),&i64::from(view.watchmand.height),&view.watchmand.hash.to_string()]).await?.get::<_,bool>("rebuilt"))
+								let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+								Ok(view.processed.height == tip
+									&& view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
 							}).await.unwrap() { break; }
 							tokio::time::sleep(Duration::from_millis(50)).await;
 						}

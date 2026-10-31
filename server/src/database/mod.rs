@@ -208,6 +208,11 @@ impl Db {
 					AND table_name='cln_xpay' AND column_name='signed_invoice' AND data_type='text') \
 				 AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' \
 					AND table_name='cln_xpay' AND column_name='dispatch_count' AND data_type='bigint') \
+				 AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' \
+					AND table_name='expiry_chain_view' AND column_name='processed_height' AND data_type='bigint') \
+				 AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' \
+					AND table_name='expiry_chain_view' AND column_name='processed_hash' AND data_type='text') \
+				 AND to_regclass('public.expiry_sync_ack') IS NULL \
 				 AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='customer_coin_owner' \
 				 AND tgrelid=to_regclass('public.vtxo') AND tgdeferrable AND tginitdeferred)", &[],
 			).await?.get(0);

@@ -174,8 +174,8 @@ async fn oversized_fee_child() {
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			if db.read(async |t| {
-				let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind == point && view.watchmand == point && t.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = t.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed == point && t.expiry_view_is_current(view).await?)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -368,24 +368,20 @@ async fn payout_reorg(depth: u32) {
 	let old_generation = wait_for_confirmation(&db, allocation, old_tip, old_hash).await;
 	let deep_queries = queries.load(Ordering::SeqCst);
 	if depth > 6 {
-		assert!(deep_queries > 0, "counter must observe the real initial parent confirmation lookup");
-		// Only the actual watchman rebuild writes this existing row. Observe
-		// two completed passes at the same deep-confirmed canonical tip.
-		let mut version = db.read(async |t| Ok(t.query_one("SELECT xmin::TEXT FROM expiry_chain_view WHERE id=1", &[])
+		// The actual block now supplies confirmation; no full historical
+		// Core lookup/rebuild is required. Idle requested sweeps must retain
+		// the completed view and not re-query this canonical paid parent.
+		let version = db.read(async |t| Ok(t.query_one("SELECT xmin::TEXT FROM expiry_chain_view WHERE id=1", &[])
 			.await?.get::<_, String>(0))).await.unwrap();
 		for _ in 0..2 {
 			srv.watchmand().trigger_sweep().await;
-			version = tokio::time::timeout(Duration::from_secs(10), async {
-				loop {
-					let current = db.read(async |t| Ok(t.query_one("SELECT xmin::TEXT FROM expiry_chain_view WHERE id=1", &[])
-						.await?.get::<_, String>(0))).await.unwrap();
-					if current != version { break current; }
-					tokio::time::sleep(Duration::from_millis(50)).await;
-				}
-			}).await.expect("watchman must complete another real rebuild pass");
-			assert_eq!(queries.load(Ordering::SeqCst), deep_queries, "deep-confirmed allocation was queried again");
+			tokio::time::sleep(Duration::from_millis(1100)).await;
+			assert_eq!(db.read(async |t| Ok(t.query_one("SELECT xmin::TEXT FROM expiry_chain_view WHERE id=1", &[])
+				.await?.get::<_, String>(0))).await.unwrap(), version);
+			assert_eq!(queries.load(Ordering::SeqCst), deep_queries, "canonical paid history was queried again");
 		}
 	}
+
 	let payout_index = parent.output.iter().position(|out| out.script_pubkey == destination).unwrap() as u32;
 	assert_eq!(parent.output[payout_index as usize].value, expected);
 	let permanent = db.read(async |t| Ok(t.query_one(
@@ -395,7 +391,7 @@ async fn payout_reorg(depth: u32) {
 	let irreversible: String = permanent.get("facts");
 
 	// The server observes the shorter fork while the watchman is offline.
-	// Its old acknowledgment must not authorize a rebuild for the new generation.
+	// Its old completed view must not authorize work for the new generation.
 	srv.watchmand().stop().await.unwrap();
 	rpc.invalidate_block(&old_hash).unwrap();
 	let fork = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
@@ -411,8 +407,8 @@ async fn payout_reorg(depth: u32) {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("actual shorter fork was not durably invalidated before watchman restart");
-	assert!(db.read(async |t| t.expiry_rebuild_token().await).await.unwrap().is_none(),
-		"the stopped watchman's old acknowledgement cannot authorize this fork");
+	assert!(db.read(async |t| t.expiry_view().await).await.unwrap().is_none(),
+		"the stopped watchman's old completed view cannot authorize this fork");
 	assert_eq!(db.read(async |t| Ok(t.get_user_vtxo_by_id(ids[0]).await?.spend_state)).await.unwrap(),
 		server::database::SpendState::Spent, "a reorg must not reopen the committed source");
 
@@ -426,9 +422,9 @@ async fn payout_reorg(depth: u32) {
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let valid = db.read(async |t| {
-				let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind == recovery_tip && view.watchmand == recovery_tip
-					&& t.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = t.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed == recovery_tip
+					&& t.expiry_view_is_current(view).await?)
 			}).await.unwrap();
 			// A retained package may already be mined in the first replacement
 			// block; otherwise the watchman must recover it in the mempool.
@@ -865,7 +861,18 @@ async fn expiry_payout_replaces_unrecognized_foreign_fee_child() {
 /// incoming mempool ingestion or of the default one-confirmation policy.
 #[tokio::test]
 async fn expiry_payout_recovers_same_parent_when_positive_untrusted_funds_mature() {
-	let ctx = TestContext::new("server/expiry_payout_positive_untrusted_funding").await;
+	Box::pin(positive_untrusted_parent_recovery(false)).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn crash_after_commit_before_confirmation_retries_same_parent() {
+	Box::pin(positive_untrusted_parent_recovery(true)).await;
+}
+
+async fn positive_untrusted_parent_recovery(crash: bool) {
+	let ctx = TestContext::new(if crash { "scuttle/expiry_parent_commit_crash_recovery" }
+		else { "server/expiry_payout_positive_untrusted_funding" }).await;
 	let srv = Box::pin(ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
 		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24))
 		.watchmand_cfg(|cfg| {
@@ -938,6 +945,23 @@ async fn expiry_payout_recovers_same_parent_when_positive_untrusted_funds_mature
 	assert_ne!(destination, operator_spk);
 	assert_eq!(parent.output.iter().filter(|out| out.script_pubkey == operator_spk)
 		.map(|out| out.value).sum::<bitcoin::Amount>(), sat(1_000));
+	#[cfg(target_os = "linux")]
+	if crash {
+		let before = srv.watchmand().native_child().await.unwrap();
+		srv.watchmand().crash_stop().await.unwrap();
+		assert!(ctx.bitcoind().sync_client().get_mempool_entry(&parent.compute_txid()).is_err());
+		srv.watchmand().start().await.unwrap();
+		assert_ne!(srv.watchmand().native_child().await.unwrap(), before);
+		let row = db.read(async |t| Ok(t.query_one("SELECT a.sweep_tx,a.status,a.broadcast_at IS NULL AS unpublished, \
+			e.irreversible_facts::TEXT AS facts FROM expiry_allocation a,expiry_entitlement e WHERE a.id=$1 AND e.id=$2",
+			&[&allocation, &entitlement]).await?)).await.unwrap();
+		assert_eq!(deserialize::<Transaction>(row.get("sweep_tx")).unwrap(), parent);
+		assert_eq!(row.get::<_, String>("status"), "pending");
+		assert!(row.get::<_, bool>("unpublished"));
+		assert_eq!(row.get::<_, String>("facts"), facts);
+		let address = srv.watchmand().config().admin_address.unwrap();
+		admin = WalletAdminServiceClient::connect(format!("http://{address}")).await.unwrap();
+	}
 
 	let deposit = ctx.bitcoind().fund_addr(fee_address.clone(), sat(100_000)).await;
 	let deposit_tx = ctx.bitcoind().await_transaction(deposit).await;

@@ -16,7 +16,7 @@ use super::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
 use super::ln::LightningHtlcSubscriptionStatus;
 use super::expiry_inventory::BackingSnapshot;
 use super::Tx;
-use crate::expiry_readiness::INVENTORY_LIMITS;
+use crate::watchman::readiness::INVENTORY_LIMITS;
 
 pub(crate) const MAX_PAYOUT_VSIZE: usize = 10_000;
 
@@ -135,11 +135,11 @@ impl Tx<'_> {
 		let rows = self.query("SELECT c.vtxo_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
 			c.payout_sat,c.forfeited_sat,a.sweep_txid,
 			CASE WHEN a.status='confirmed' AND NOT cv.invalid
-				AND cv.rebuilt_watchmand_height >= a.confirmed_height+5
+				AND cv.processed_height >= a.confirmed_height+5
 				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
 				THEN a.confirmed_height END AS confirmed_height,
 			CASE WHEN a.status='confirmed' AND NOT cv.invalid
-				AND cv.rebuilt_watchmand_height >= a.confirmed_height+5
+				AND cv.processed_height >= a.confirmed_height+5
 				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
 				THEN a.confirmed_hash END AS confirmed_hash,p.output_index
 			FROM (SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
@@ -414,7 +414,7 @@ impl Tx<'_> {
 		let keys = paths.keys.iter().map(ToString::to_string).collect::<Vec<_>>();
 		let locked_keys = self.query("SELECT pubkey FROM ephemeral_tweak WHERE pubkey=ANY($1) ORDER BY pubkey FOR SHARE", &[&keys]).await?;
 		ensure!(locked_keys.len() == keys.len(), "split recovery key was dropped during preparation");
-		ensure!(root.expiry_height() <= view.captaind.height && root.expiry_height() <= view.watchmand.height,
+		ensure!(root.expiry_height() <= view.processed.height,
 			"expiry split backing is not mature");
 		let row = self.query_one("SELECT oor_spent_txid FROM vtxo WHERE vtxo_id=$1", &[&root.id().to_string()]).await?;
 		let Some(txid) = row.get::<_, Option<&str>>("oor_spent_txid") else { return Ok(false); };

@@ -175,8 +175,8 @@ async fn rebuilt(db: &Db, point: BlockRef) {
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			if db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind == point && view.watchmand == point && tx.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed == point && tx.expiry_view_is_current(view).await?)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}

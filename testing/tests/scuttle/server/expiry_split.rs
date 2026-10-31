@@ -133,8 +133,8 @@ async fn mixed_split(pin: bool) {
 	tokio::time::timeout(Duration::from_secs(15), async {
 		loop {
 			let result = db.write(async |t| {
-				let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-				if !t.expiry_view_is_rebuilt(view).await? { return Ok(false); }
+				let Some(view) = t.expiry_view().await? else { return Ok(false); };
+				if !t.expiry_view_is_current(view).await? { return Ok(false); }
 				let requested = t.request_expiry_split(view, &root).await?;
 				if requested { t.record_expiry_hold(root.id(), "output_requires_split").await?; }
 				Ok(requested)

@@ -185,7 +185,6 @@ impl Daemon {
 		let listeners: Vec<Box<dyn ChainEventListener>> = vec![
 			Box::new(watchman_wallet.clone()),
 			Box::new(frontier.clone()),
-			Box::new(database::expiry_chain::ExpiryChainListener::start(db.clone(), BlockTable::Watchmand).await?),
 		];
 
 		let sync_manager = SyncManager::start(

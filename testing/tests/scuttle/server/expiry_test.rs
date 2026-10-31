@@ -39,7 +39,7 @@ pub(super) async fn rebuilt(ctx: &TestContext, srv: &Captaind, db: &Db) {
 	srv.wait_for_sync_height(height).await;
 	srv.watchmand().wait_for_sync_height(height).await;
 	let point = BlockRef { height, hash: ctx.bitcoind().sync_client().get_best_block_hash().unwrap() };
-	wait_rebuilt(db, point, Duration::from_secs(15), "both completed expiry views must bind the real Core tip").await;
+	wait_rebuilt(db, point, Duration::from_secs(15), "watchmand's completed expiry view must bind the real Core tip").await;
 }
 
 pub(super) async fn actual_fee(ctx: &TestContext, transaction: &Transaction) -> Amount {
@@ -276,8 +276,8 @@ pub(super) async fn wait_rebuilt(db: &Db, point: BlockRef, timeout: Duration, me
 	tokio::time::timeout(timeout, async {
 		loop {
 			let generation = db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(None); };
-				if view.captaind == point && view.watchmand == point && tx.expiry_view_is_rebuilt(view).await? {
+				let Some(view) = tx.expiry_view().await? else { return Ok(None); };
+				if view.processed == point && tx.expiry_view_is_current(view).await? {
 					Ok(Some(view.generation))
 				} else { Ok(None) }
 			}).await.unwrap();

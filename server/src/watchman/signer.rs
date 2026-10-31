@@ -33,6 +33,10 @@ pub struct WatchmanSigner {
 }
 
 impl WatchmanSigner {
+	pub(crate) fn server_pubkey(&self) -> bitcoin::secp256k1::PublicKey {
+		self.server_keypair.leak_ref().public_key()
+	}
+
 	pub fn new(
 		server_keypair: Secret<Keypair>,
 		ephemeral_master_key: Secret<Keypair>,

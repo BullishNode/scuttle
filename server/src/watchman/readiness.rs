@@ -1,8 +1,6 @@
 //! Background preparation of independently ready expiry backing outputs.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use bitcoin::{OutPoint, Transaction};
@@ -13,7 +11,7 @@ use tracing::{debug, info, warn};
 
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId};
 
-use crate::Server;
+use crate::watchman::Watchman;
 use crate::database::Tx;
 use crate::database::expiry_attribution::Attribution;
 use crate::database::expiry_chain::ExpiryViewToken;
@@ -68,7 +66,7 @@ impl Tx<'_> {
 		view: ExpiryViewToken,
 	) -> anyhow::Result<PreparedCoin> {
 		let ownership = self.propose_expiry_ownership(
-			fact, funding, view.captaind.height, Some(view.watchmand.height),
+			fact, funding, view.processed.height, Some(view.processed.height),
 		).await?;
 		let payee = match &ownership.disposition {
 			OwnershipDisposition::Customer { .. } => {
@@ -102,43 +100,10 @@ impl Tx<'_> {
 	}
 }
 
-impl Server {
-	pub(crate) fn start_expiry_readiness(self: Arc<Self>) {
-		let worker = self.rtmgr.spawn_critical("ExpiryReadiness");
-		tokio::spawn(async move {
-			let _worker = worker;
-			let mut cursor = 0;
-			while !self.rtmgr.shutdown_requested() {
-				match self.expiry_readiness_pass(cursor).await {
-					Ok(next) => cursor = next,
-					Err(error) => warn!("Expiry readiness pass failed; no incomplete payout authorized: {:#}", error),
-				}
-				match self.db.read(async |tx| tx.expiry_hold_count().await).await {
-					Ok(count) => crate::telemetry::set_expiry_hold_count(count),
-					Err(error) => warn!("Could not refresh expiry hold gauge: {error:#}"),
-				}
-				tokio::select! {
-					_ = self.rtmgr.shutdown_signal() => break,
-					_ = tokio::time::sleep(Duration::from_secs(1)) => {},
-				}
-			}
-		});
-	}
-
-	async fn expiry_readiness_pass(self: &Arc<Self>, cursor: i64) -> anyhow::Result<i64> {
-		// Token validation takes a shared row lock, which PostgreSQL forbids
-		// in a read-only transaction. Release it before background preparation.
-		let Some(view) = self.db.write(async |t| {
-			let Some(view) = t.expiry_rebuild_token().await? else {
-				return Ok(None);
-			};
-			t.lock_valid_expiry_view(view).await?;
-			Ok(Some(view))
-		}).await? else {
-			return Ok(cursor);
-		};
+impl Watchman {
+	pub(crate) async fn expiry_readiness_pass(&self, view: ExpiryViewToken, cursor: i64) -> anyhow::Result<i64> {
 		view.verify(&self.bitcoind).await?;
-		let tip = i32::try_from(view.captaind.height.min(view.watchmand.height).to_u32())?;
+		let tip = i32::try_from(view.processed.height.to_u32())?;
 		let rows = self.db.read(async |t| Ok(t.query(
 			"
 				SELECT v.id,v.vtxo_id
@@ -170,9 +135,6 @@ impl Server {
 		let mut ready = BTreeMap::<BlockHeight, Vec<ReadyOutput>>::new();
 		let mut prepared_bytes = 0usize;
 		for (anchor, roots) in anchors {
-			if self.rtmgr.shutdown_requested() {
-				break;
-			}
 			let root_ids = roots.iter().map(|root| root.id()).collect::<Vec<_>>();
 			if let Err(error) = self.prepare_expiry_anchor(
 				view, anchor, roots, &mut ready, &mut prepared_bytes
@@ -207,7 +169,7 @@ impl Server {
 	}
 
 	pub(crate) async fn prepare_expiry_anchor(
-		self: &Arc<Self>,
+		&self,
 		view: ExpiryViewToken,
 		anchor: OutPoint,
 		_roots: Vec<ServerVtxo>,
@@ -218,7 +180,7 @@ impl Server {
 		// separately to each actual physical subtree below, never its whole
 		// historical anchor inventory.
 		let roots = self.db.read(async |t| {
-			let tip = i32::try_from(view.captaind.height.min(view.watchmand.height).to_u32())?;
+			let tip = i32::try_from(view.processed.height.to_u32())?;
 			let limit = i64::try_from(INVENTORY_LIMITS.max_rows)?.checked_add(1)
 				.context("expiry root row budget overflow")?;
 			let eligible = t.query("
@@ -243,7 +205,7 @@ impl Server {
 		ensure!(funding.compute_txid() == anchor.txid, "expiry funding transaction differs from its anchor");
 		for root in roots {
 			let result = async {
-				ensure!(root.server_pubkey() == self.server_pubkey, "expiry backing belongs to a different server key");
+				ensure!(root.server_pubkey() == self.signer.server_pubkey(), "expiry backing belongs to a different server key");
 				if matches!(root.policy(), ServerVtxoPolicy::User(_)) {
 					// A fully exposed leaf follows its own claim/refund contract.
 					// Do not commit unrelated payouts against that physical input.
@@ -268,25 +230,13 @@ impl Server {
 						Ok::<_, anyhow::Error>((snapshot, cut))
 					}).await.context("expiry subtree validation task failed")??
 				};
-				// Avoid cancelling a round whose input this process already holds.
-				// Other processes still serialize on the durable source/participation
-				// fences; a late losing round handles their refusal recoverably.
-				let mut ids = cut.visited.iter().map(|i| snapshot.regular[*i].state.vtxo_id).collect::<Vec<_>>();
-				ids.sort_unstable(); ids.dedup();
-				let _flux = match self.vtxos_in_flux.try_lock(&ids) {
-					Ok(guard) => guard,
-					Err(error) => {
-						debug!(vtxo_id = %error.id, root = %root.id(), "Expiry preparation skips an in-flux input");
-						return Ok(());
-					},
-				};
+				// Captaind's local in-flux set is not shared with watchmand.
+				// The decision transaction retains the durable participation,
+				// source and cancellation guards; late round refusal is recoverable.
 				let mut coins = Vec::with_capacity(cut.terminals.len());
 				let mut hold = false;
 				let mut needs_htlc_progress = false;
 				for index in &cut.terminals {
-					if self.rtmgr.shutdown_requested() {
-						return Ok(());
-					}
 					let coin = self.db.write(async |t| t.prepare_expiry_coin(
 						&snapshot.regular[*index],
 						&funding,
@@ -363,22 +313,6 @@ impl Server {
 		&self, view: ExpiryViewToken, outputs: Vec<ReadyOutput>,
 		frontier: &[DustCandidate], included: &mut BTreeSet<VtxoId>,
 	) -> anyhow::Result<()> {
-		// Preparation releases its local locks before grouping. Close that gap
-		// without letting one busy output stop unrelated ready outputs. Keep the
-		// guards through the decision commit; SQL still revalidates every source.
-		let mut guards = Vec::with_capacity(outputs.len());
-		let mut available = Vec::with_capacity(outputs.len());
-		for output in outputs {
-			match self.vtxos_in_flux.try_lock(&output.source_ids()) {
-				Ok(guard) => {
-					guards.push(guard);
-					available.push(output);
-				},
-				Err(error) => debug!(vtxo_id = %error.id, root = %output.root().id(),
-					"Expiry decision skips an in-flux input"),
-			}
-		}
-		let outputs = available;
 		if outputs.is_empty() {
 			return Ok(());
 		}

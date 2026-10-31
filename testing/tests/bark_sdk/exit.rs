@@ -261,9 +261,9 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 	async {
 		loop {
 			let rebuilt = db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == final_height && view.captaind.hash == final_hash
-					&& view.watchmand == view.captaind && tx.query_one("SELECT COALESCE(NOT invalid AND generation=$1 AND rebuilt_captaind_height=$2 AND rebuilt_captaind_hash=$3 AND rebuilt_watchmand_height=$4 AND rebuilt_watchmand_hash=$5,FALSE) AS rebuilt FROM expiry_chain_view WHERE id=1", &[&view.generation,&i64::from(view.captaind.height),&view.captaind.hash.to_string(),&i64::from(view.watchmand.height),&view.watchmand.hash.to_string()]).await?.get::<_,bool>("rebuilt"))
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == final_height && view.processed.hash == final_hash
+					&& tx.expiry_view_is_current(view).await?)
 			}).await.unwrap();
 			if rebuilt { break; }
 			tokio::time::sleep(Duration::from_millis(100)).await;
@@ -525,9 +525,9 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 	async {
 		loop {
 			let rebuilt = db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == final_height && view.captaind.hash == final_hash
-					&& view.watchmand == view.captaind && tx.query_one("SELECT COALESCE(NOT invalid AND generation=$1 AND rebuilt_captaind_height=$2 AND rebuilt_captaind_hash=$3 AND rebuilt_watchmand_height=$4 AND rebuilt_watchmand_hash=$5,FALSE) AS rebuilt FROM expiry_chain_view WHERE id=1", &[&view.generation,&i64::from(view.captaind.height),&view.captaind.hash.to_string(),&i64::from(view.watchmand.height),&view.watchmand.hash.to_string()]).await?.get::<_,bool>("rebuilt"))
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == final_height && view.processed.hash == final_hash
+					&& tx.expiry_view_is_current(view).await?)
 			}).await.unwrap();
 			if rebuilt { break; }
 			tokio::time::sleep(Duration::from_millis(100)).await;

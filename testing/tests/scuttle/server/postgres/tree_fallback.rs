@@ -279,19 +279,13 @@ async fn dust_decision_board(db: &Db, tag: u8, amount: u64, foreign: bool) -> Du
 	DustDecisionBoard { root: root.to_bare(), leaf, funding, key, mailbox }
 }
 
-async fn dust_decision_view(db: &Db, cap: u32, watch: u32) -> ExpiryViewToken {
+async fn dust_decision_view(db: &Db, _cap: u32, watch: u32) -> ExpiryViewToken {
 	db.write(async |tx| {
 		let generation: i64 = tx.query_one("SELECT generation FROM expiry_chain_view WHERE id=1", &[]).await?.get(0);
-		for (table, process, height) in [(BlockTable::Captaind, "captaind", cap), (BlockTable::Watchmand, "watchmand", watch)] {
-			let point = BlockRef { height: BlockHeight::new(height), hash: bitcoin::BlockHash::from_byte_array([height as u8; 32]) };
-			if tx.get_highest_block(table).await? != Some(point) { tx.store_block(table, &point).await?; }
-			tx.execute("INSERT INTO expiry_sync_ack(process,generation,height,hash) VALUES($1,$2,$3,$4) \
-				ON CONFLICT(process) DO UPDATE SET generation=EXCLUDED.generation,height=EXCLUDED.height,hash=EXCLUDED.hash",
-				&[&process, &generation, &i64::from(height), &point.hash.to_string()]).await?;
-		}
-		let view = tx.expiry_rebuild_token().await?.unwrap();
-		assert!(tx.finish_expiry_rebuild(view).await?);
-		Ok(view)
+		let point = BlockRef { height: BlockHeight::new(watch), hash: bitcoin::BlockHash::from_byte_array([watch as u8; 32]) };
+		if tx.get_highest_block(BlockTable::Watchmand).await? != Some(point) { tx.store_block(BlockTable::Watchmand, &point).await?; }
+		tx.complete_expiry_sync(generation, point).await?;
+		Ok(tx.expiry_view().await?.unwrap())
 	}).await.unwrap()
 }
 
@@ -299,7 +293,7 @@ async fn dust_decision_ready(db: &Db, board: &DustDecisionBoard, view: ExpiryVie
 	db.read(async |tx| {
 		let snapshot = tx.backing_snapshot(std::slice::from_ref(&board.root), DUST_TEST_LIMITS).await?;
 		let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == board.leaf.id()).unwrap();
-		let ownership = tx.propose_expiry_ownership(fact, &board.funding, view.captaind.height, Some(view.watchmand.height)).await?;
+		let ownership = tx.propose_expiry_ownership(fact, &board.funding, view.processed.height, Some(view.processed.height)).await?;
 		assert!(matches!(ownership.disposition, OwnershipDisposition::Customer { .. }));
 		let payee = match tx.derived_expiry_owner(&ownership).await? {
 			Attribution::Owned { mailbox_pk, spk } => VerifiedPayee { mailbox: mailbox_pk, script: spk },
@@ -373,7 +367,7 @@ async fn dust_hold_ends_at_deadline() {
 		let second = dust_decision_ready(&db, &other, view).await;
 		let frontier = first.dust_candidates().into_iter().chain(second.dust_candidates()).collect::<Vec<_>>();
 		let group = db.write(async |tx| tx.commit_expiry_group(view, vec![first], &frontier, &BTreeSet::new()).await).await.unwrap();
-		assert_eq!(group.is_some(), cap == 244 && watch == 244, "K uses the completed paired view only");
+		assert_eq!(group.is_some(), watch == 244, "K uses only watchmand's completed view");
 	}
 	let row = db.read(async |tx| Ok(tx.query_one("SELECT c.forfeited_sat,c.fee_sat,c.payout_sat FROM expiry_allocation_coin c \
 		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1", &[&small.leaf.id().to_string()]).await?)).await.unwrap();
@@ -546,4 +540,69 @@ async fn expiry_fence_releases_only_operator_shares_of_conflicted_allocations() 
 		VALUES($1,$2,repeat('0',66),'key','script','customer',10000,1000,9000,0,FALSE,'{}')",
 		&[&customer, &entitlement]).await?)).await.unwrap();
 	assert!(fenced().await, "a customer entitlement stays fenced after a conflict");
+}
+
+#[tokio::test]
+async fn invalidation_before_decision_lock_refuses_stale_decision() {
+	let (_ctx, db) = test_db("invalidation_before_decision_lock").await;
+	let view = dust_decision_view(&db, 104, 104).await;
+	db.write(async |tx| tx.invalidate_expiry_chain().await).await.unwrap();
+	let error = db.write(async |tx| tx.lock_valid_expiry_view(view).await).await.unwrap_err();
+	assert!(format!("{error:#}").contains("expiry view is invalidated or differs from the completed view"));
+	assert!(db.read(async |tx| tx.expiry_view().await).await.unwrap().is_none());
+	let generation = db.read(async |tx| Ok(tx.query_one("SELECT generation FROM expiry_chain_view WHERE id=1", &[])
+		.await?.get::<_, i64>(0))).await.unwrap();
+	assert!(generation > view.generation);
+	let error = db.write(async |tx| tx.complete_expiry_sync(view.generation, view.processed).await).await.unwrap_err();
+	assert!(format!("{error:#}").contains("expiry generation or processed tip changed before sync completion"),
+		"an older completed cycle cannot clear a newer invalidation");
+}
+
+#[tokio::test]
+async fn invalidation_waits_for_held_decision_lock() {
+	let (_ctx, db) = test_db("invalidation_waits_for_decision_lock").await;
+	let view = dust_decision_view(&db, 104, 104).await;
+	let (held, entered) = tokio::sync::oneshot::channel();
+	let release = std::sync::Arc::new(tokio::sync::Notify::new());
+	let release_decision = release.clone();
+	let decision_db = db.clone();
+	let decision = tokio::spawn(async move {
+		decision_db.write(async |tx| {
+			tx.lock_valid_expiry_view(view).await?;
+			let pid = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get::<_, i32>(0);
+			held.send(pid).unwrap();
+			release_decision.notified().await;
+			tx.lock_valid_expiry_view(view).await?;
+			Ok(())
+		}).await
+	});
+	let blocker = entered.await.unwrap();
+	let (attempted, invalidator) = tokio::sync::oneshot::channel();
+	let invalidation_db = db.clone();
+	let invalidation = tokio::spawn(async move {
+		invalidation_db.write(async |tx| {
+			let row = tx.query_one("SELECT pid,backend_start FROM pg_stat_activity WHERE pid=pg_backend_pid()", &[]).await?;
+			attempted.send((row.get::<_, i32>(0), row.get::<_, chrono::DateTime<chrono::Utc>>(1))).unwrap();
+			tx.invalidate_expiry_chain().await
+		}).await
+	});
+	let writer = invalidator.await.unwrap();
+	tokio::time::timeout(std::time::Duration::from_secs(10), async {
+		loop {
+			let blocked = db.read(async |tx| {
+				tx.query_one("SELECT pg_stat_clear_snapshot()", &[]).await?;
+				Ok(tx.query_one("SELECT COUNT(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid \
+					WHERE a.pid=$1 AND a.backend_start=$2 AND NOT l.granted AND $3=ANY(pg_blocking_pids(a.pid))",
+					&[&writer.0, &writer.1, &blocker]).await?.get::<_, i64>(0))
+			}).await.unwrap();
+			if blocked == 1 { break; }
+			tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		}
+	}).await.expect("invalidation did not wait on the actual held shared decision lock");
+	assert!(!invalidation.is_finished());
+	assert_eq!(db.read(async |tx| tx.expiry_view().await).await.unwrap(), Some(view));
+	release.notify_one();
+	decision.await.unwrap().unwrap();
+	invalidation.await.unwrap().unwrap();
+	assert!(db.read(async |tx| tx.expiry_view().await).await.unwrap().is_none());
 }

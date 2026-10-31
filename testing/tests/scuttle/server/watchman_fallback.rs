@@ -91,10 +91,10 @@ pub(super) async fn watchman_sweeps_boards() {
 					AND irreversible_facts->>'operator'='true' AND irreversible_facts->>'participation_id'=$2",
 					&[&original.id().to_string(), &participation]).await?.is_some();
 				if !authorized { return Ok(false); }
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip
-					&& view.captaind.hash == hash && view.watchmand.hash == hash
-					&& tx.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip
+					&& view.processed.hash == hash
+					&& tx.expiry_view_is_current(view).await?)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -362,10 +362,10 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 					WHERE e.vtxo_id=ANY($1) AND c.active", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
 				if allocated != expected_sources { return Ok(false); }
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip
-					&& view.captaind.hash == hash && view.watchmand.hash == hash
-					&& tx.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip
+					&& view.processed.hash == hash
+					&& tx.expiry_view_is_current(view).await?)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -780,10 +780,10 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 					WHERE e.vtxo_id=ANY($1) AND c.active", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
 				if allocated != expected_sources { return Ok(false); }
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip
-					&& view.captaind.hash == tip_hash && view.watchmand.hash == tip_hash
-					&& tx.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip
+					&& view.processed.hash == tip_hash
+					&& tx.expiry_view_is_current(view).await?)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -1174,9 +1174,9 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 					WHERE e.vtxo_id=ANY($1) AND c.active", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
 				if allocated != expected_sources { return Ok(false); }
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip
-					&& view.captaind.hash == hash && view.watchmand.hash == hash && tx.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip
+					&& view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -1663,9 +1663,9 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 					WHERE e.vtxo_id=ANY($1) AND c.active", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
 				if allocated != expected { return Ok(false); }
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip
-					&& view.captaind.hash == blockhash && view.watchmand.hash == blockhash)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip
+					&& view.processed.hash == blockhash)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -1673,10 +1673,10 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 		wm.trigger_sweep().await;
 		loop {
 			let rebuilt = db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip
-					&& view.captaind.hash == blockhash && view.watchmand.hash == blockhash
-					&& tx.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip
+					&& view.processed.hash == blockhash
+					&& tx.expiry_view_is_current(view).await?)
 			}).await.unwrap();
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
@@ -2041,9 +2041,8 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 		let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
 		loop {
 			if db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip && view.captaind.hash == hash
-					&& view.watchmand.hash == hash && tx.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip && view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -2128,9 +2127,8 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 						WHERE e.vtxo_id=ANY($1) AND c.active", &[&source_ids]).await?
 						.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
 					if allocated != expected.keys().cloned().collect::<BTreeSet<_>>() { return Ok(false); }
-					let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-					Ok(view.captaind.height == tip && view.watchmand.height == tip && view.captaind.hash == hash
-						&& view.watchmand.hash == hash && tx.expiry_view_is_rebuilt(view).await?)
+					let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+					Ok(view.processed.height == tip && view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
 				}).await.unwrap() { break; }
 			}
 			tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2553,9 +2551,9 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 			let ready = db.read(async |tx| {
 				let allocated = tx.query("SELECT e.vtxo_id FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 					WHERE e.vtxo_id=ANY($1) AND c.active", &[&operator_ids]).await?.into_iter().map(|row| row.get::<_, String>(0)).collect::<BTreeSet<_>>();
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(allocated == operator_ids.iter().cloned().collect() && view.captaind.height == tip && view.watchmand.height == tip
-					&& view.captaind.hash == hash && view.watchmand.hash == hash)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(allocated == operator_ids.iter().cloned().collect() && view.processed.height == tip
+					&& view.processed.hash == hash)
 			}).await.unwrap();
 			if ready && sponsors.keys().all(|point| core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().is_some_and(|output| output.confirmations >= 6)) {
 				let owned = watchman_confirmed_outpoints(wm).await;
@@ -2578,9 +2576,9 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 				if let Some(previous) = packages.insert(row.get::<_, i64>("id"), package.clone()) { assert_eq!(previous, package); }
 			}
 			let rebuilt = db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip && view.captaind.hash == hash && view.watchmand.hash == hash
-					&& tx.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip && view.processed.hash == hash
+					&& tx.expiry_view_is_current(view).await?)
 			}).await.unwrap();
 			if rebuilt && seen == operator_ids.iter().cloned().collect() && packages.values().all(|(parent, child, _)|
 				core.get_raw_transaction(&parent.compute_txid(), None).ok().as_ref() == Some(parent)
@@ -2881,9 +2879,9 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 			}
 			loop {
 				if db.read(async |tx| {
-					let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-					Ok(view.captaind.height == tip && view.watchmand.height == tip
-						&& view.captaind.hash == hash && view.watchmand.hash == hash && tx.expiry_view_is_rebuilt(view).await?)
+					let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+					Ok(view.processed.height == tip
+						&& view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
 				}).await.unwrap() { break; }
 				tokio::time::sleep(Duration::from_millis(50)).await;
 			}
@@ -3177,14 +3175,14 @@ async fn sweep_offboard_forfeit(captaind_down: bool) {
 		assert_eq!(client.get_block_count().unwrap(), u64::from(tip.to_u32()));
 		let hash = client.get_block_hash(u64::from(tip.to_u32())).unwrap();
 		if captaind_down {
-			assert!(db.read(async |tx| tx.expiry_rebuild_token().await).await.unwrap().is_none(),
+			assert!(db.read(async |tx| tx.expiry_view().await).await.unwrap().is_none(),
 				"stopped captaind must leave the customer view unavailable");
 		} else {
 			loop {
 				if db.read(async |tx| {
-					let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-					Ok(view.captaind.height == tip && view.watchmand.height == tip
-						&& view.captaind.hash == hash && view.watchmand.hash == hash && tx.expiry_view_is_rebuilt(view).await?)
+					let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+					Ok(view.processed.height == tip
+						&& view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
 				}).await.unwrap() { break; }
 				tokio::time::sleep(Duration::from_millis(50)).await;
 			}
@@ -3598,9 +3596,9 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 		let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
 		loop {
 			if db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip
-					&& view.captaind.hash == hash && view.watchmand.hash == hash && tx.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip
+					&& view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -3709,9 +3707,8 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 					if coin.id() == padding.id() { assert_eq!(facts["kind"], "padding"); }
 				}
 				if db.read(async |tx| {
-					let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-					Ok(view.captaind.height == tip && view.watchmand.height == tip && view.captaind.hash == hash
-						&& view.watchmand.hash == hash && tx.expiry_view_is_rebuilt(view).await?)
+					let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+					Ok(view.processed.height == tip && view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
 				}).await.unwrap() { break; }
 			}
 			tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4160,8 +4157,8 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE e.vtxo_id=ANY($1) AND c.active",
 				&[&source_ids]).await?.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>())).await.unwrap();
 			let synced = db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip && view.captaind.hash == hash && view.watchmand.hash == hash)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip && view.processed.hash == hash)
 			}).await.unwrap();
 			let owned = watchman_confirmed_outpoints(wm).await;
 			if allocated == source_ids.iter().cloned().collect() && synced && sponsors.keys().all(|point| owned.contains(point)) { break; }
@@ -4189,9 +4186,8 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 				if let Some(previous) = packages.insert(row.get::<_, i64>("id"), package.clone()) { assert_eq!(previous, package); }
 			}
 			let rebuilt = db.read(async |tx| {
-				let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-				Ok(view.captaind.height == tip && view.watchmand.height == tip && view.captaind.hash == hash
-					&& view.watchmand.hash == hash && tx.expiry_view_is_rebuilt(view).await?)
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip && view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
 			}).await.unwrap();
 			if rebuilt && seen == source_ids.iter().cloned().collect() && packages.values().all(|(parent, child, _)|
 				core.get_raw_transaction(&parent.compute_txid(), None).ok().as_ref() == Some(parent)
@@ -4924,10 +4920,10 @@ pub(super) async fn expiry_same_owner_fragments(name: &str, small_first: bool) {
 		tokio::time::timeout(Duration::from_secs(10), async {
 			loop {
 				let ready = db.read(async |tx| {
-					let Some(view) = tx.expiry_rebuild_token().await? else { return Ok(false); };
-					Ok(view.captaind.height == tip && view.watchmand.height == tip
-						&& view.captaind.hash == hash && view.watchmand.hash == hash
-						&& tx.expiry_view_is_rebuilt(view).await?)
+					let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+					Ok(view.processed.height == tip
+						&& view.processed.hash == hash
+						&& tx.expiry_view_is_current(view).await?)
 				}).await.unwrap();
 				if ready { break; }
 				tokio::time::sleep(Duration::from_millis(50)).await;

@@ -30,21 +30,13 @@ CREATE TABLE expiry_chain_view (
 	id SMALLINT PRIMARY KEY CHECK (id = 1),
 	generation BIGINT NOT NULL DEFAULT 0 CHECK (generation >= 0),
 	invalid BOOLEAN NOT NULL DEFAULT TRUE,
-	rebuilt_captaind_height BIGINT,
-	rebuilt_captaind_hash TEXT,
-	rebuilt_watchmand_height BIGINT,
-	rebuilt_watchmand_hash TEXT
+	processed_height BIGINT CHECK (processed_height >= 0),
+	processed_hash TEXT,
+	CHECK ((processed_height IS NULL) = (processed_hash IS NULL))
 );
 INSERT INTO expiry_chain_view (id) VALUES (1);
 
-CREATE TABLE expiry_sync_ack (
-	process TEXT PRIMARY KEY CHECK (process IN ('captaind', 'watchmand')),
-	generation BIGINT NOT NULL,
-	height BIGINT NOT NULL,
-	hash TEXT NOT NULL
-);
-
--- Financial decisions are immutable; active links and chain results are rebuilt.
+-- Financial decisions are immutable; active links follow canonical watchmand observations.
 CREATE TABLE expiry_allocation (
 	id BIGSERIAL PRIMARY KEY,
 	expiry_height INTEGER NOT NULL CHECK (expiry_height >= 0),

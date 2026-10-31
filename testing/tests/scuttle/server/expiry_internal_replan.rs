@@ -233,10 +233,10 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 					let hash = ctx.bitcoind().sync_client().get_block_hash(u64::from(tip.to_u32())).unwrap();
 					loop {
 						let rebuilt = db.read(async |t| {
-							let Some(view) = t.expiry_rebuild_token().await? else { return Ok(false); };
-							if view.captaind.height != tip || view.watchmand.height != tip
-								|| view.captaind.hash != hash || view.watchmand.hash != hash
-								|| !t.expiry_view_is_rebuilt(view).await? { return Ok(false); }
+							let Some(view) = t.expiry_view().await? else { return Ok(false); };
+							if view.processed.height != tip
+								|| view.processed.hash != hash
+								|| !t.expiry_view_is_current(view).await? { return Ok(false); }
 							// The completed chain view does not mean captaind's separate
 							// readiness worker has committed both refund obligations yet.
 							// Reserve the original shared root before allowing its sweep.
