@@ -331,10 +331,15 @@ impl LightningManager {
 		// and gets no row. The deadlines are computed here, before anything is
 		// stored, so a payment we cannot make leaves nothing behind.
 		let mut new_xpay = if sub.is_none() {
+			// A lagging CLN must not enlarge the route's budget beyond the
+			// processed server tip or the height already bound to this attempt.
+			let server_tip = self.db.read(async |t| t.get_highest_block(database::BlockTable::Captaind).await)
+				.await?.map(|block| block.height).unwrap_or(attempt_block_height);
+			let tip = BlockHeight::new(tip).max(server_tip).max(attempt_block_height);
 			// NB: we don't want a lightning payment to take more time than the
 			// htlc-send expiry leaves us with.
 			let max_cltv_expiry_delta = htlc_send_expiry_height
-				.checked_blocks_since(BlockHeight::new(tip) + self.htlc_expiry_delta)
+				.checked_blocks_since(tip + self.htlc_expiry_delta)
 				.context("HTLC expiry height is too soon to perform a lightning payment")?;
 			let max_cltv_expiry_delta = BlockDelta::try_from(max_cltv_expiry_delta)
 				.unwrap_or(BlockDelta::MAX);
@@ -342,7 +347,7 @@ impl LightningManager {
 			// The absolute form of the relative deadlines the xpay call takes.
 			let attempt_expiry = Local::now() + TimeDelta::from_std(retry_for)
 				.context("retry_for does not fit in a timestamp")?;
-			let htlc_expiry = BlockHeight::new(tip) + max_cltv_expiry_delta;
+			let htlc_expiry = tip + max_cltv_expiry_delta;
 
 			Some((max_cltv_expiry_delta, NewClnXpay {
 				lightning_node_id: node.id,

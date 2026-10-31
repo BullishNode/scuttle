@@ -5,6 +5,7 @@ use ark::lightning::{PaymentHash, Preimage};
 use ark::{ProtocolEncoding, Vtxo, VtxoId, VtxoPolicy};
 use ark::vtxo::{Full, TapScriptClause};
 use ark_testing::{btc, sat, TestContext};
+use ark_testing::context::LightningPaymentSetup;
 use bitcoin::consensus::deserialize;
 use bitcoin::Transaction;
 use bitcoin_ext::{BlockDelta, BlockHeight};
@@ -107,10 +108,19 @@ pub(super) async fn assert_grants_reclaimed(ctx: &TestContext, db: &Db, grants: 
 	}
 }
 
-async fn failed_external_payout(no_channel: bool) {
-	let name = if no_channel { "server/expiry_no_part_external_offline_owner" } else { "server/expiry_failed_external_offline_owner" };
+async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
+	let name = if lagging_cln { "server/maxdelay_uses_server_tip_when_cln_lags" }
+		else if no_channel { "server/expiry_no_part_external_offline_owner" }
+		else { "server/expiry_failed_external_offline_owner" };
 	let ctx = TestContext::new(name).await;
-	let lightning = if no_channel { ctx.new_lightning_setup_no_channel("lightningd").await }
+	let lightning = if lagging_cln {
+		let internal = ctx.lightningd("lightningd_internal").own_bitcoind().create().await;
+		let external = ctx.lightningd("lightningd_external").create().await;
+		ctx.fund_lightning(&internal, btc(12)).await;
+		let height = ctx.generate_blocks(6).await;
+		internal.wait_for_block(height).await;
+		LightningPaymentSetup { internal, external }
+	} else if no_channel { ctx.new_lightning_setup_no_channel("lightningd").await }
 		else { ctx.new_lightning_setup("lightningd").await };
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).no_vtxo_pool()
 		.funded(btc(10)).cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(400)).watchmand().create().await;
@@ -143,6 +153,21 @@ async fn failed_external_payout(no_channel: bool) {
 	client.register_vtxo_transactions_with_server(&leaves).await.unwrap();
 	let id = leaves[0].id();
 	lightning.sync().await;
+	let lagged_tip = if lagging_cln {
+		// This is a genuine older native chain view, not a fake getinfo
+		// response. RPC stays available on the existing authenticated node.
+		assert!(!lightning.internal.bitcoind().sync_client()
+			.call::<bool>("setnetworkactive", &[serde_json::json!(false)]).unwrap());
+		let native_tip = lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner().blockheight;
+		// Use the primary directly: the normal all-node barrier must not wait
+		// for the deliberately disconnected secondary until it is restored.
+		ctx.bitcoind().generate(1).await;
+		let server_tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+		srv.wait_for_sync_height(server_tip).await;
+		assert!(server_tip.to_u32() > native_tip);
+		assert_eq!(lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner().blockheight, native_tip);
+		Some((native_tip, server_tip))
+	} else { None };
 	let dispatched_invoice = invoice.clone();
 	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 90_000, htlc_vtxo_ids: vec![id.to_bytes().to_vec()],
@@ -207,6 +232,20 @@ async fn failed_external_payout(no_channel: bool) {
 		let node = bitcoin::secp256k1::PublicKey::from_slice(&info.id).unwrap();
 		assert_eq!(receipt["node_pubkey"], node.to_string());
 		assert_eq!(row.get::<_, Vec<u8>>("pubkey"), info.id);
+		if let Some((native_tip, server_tip)) = lagged_tip {
+			assert_eq!(info.blockheight, native_tip);
+			let maxdelay = receipt["request"]["maxdelay"].as_u64().unwrap();
+			let recorded_deadline = receipt["original_htlc_expiry"].as_u64().unwrap();
+			assert!(u64::from(server_tip.to_u32()) + maxdelay <= recorded_deadline);
+			assert!(u64::from(native_tip) + maxdelay < recorded_deadline,
+				"a genuinely lagging native tip must not enlarge the relative delay");
+		}
+	}
+	if lagging_cln {
+		assert!(lightning.internal.bitcoind().sync_client()
+			.call::<bool>("setnetworkactive", &[serde_json::json!(true)]).unwrap());
+		ctx.await_block_count_sync().await;
+		lightning.internal.wait_for_block_sync().await;
 	}
 	drop(client);
 	let fee_address = srv.watchmand().wait_wallet_address().await;
@@ -244,12 +283,17 @@ async fn failed_external_payout(no_channel: bool) {
 
 #[tokio::test]
 async fn expiry_actual_failed_external_send_pays_offline_owner() {
-	failed_external_payout(false).await;
+	failed_external_payout(false, false).await;
 }
 
 #[tokio::test]
 async fn expiry_actual_no_part_external_send_pays_offline_owner() {
-	failed_external_payout(true).await;
+	failed_external_payout(true, false).await;
+}
+
+#[tokio::test]
+async fn maxdelay_uses_server_tip_when_cln_lags() {
+	failed_external_payout(true, true).await;
 }
 
 /// Internal setup timeout closes a receive that never granted

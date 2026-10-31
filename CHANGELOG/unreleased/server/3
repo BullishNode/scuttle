@@ -4,6 +4,9 @@
   A fresh native NoRoute reply can fail its exact call after the qualified CLN
   version acknowledges persistent slow mode; the reply and failure commit
   together. Lost replies and unqualified errors remain unresolved.
+  Bound route delay by the higher native or recorded server height and apply
+  the existing retry time plus buffer as the RPC deadline. A timed-out RPC
+  releases its waiter while native reconciliation retains the payment.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
 - Resume an intra-Ark receive after its sender already settled.
   A restart between the sender and receive commits no longer retries a cancelled
