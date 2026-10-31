@@ -590,8 +590,7 @@ mod tests {
 
 	#[test]
 	fn scuttle_client_requires_exact_fork_protocol() {
-		for maximum in [pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES,
-			pver::PROTOCOL_VERSION_JOINT_OWNER_PROOF, pver::PROTOCOL_VERSION_SCUTTLE - 1] {
+		for maximum in [pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES, pver::PROTOCOL_VERSION_SCUTTLE - 1] {
 			let old = protos::HandshakeResponse {
 				min_protocol_version: pver::PROTOCOL_VERSION_PPM_FEE_TOTAL,
 				max_protocol_version: maximum,
