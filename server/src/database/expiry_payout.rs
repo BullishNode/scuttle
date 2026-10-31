@@ -509,8 +509,8 @@ impl Tx<'_> {
 	pub async fn lock_unallocated_watchman_inputs(&self, ids: &[ark::VtxoId]) -> anyhow::Result<()> {
 		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
-		// Physical reservations survive while pending/confirmed. A conflicted
-		// operator-only decision does not permanently forbid signed recovery.
+		// Physical reservations survive while pending/confirmed. An operator
+		// entitlement stays reserved until all its allocations have conflicted.
 		// Customer entitlements remain irreversible even across a conflict;
 		// the off-chain obligation guard retains its separate stronger fence.
 		if let Some(row) = self.query_opt("SELECT vtxo_id FROM ( \
@@ -518,6 +518,9 @@ impl Tx<'_> {
 				WHERE i.vtxo_id=ANY($1) AND a.status<>'conflicted' \
 			UNION SELECT e.vtxo_id FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1) AND ( \
 				e.irreversible_facts ? 'customer_key' \
+				OR NOT EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id) \
+				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation a ON a.id=c.allocation_id \
+					WHERE c.entitlement_id=e.id AND a.status<>'conflicted') \
 				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND c.disposition='customer') \
 				OR EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id))) fenced \
 			ORDER BY vtxo_id LIMIT 1", &[&ids]).await? {

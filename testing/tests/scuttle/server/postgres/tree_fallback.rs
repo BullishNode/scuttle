@@ -72,18 +72,30 @@ async fn customer_births_record_their_owners_once() {
 	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
 		&[&rollback.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 
-	// Model an accepted pre-shadow record by omitting only its shadow key.
-	// Later genuine authorization must not turn a replay into a new birth.
+	// An unbound customer birth is refused before either row is stored.
+	// Genuine authorization then admits the birth; replay preserves it.
 	let prior = ServerVtxo::from(VTXO_VECTORS.arkoor3_vtxo.clone());
 	let key = VTXO_VECTORS.arkoor3_user_key;
+	db.write(async |tx| Ok(tx.execute("DELETE FROM owner_key WHERE user_pubkey=$1",
+		&[&key.public_key().to_string()]).await?)).await.unwrap();
+	let error = db.write(async |tx| tx.execute_vtxo_tree_update(
+		VtxoTreeUpdate::new().insert_spendable_vtxos([prior.clone()])).await).await.unwrap_err();
+	assert!(error.is::<OwnershipRefusal>(), "{error:#}");
+	assert!(db.read(async |tx| tx.try_get_bare_vtxo_by_id(prior.id()).await).await.unwrap().is_none());
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
+		&[&prior.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 	db.write(async |tx| {
-		tx.execute("DELETE FROM owner_key WHERE user_pubkey=$1", &[&key.public_key().to_string()]).await?;
-		tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([prior.clone()])).await?;
 		let link = OwnerLink::new_joint(Network::Regtest, server.public_key(), server, &key)?;
+		tx.verify_owner_link(server, key.public_key(), &link, Network::Regtest).await?;
+		assert_eq!(tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([prior.clone()])).await?, 1);
+		let original_xmin = tx.query_one("SELECT xmin::TEXT FROM coin_owner WHERE vtxo_id=$1",
+			&[&prior.id().to_string()]).await?.get::<_, String>(0);
 		tx.verify_owner_link(server, key.public_key(), &link, Network::Regtest).await?;
 		assert_eq!(tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([prior.clone()])).await?, 0);
 		assert_eq!(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
-			&[&prior.id().to_string()]).await?.get::<_, i64>(0), 0);
+			&[&prior.id().to_string()]).await?.get::<_, i64>(0), 1);
+		assert_eq!(tx.query_one("SELECT xmin::TEXT FROM coin_owner WHERE vtxo_id=$1",
+			&[&prior.id().to_string()]).await?.get::<_, String>(0), original_xmin);
 		Ok(())
 	}).await.unwrap();
 }
@@ -482,4 +494,56 @@ async fn conflicted_allocation_input_can_be_split() {
 		&[board.root.id()], std::iter::once(&output), None).await).await.unwrap_err();
 	assert!(format!("{offchain:#}").contains(&format!("vtxo {} is reserved for expiry recovery", board.root.id())),
 		"conflicted progress is not permission to spend off chain: {offchain:#}");
+}
+
+#[tokio::test]
+async fn expiry_fence_releases_only_operator_shares_of_conflicted_allocations() {
+	let (_ctx, db) = test_db("expiry_fence_conflicted_operator_share").await;
+	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
+	let id = coin.id();
+	let vtxo_id = id.to_string();
+	db.write(async |tx| tx.execute_vtxo_tree_update(
+		VtxoTreeUpdate::new().insert_spendable_vtxos([coin.clone()])).await).await.unwrap();
+	// The watchman claim and progress paths use this fence.
+	let fenced = async || match db.write(async |tx| tx.lock_unallocated_watchman_inputs(&[id]).await).await {
+		Ok(()) => false,
+		Err(error) => {
+			assert!(error.is::<server::FallbackRefusal>(), "{error:#}");
+			true
+		},
+	};
+	let new_allocation = async |status: &'static str| db.write(async |tx| Ok(tx.query_one(
+		"INSERT INTO expiry_allocation(expiry_height,status) VALUES(100,$1) RETURNING id", &[&status],
+	).await?.get::<_, i64>(0))).await.unwrap();
+	let conflict = async |allocation: i64| db.write(async |tx| Ok(tx.execute(
+		"UPDATE expiry_allocation SET status='conflicted' WHERE id=$1", &[&allocation],
+	).await?)).await.unwrap();
+	assert!(!fenced().await, "an undecided coin is not fenced");
+
+	let entitlement = db.write(async |tx| Ok(tx.query_one(
+		"INSERT INTO expiry_entitlement(vtxo_id,gross_sat) VALUES($1,10000) RETURNING id", &[&vtxo_id],
+	).await?.get::<_, i64>(0))).await.unwrap();
+	assert!(fenced().await, "an entitlement without an allocation stays fenced");
+
+	let operator = new_allocation("pending").await;
+	db.write(async |tx| Ok(tx.execute("INSERT INTO expiry_allocation_coin(allocation_id,entitlement_id,\
+		disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,active,evidence) \
+		VALUES($1,$2,'operator',10000,0,0,0,TRUE,'{}')", &[&operator, &entitlement]).await?)).await.unwrap();
+	assert!(fenced().await, "a live operator decision is fenced");
+	conflict(operator).await;
+	assert!(!fenced().await, "an operator share of a conflicted allocation reserves nothing");
+
+	let spending = new_allocation("pending").await;
+	db.write(async |tx| Ok(tx.execute("INSERT INTO expiry_allocation_input(allocation_id,vtxo_id) VALUES($1,$2)",
+		&[&spending, &vtxo_id]).await?)).await.unwrap();
+	assert!(fenced().await, "the input of a pending allocation is fenced");
+	conflict(spending).await;
+	assert!(!fenced().await, "the input of a conflicted allocation is not");
+
+	let customer = new_allocation("conflicted").await;
+	db.write(async |tx| Ok(tx.execute("INSERT INTO expiry_allocation_coin(allocation_id,entitlement_id,\
+		owner_mailbox,user_pubkey,spk,disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,active,evidence) \
+		VALUES($1,$2,repeat('0',66),'key','script','customer',10000,1000,9000,0,FALSE,'{}')",
+		&[&customer, &entitlement]).await?)).await.unwrap();
+	assert!(fenced().await, "a customer entitlement stays fenced after a conflict");
 }

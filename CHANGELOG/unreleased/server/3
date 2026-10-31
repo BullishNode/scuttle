@@ -50,3 +50,15 @@
   stays held. Conflicted operator reservations no longer permanently block that
   progress, while customer and off-chain fences remain protected.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Keep operator entitlements reserved until all associated allocations conflict.
+  The watchman can then recover operator-only outputs without relaxing ordinary
+  off-chain or customer fences. Entitlements without an allocation stay held.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Abandon a round instead of stopping captaind when an expiry decision takes
+  one of its inputs before the funding transaction is signed.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Log an error on each node check while an offline Lightning node has open
+  external payments or receives. Their unresolved obligations stay open.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+  - **BREAKING:** Remove the unimplemented `FailLightningAttempt` and duplicate
+    `ScopedPaymentStatus` calls. Use `CheckLightningPayment` for payment status.

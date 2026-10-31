@@ -1,7 +1,7 @@
 # Fallback payouts for expired VTXOs
 
-This fork pays the bitcoin of an expired customer VTXO to an on-chain address
-of its owner. Upstream Bark lets the Ark server keep it. `docs/scuttle-protocol.md`
+Scuttle pays eligible expired customer VTXOs on-chain after it can establish
+who is owed them. Unresolved obligations stay held. `docs/scuttle-protocol.md`
 describes the client contract. This page describes the operator side.
 
 ## Ownership and payout address
@@ -11,8 +11,13 @@ recipient address carries a proof signed by the VTXO key and by the mailbox
 key, in address delivery type `0x03`. The server checks both signatures once
 and stores the binding. A VTXO without a valid proof is refused.
 
-The payout goes to the BIP86 address of the mailbox key `M`: `tr(M)` with an
-empty script tree. A wallet that derives `M` as the first key of its BIP86
+The economic stage selects the entitled spending key before the server resolves
+its mailbox. An unfinished transfer can still owe its input owner; a collected
+forwarded receive owes its committed claim destination. Birth ownership alone
+does not select the payee in these cases.
+
+The payout goes to the BIP86 address of that mailbox key `M`: `tr(M)` with an
+empty script tree. A wallet that derives `M` at external index zero of its BIP86
 account sees the payout as an ordinary receive.
 
 ## Stores and protocol
@@ -28,17 +33,20 @@ wallet through its wallet admin RPC. The watchman pays each payout in an
 immutable parent transaction with no fee. Its wallet pays the fee in a separate
 child transaction. Without confirmed fee funds, payouts stay pending.
 
-Payouts that share a script and an expiry height pay a total fee of the larger
-of 1,000 sats and 1%, rounded up. A VTXO whose share is below the dust limit of
-its script can wait up to 144 blocks after expiry for another ready VTXO with
-the same payout script, so the two can share one output. After that, the dust
-amount is forfeited and the other VTXOs are paid.
+Payouts in one allocation group that share a script and an expiry height pay a
+total fee of the larger of 1,000 sats and 1%, rounded up. Size limits can create
+several groups. An otherwise ready VTXO whose share is below its script's dust
+limit can wait up to 144 blocks after expiry for another ready VTXO with the same
+script and expiry. The dust policy then applies. This deadline does not release
+an unresolved payment, ownership or integrity hold.
 
 ## Holds
 
 The server holds a VTXO when it cannot yet decide who is owed it, for example
-while a Lightning payment is unresolved. A held VTXO stays spendable,
-refreshable and exitable by its owner. The server never sweeps it.
+while a Lightning payment is unresolved. An undecided hold does not itself block
+ordinary spending, refresh or emergency exit. Existing Lightning and round
+restrictions still apply. A committed fallback claim is already fenced
+off-chain and must wait for its canonical payout or terminal forfeiture.
 
 - Run `captaind rpc expiry-holds` to list held VTXOs and the reason for each.
 - Monitor the `expiry_holds` gauge.
@@ -54,7 +62,12 @@ Keep matching subdaemons and plugins.
 
 ## Wallet behaviour
 
-A VTXO with a committed payout shows as fallback pending and cannot be spent
-off-chain. The payout itself arrives at the BIP86 address of the mailbox key,
-so the bitcoin wallet of that account finds it, also after a restore from the
-seed. Keep wallet backups and the mailbox key.
+A VTXO with a committed payout shows as fallback pending. The wallet requires
+six canonical confirmations and checks the actual payout script and value
+before it retires the claim. A reorg returns the claim to pending.
+
+The default wallet's seed phrase recovers its BIP86 mailbox account. An
+application that supplies an external mailbox must back up its original key,
+network, account, passphrase and discovery policy. The protocol does not prove
+that backup. Ordinary spent reports retain upstream server trust; a false
+ordinary-spent report can hide a still-valid claim. Keep wallet backups.
