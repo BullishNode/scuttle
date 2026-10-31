@@ -22,6 +22,12 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 		.boarded(sat(100_000)).create().await;
 	let coin = wallet.spendable_vtxos().await.unwrap().remove(0);
 	let original = wallet.get_full_vtxo(coin.id()).await.unwrap();
+	// Start the real exit before the commitment is discovered, but publish
+	// nothing. The later receipt must fence this existing abortable lifecycle.
+	wallet.exit_mgr().start_exit_for_vtxos(&[coin.vtxo.clone()]).await.unwrap();
+	let initial_exit = wallet.exit_mgr().get_exit_vtxo(coin.id()).await.unwrap().state().clone();
+	assert!(initial_exit.is_cancelable());
+	let exit_txids = original.transactions().map(|step| step.tx.compute_txid()).collect::<std::collections::BTreeSet<_>>();
 	let registration = wallet.fallback_script();
 	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let height = ctx.bitcoind().get_block_count().await as u32;
@@ -50,6 +56,14 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 	assert!(wallet.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
 	assert!(wallet.exit_mgr().start_exit_for_vtxos(&[coin.vtxo.clone()]).await.is_err());
 	assert!(wallet.lock_vtxos([coin.id()], None).await.is_err());
+	for _ in 0..2 {
+		wallet.sync_exits().await.unwrap();
+		let _ = wallet.progress_exits().await.unwrap();
+		assert!(wallet.exit_mgr().exits_needing_cpfp().await.is_empty());
+		assert_eq!(*wallet.exit_mgr().get_exit_vtxo(coin.id()).await.unwrap().state(), initial_exit);
+		assert!(ctx.bitcoind().sync_client().get_raw_mempool().unwrap().iter().all(|txid| !exit_txids.contains(txid)),
+			"learning a commitment must not publish the already-started exit");
+	}
 	let pending = wallet.history().await.unwrap();
 	assert!(pending.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
 		.all(|movement| movement.status != bark::movement::MovementStatus::Successful));

@@ -163,6 +163,12 @@ impl ExitVtxo {
 		}
 
 		let vtxo = self.get_vtxo(&*wallet.inner.db).await?;
+		let receipts = wallet.inner.db.get_fallback_receipts().await
+			.map_err(|error| ExitError::InvalidWalletState { error: error.to_string() })?;
+		if crate::exit::fallback_blocks_abortable_exit(&self.state, self.id(), &receipts)
+			&& vtxo.state.kind() != crate::vtxo::VtxoStateKind::Spent {
+			return Err(ExitError::InvalidWalletState { error: "a committed fallback source cannot progress an abortable exit".into() });
+		}
 		const MAX_ITERATIONS: usize = 100;
 		for _ in 0..MAX_ITERATIONS {
 			let mut context = ProgressContext {
