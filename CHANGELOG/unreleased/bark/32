@@ -1,6 +1,0 @@
-- Register fallback destinations and track expired customer payouts
-  Verify canonical payouts, keep validated unpaid claims pending, and scope
-  payment outcomes to their actual inputs. Ordinary spends use upstream trust.
-  [#32](https://github.com/BullishNode/abandon-ship-bark/pull/32), [#33](https://github.com/BullishNode/abandon-ship-bark/pull/33), [#45](https://github.com/BullishNode/abandon-ship-bark/pull/45), [#46](https://github.com/BullishNode/abandon-ship-bark/pull/46), [#50](https://github.com/BullishNode/abandon-ship-bark/pull/50)
-  - **BREAKING:** Supply `OpenWalletArgs.fallback_spk`; custom persisters need fallback storage, atomic holder retirement and witness updates that preserve coin identity.
-  - **BREAKING:** Use fresh stores, signed recipient addresses and protocol version 6. Registration precedes mailbox use.
