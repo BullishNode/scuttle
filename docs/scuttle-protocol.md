@@ -9,8 +9,7 @@ for change. A request's submitting wallet does not determine the output's owner.
 The registration programme is removed. Fresh matched server and wallet stores
 use one atomic Scuttle initializer alongside the unchanged upstream migration
 history. Registration-shaped or incompatible stores are refused before writes;
-keep their original software and data. Source implementation is distinct from
-executed native qualification and release approval.
+keep their original software and data.
 
 ## Wire contract
 

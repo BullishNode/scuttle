@@ -542,8 +542,8 @@ impl Server {
 			// Commit the durable alarm/hold without releasing any funds, then
 			// return the refusal outside this transaction.
 			if unknown { return Ok(true); }
-			// Retain the conservative hash gate until the disjoint-source
-			// replacement has passed its real native release controls.
+			// Also refuse when the hash settled through any other source. That
+			// keeps such a source held instead of refunding it cooperatively.
 			t.ensure_not_settled(payment_hash).await?;
 			owner_links.verify_package(t, &builder, self.mailbox_key.leak_ref(), self.config.network).await?;
 			crate::database::expiry_guard::guard_obligation_changes(t, &htlc_vtxo_ids).await?;

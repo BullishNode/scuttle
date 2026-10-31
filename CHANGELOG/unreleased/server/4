@@ -1,0 +1,16 @@
+- Release the expiry fence on operator shares of conflicted allocations.
+  After a backing conflict, the watchman can again claim an exposed leaf
+  the operator is owed, so a paid Lightning sender cannot also reclaim it.
+  Customer entitlements stay fenced.
+  [#4](https://github.com/BullishNode/scuttle/pull/4)
+- Abandon a round instead of stopping captaind when an expiry decision
+  takes one of its inputs while the round collects signatures.
+  [#4](https://github.com/BullishNode/scuttle/pull/4)
+- Remove expiry holds of coins that left the expiry inventory. The gauge and
+  `captaind rpc expiry-holds` show only coins that still wait for a decision.
+  [#4](https://github.com/BullishNode/scuttle/pull/4)
+- Log an error on every node check while an offline Lightning node has open
+  payments or receives. They stay open until the node is back.
+  [#4](https://github.com/BullishNode/scuttle/pull/4)
+  - **BREAKING:** `ScuttleService` no longer has `FailLightningAttempt` or
+    `ScopedPaymentStatus`. Use `CheckLightningPayment` for payment status.

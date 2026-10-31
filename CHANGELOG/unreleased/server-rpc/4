@@ -1,0 +1,5 @@
+- Remove the retired protocol 6 and 7 constants and the operator calls
+  that had no behaviour of their own.
+  [#4](https://github.com/BullishNode/scuttle/pull/4)
+  - **BREAKING:** `PROTOCOL_VERSION_OWNER_PROOF`, `PROTOCOL_VERSION_JOINT_OWNER_PROOF`,
+    `FailLightningAttempt` and `ScopedPaymentStatus` are removed.
