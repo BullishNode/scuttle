@@ -73,8 +73,18 @@ pub(super) async fn await_decision(ctx: &TestContext, srv: &captaind::Captaind, 
 
 #[tokio::test]
 async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
+	unseen_paid_mailbox(false).await;
+}
+
+#[tokio::test]
+async fn status_first_spent_recovery_keeps_fallback_history_stable() {
+	unseen_paid_mailbox(true).await;
+}
+
+async fn unseen_paid_mailbox(recover_spent_first: bool) {
 	require_bitcoind_chain_source!();
-	let ctx = TestContext::new("bark_sdk/full_sync_unseen_paid_mailbox").await;
+	let ctx = TestContext::new(if recover_spent_first { "bark_sdk/status_first_spent_recovery" }
+		else { "bark_sdk/full_sync_unseen_paid_mailbox" }).await;
 	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| {
 		cfg.vtxo_lifetime = BlockDelta::new(24);
 		cfg.vtxo_exit_delta = BlockDelta::new(3);
@@ -163,7 +173,28 @@ async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
 	for id in &ids { assert!(local.get_wallet_vtxo(*id).await.unwrap().is_none()); }
 	let returned = reopen(&ctx, "recipient", &srv).await;
 	assert!(returned.history().await.unwrap().is_empty());
-	returned.sync().await;
+	let status_history = if recover_spent_first {
+		// Discover the real N6 receipts before recovery returns historical
+		// Spent bodies. Neither operation adopts earlier Ark principal.
+		returned.sync_fallback_payouts().await.unwrap();
+		for id in &ids { assert!(local.get_wallet_vtxo(*id).await.unwrap().is_none()); }
+		let history = returned.history().await.unwrap();
+		assert_eq!(history.len(), 2);
+		assert!(history.iter().all(|movement| movement.subsystem.name == "scuttle.fallback"
+			&& movement.status == bark::movement::MovementStatus::Successful
+			&& movement.intended_balance == bitcoin::SignedAmount::ZERO
+			&& movement.effective_balance == bitcoin::SignedAmount::ZERO
+			&& movement.input_vtxos.is_empty() && movement.output_vtxos.is_empty()));
+		let report = returned.recover_vtxos(ids.iter().copied(), None).await.unwrap();
+		assert!(report.is_complete());
+		assert!(report.recovered().is_empty());
+		assert_eq!(report.skipped().ids().collect::<BTreeSet<_>>(), ids.iter().copied().collect());
+		assert_eq!(returned.history().await.unwrap(), history);
+		Some(history)
+	} else {
+		returned.sync().await;
+		None
+	};
 	for coin in &coins {
 		assert_eq!(local.get_wallet_vtxo(coin.vtxo_id).await.unwrap().unwrap().state, VtxoState::Spent);
 		assert_eq!(returned.get_full_vtxo(coin.vtxo_id).await.unwrap().serialize(), coin.vtxo.serialize());
@@ -171,23 +202,37 @@ async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
 	assert!(returned.spendable_vtxos().await.unwrap().is_empty());
 	assert_eq!(returned.balance().await.unwrap().total(), sat(0));
 	let history = returned.history().await.unwrap();
-	assert_eq!(history.len(), 4);
+	assert_eq!(history.len(), if recover_spent_first { 2 } else { 4 });
 	let incoming = history.iter().filter(|movement| movement.subsystem.name == "bark.arkoor").collect::<Vec<_>>();
-	assert_eq!(incoming.len(), 2);
+	assert_eq!(incoming.len(), if recover_spent_first { 0 } else { 2 });
 	assert!(incoming.iter().all(|movement| movement.status == bark::movement::MovementStatus::Successful
 		&& movement.input_vtxos.is_empty() && movement.offchain_fee == sat(0)));
 	let receipts = history.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback").collect::<Vec<_>>();
 	assert_eq!(receipts.len(), 2);
 	assert!(receipts.iter().all(|movement| movement.status == bark::movement::MovementStatus::Successful));
 	assert_eq!(receipts.iter().map(|movement| movement.offchain_fee).sum::<bitcoin::Amount>(), sat(1_000));
-	assert_eq!(receipts.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(), -20_000);
+	assert_eq!(receipts.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(),
+		if recover_spent_first { 0 } else { -20_000 });
 	assert_eq!(history.iter().flat_map(|movement| movement.output_vtxos.iter().copied()).collect::<BTreeSet<_>>(),
-		ids.iter().copied().collect());
+		if recover_spent_first { BTreeSet::new() } else { ids.iter().copied().collect() });
 	assert_eq!(history.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(), 0);
 	for _ in 0..2 {
-		returned.sync().await;
+		if recover_spent_first { returned.sync_fallback_payouts().await.unwrap(); } else { returned.sync().await; }
 		assert_eq!(returned.history().await.unwrap(), history);
 		assert_eq!(returned.balance().await.unwrap().total(), sat(0));
+	}
+	if let Some(status_history) = status_history {
+		assert_eq!(history, status_history);
+		returned.stop_daemon_wait().await.unwrap();
+		drop(returned);
+		let returned = reopen(&ctx, "recipient", &srv).await;
+		returned.sync_fallback_payouts().await.unwrap();
+		assert_eq!(returned.history().await.unwrap(), status_history);
+		assert_eq!(returned.balance().await.unwrap().total(), sat(0));
+		for coin in &coins {
+			assert_eq!(local.get_wallet_vtxo(coin.vtxo_id).await.unwrap().unwrap().state, VtxoState::Spent);
+			assert_eq!(returned.get_full_vtxo(coin.vtxo_id).await.unwrap().serialize(), coin.vtxo.serialize());
+		}
 	}
 }
 

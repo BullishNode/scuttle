@@ -7,6 +7,7 @@
 - Track explicit fallback receipts and their stage-selected source aliases.
   Paid receipts require six canonical confirmations; reorgs restore pending
   principal without inventing a Lightning outcome or duplicate movement.
+  Recovered spent bodies alone do not create an Ark retirement debit.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
   - **BREAKING:** Registration, `fallback_spk` and the inferred fallback snapshot
     API are removed; use `fallback_script` and `fallback_receipts`.
