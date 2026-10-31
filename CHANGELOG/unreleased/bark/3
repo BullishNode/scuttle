@@ -10,3 +10,7 @@
   [#3](https://github.com/BullishNode/scuttle/pull/3)
   - **BREAKING:** Registration, `fallback_spk` and the inferred fallback snapshot
     API are removed; use `fallback_script` and `fallback_receipts`.
+- Keep a transfer refused for fallback separate from successful delivery.
+  Exact input-owner receipts preserve the signed checkpoint until canonical
+  retirement, without adding a second successful debit to payment history.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)

@@ -568,8 +568,9 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 	gate.release.notify_one();
 	let owner = match owner {
 		Some(owner) => {
-			tokio::time::timeout(Duration::from_secs(15), payment.expect("live send driver"))
-				.await.unwrap().unwrap().unwrap();
+			let error = tokio::time::timeout(Duration::from_secs(15), payment.expect("live send driver"))
+				.await.unwrap().unwrap().unwrap_err();
+			assert_eq!(bark::FallbackRefusal::from_error(&error), Some(bark::FallbackRefusal::DecidedForFallback));
 			owner
 		},
 		None => {
@@ -577,11 +578,19 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 			assert_eq!(serde_json::to_vec(&owner.pending_arkoor_sends().await.unwrap()).unwrap(), checkpoint,
 				"reopen must load the exact signed checkpoint without caller-supplied bodies");
 			owner.sync_pending_arkoor_sends().await.unwrap();
-			assert!(owner.pending_arkoor_sends().await.unwrap().is_empty());
 			owner
 		},
 	};
 	owner.sync().await;
+	assert_eq!(serde_json::to_vec(&owner.pending_arkoor_sends().await.unwrap()).unwrap(), checkpoint,
+		"an unfunded committed claim retains the complete original signed Registration checkpoint");
+	let sends = owner.history().await.unwrap().into_iter().filter(|movement| movement.subsystem.name == "bark.arkoor")
+		.collect::<Vec<_>>();
+	assert_eq!(sends.len(), 1);
+	assert_eq!(sends[0].status, bark::movement::MovementStatus::Failed);
+	assert_eq!(sends[0].intended_balance, bitcoin::SignedAmount::from_sat(-60_000));
+	assert_eq!(sends[0].effective_balance, bitcoin::SignedAmount::ZERO,
+		"the input-owner commitment did not transfer 60k to the provisional recipient");
 	let mut rpc = srv.get_public_rpc().await;
 	let mut queries = Vec::new();
 	for coin in &leaves {
@@ -654,12 +663,26 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 	ctx.generate_blocks(6).await;
 	owner.chain().invalidate_caches().await;
 	owner.sync_fallback_payouts().await.unwrap();
+	owner.sync_pending_arkoor_sends().await.unwrap();
+	assert!(owner.pending_arkoor_sends().await.unwrap().is_empty(),
+		"actual canonical retirement permits removal of the protected checkpoint");
 	for change in &changes {
 		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Spent);
 		assert!(super::fallback_receipt_ids(local.get_fallback_receipts().await.unwrap(), true).contains(&change.id()));
 	}
 	assert_eq!(owner.balance().await.unwrap().awaiting_settlement, sat(0));
 	assert_eq!(owner.balance().await.unwrap().total(), sat(0));
+	let history = owner.history().await.unwrap();
+	assert_eq!(history.iter().map(|movement| movement.effective_balance).sum::<bitcoin::SignedAmount>(), bitcoin::SignedAmount::ZERO,
+		"one 100k board and one 100k fallback retirement conserve the wallet history");
+	let sends = history.iter().filter(|movement| movement.subsystem.name == "bark.arkoor").collect::<Vec<_>>();
+	assert_eq!(sends.len(), 1);
+	assert_eq!(sends[0].status, bark::movement::MovementStatus::Failed);
+	assert_eq!(sends[0].effective_balance, bitcoin::SignedAmount::ZERO);
+	let history = serde_json::to_value(history).unwrap();
+	owner.sync_pending_arkoor_sends().await.unwrap();
+	owner.sync_fallback_payouts().await.unwrap();
+	assert_eq!(serde_json::to_value(owner.history().await.unwrap()).unwrap(), history);
 	let (index, _) = payout.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination && output.value == sat(99_000)).unwrap();
 	let output = ctx.bitcoind().sync_client().get_tx_out(&payout.compute_txid(), index as u32, Some(true)).unwrap().unwrap();
 	assert!(output.confirmations >= 6);
