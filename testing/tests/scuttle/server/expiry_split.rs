@@ -92,6 +92,10 @@ async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
 	assert!(db.read(async |t| t.list_expiry_holds().await).await.unwrap().iter()
 		.any(|hold| hold.vtxo_id == root.id() && hold.reason == "output_requires_split"));
 	ctx.bitcoind().await_transaction(input.point().txid).await;
+	assert!(ctx.bitcoind().sync_client().get_tx_out(&root.point().txid, root.point().vout, Some(true)).unwrap().is_none());
+	// A mempool prefix makes gettxout unavailable before frontier confirmation.
+	// Preserve that real transient reason until the exact prefix confirms.
+	db.write(async |t| t.record_expiry_hold(root.id(), "backing_output_unavailable").await).await.unwrap();
 	// Confirm the board exit, then allow the configured watchtower grace
 	// period to pass. Waiting in wall-clock time cannot advance this policy.
 	ctx.generate_blocks(1 + srv.watchmand().config().watchman.progress_grace_period.to_u32()).await;
@@ -101,6 +105,11 @@ async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
 	srv.watchmand().wait_for_sync_height(progressed).await;
 	assert!(!db.read(async |t| t.list_expiry_holds().await).await.unwrap().iter()
 		.any(|hold| hold.vtxo_id == root.id()), "a confirmed matching prefix resolves its old physical-parent split hold");
+	for reason in ["output_requires_split", "backing_output_unavailable", "output_preparation_failed", "anchor_preparation_failed"] {
+		db.write(async |t| t.record_expiry_hold(root.id(), reason).await).await.unwrap();
+	}
+	assert!(!db.read(async |t| t.list_expiry_holds().await).await.unwrap().iter()
+		.any(|hold| hold.vtxo_id == root.id()), "late observations cannot recreate a completed prefix hold");
 	let first = payout(&db, ordinary).await;
 	assert_eq!(ctx.bitcoind().await_transaction(first.compute_txid()).await, first);
 	let backing = first.input.iter().map(|i| ark::VtxoId::from(i.previous_output)).collect::<Vec<_>>();

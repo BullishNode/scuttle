@@ -24,7 +24,8 @@ impl Tx<'_> {
 			.map(|row| row.get::<_, String>(0));
 		let recorded = self.query_opt("INSERT INTO expiry_hold(vtxo_id,reason) \
 			SELECT v.vtxo_id,$2 FROM vtxo v WHERE v.vtxo_id=$1 \
-			AND ($2<>'output_requires_split' OR NOT EXISTS(SELECT 1 FROM expiry_split_request r \
+			AND ($2 NOT IN ('output_requires_split','backing_output_unavailable','output_preparation_failed','anchor_preparation_failed') \
+				OR NOT EXISTS(SELECT 1 FROM expiry_split_request r \
 				WHERE r.vtxo_id=v.vtxo_id AND r.progress_txid=v.onchain_spent_txid AND v.onchain_spent_height IS NOT NULL)) \
 			AND NOT EXISTS(SELECT 1 FROM expiry_allocation_input i JOIN expiry_allocation a ON a.id=i.allocation_id \
 				WHERE i.vtxo_id=v.vtxo_id AND a.status<>'conflicted') \
@@ -53,7 +54,8 @@ impl Tx<'_> {
 		self.query_opt("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 FOR UPDATE", &[&id.to_string()]).await?;
 		if self.query_opt("DELETE FROM expiry_hold h USING expiry_split_request r \
 			WHERE h.vtxo_id=r.vtxo_id AND r.vtxo_id=$1 AND r.progress_txid=$2 \
-			AND h.reason='output_requires_split' RETURNING h.vtxo_id", &[&id.to_string(), &txid.to_string()]).await?.is_some() {
+			AND h.reason IN ('output_requires_split','backing_output_unavailable','output_preparation_failed','anchor_preparation_failed') \
+			RETURNING h.vtxo_id", &[&id.to_string(), &txid.to_string()]).await?.is_some() {
 			slog!(ExpiryHoldDecision, vtxo_id: id);
 		}
 		Ok(())
