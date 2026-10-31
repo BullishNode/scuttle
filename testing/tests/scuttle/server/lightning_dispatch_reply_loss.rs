@@ -677,6 +677,65 @@ struct QueuedNativeLogs {
 }
 
 #[cfg(target_os = "linux")]
+impl QueuedNativeLogs {
+	fn observe(&mut self, line: &str, endpoints: &str) {
+		let text = line.trim_end_matches(['\r', '\n']);
+		let mut matched = false;
+		if let Some((prefix, route)) = text.split_once(": getroutes from ") {
+			if prefix.contains("xpay:") && route == endpoints {
+				if let Some(id) = prefix.split_whitespace().last().and_then(|id| id.parse::<u64>().ok()) {
+					self.payments.insert(id); matched = true;
+				}
+			}
+		}
+		if let Some((prefix, state)) = text.split_once(": getroutes_done: ") {
+			if prefix.contains("xpay:") {
+				if let Some(id) = prefix.split_whitespace().last().and_then(|id| id.parse::<u64>().ok()) {
+					// "ignoring" means its original command already ended; it
+					// cannot establish the unresolved-A concurrency target.
+					if state == "continuing" { self.continuing.insert(id); }
+					matched = true;
+				}
+			}
+		}
+		if let Some((prefix, _)) = text.split_once(": Too many running at once (0 vs 0): waiting") {
+			// Only the quoted native command ID counts, never "notify msg info".
+			if let Some((_, command)) = prefix.rsplit_once("askrene: ") {
+				if serde_json::from_str::<String>(command).is_ok_and(|id| !id.is_empty()) {
+					self.queued.insert(command.to_owned()); matched = true;
+				}
+			}
+		}
+		if matched { self.lines.push(line.to_owned()); }
+	}
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn queued_native_logs_require_command_ids_and_trim_line_endings() {
+	// Original native R1 stdout framing, including its trailing newline and
+	// duplicate notification. These public IDs are observation fixtures only.
+	let endpoints = "039c1d700620ab6b2ebcbabc8822fb71fb6cd43fbcf2a93786c20901cbed4f09b9 to 033880c72bb7c7c399f295b619684cf6dc4268e50ff077edf790e65af43a64625c";
+	let route = format!("2026-10-31T17:39:01.135Z DEBUG   plugin-cln-xpay: 1: getroutes from {endpoints}\n");
+	let notification = "2026-10-31T17:39:01.135Z DEBUG   plugin-cln-askrene: notify msg info: Too many running at once (0 vs 0): waiting\n";
+	let command = "\"1/cln:xpay#238/cln-xpay:getroutes#13/cln:getroutes#240\"";
+	let queued = format!("2026-10-31T17:39:01.135Z DEBUG   plugin-cln-askrene: {command}: Too many running at once (0 vs 0): waiting\n");
+	let mut logs = QueuedNativeLogs::default();
+	logs.observe(&route, endpoints);
+	assert_eq!(logs.payments, BTreeSet::from([1]));
+	logs.observe(notification, endpoints);
+	assert!(logs.queued.is_empty(), "a forwarded notification is not a second native command");
+	logs.observe(&queued, endpoints);
+	assert_eq!(logs.queued, BTreeSet::from([command.to_owned()]));
+	logs.observe("2026-10-31T17:39:01.135Z DEBUG   plugin-cln-xpay: notify msg debug: getroutes_done: continuing\n", endpoints);
+	logs.observe("2026-10-31T17:39:01.135Z DEBUG   plugin-cln-xpay: 2: getroutes_done: ignoring\n", endpoints);
+	assert!(logs.continuing.is_empty(), "neither a notification nor an ended command proves active A");
+	logs.observe("2026-10-31T17:39:01.135Z DEBUG   plugin-cln-xpay: 1: getroutes_done: continuing\r\n", endpoints);
+	assert_eq!(logs.continuing, BTreeSet::from([1]));
+	assert_eq!(&logs.lines[..2], &[route, queued], "retained raw evidence must keep its line endings");
+}
+
+#[cfg(target_os = "linux")]
 struct QueuedNativeRouting {
 	logs: Arc<Mutex<QueuedNativeLogs>>,
 	probe: cln_rpc::GetroutesRequest,
@@ -712,33 +771,7 @@ async fn queue_native_routing(node: &Lightningd, recipient: &Lightningd) -> anyh
 	let observed = logs.clone();
 	let endpoints = format!("{} to {}", source.to_lower_hex_string(), destination.to_lower_hex_string());
 	node.add_stdout_handler(move |line: &str| {
-		let mut logs = observed.lock().unwrap();
-		let mut matched = false;
-		if let Some((prefix, route)) = line.split_once(": getroutes from ") {
-			if prefix.contains("xpay:") && route == endpoints {
-				if let Some(id) = prefix.split_whitespace().last().and_then(|id| id.parse::<u64>().ok()) {
-					logs.payments.insert(id); matched = true;
-				}
-			}
-		}
-		if let Some((prefix, state)) = line.split_once(": getroutes_done: ") {
-			if prefix.contains("xpay:") {
-				if let Some(id) = prefix.split_whitespace().last().and_then(|id| id.parse::<u64>().ok()) {
-					// "ignoring" means its original command already ended; it
-					// cannot establish the unresolved-A concurrency target.
-					if state == "continuing" { logs.continuing.insert(id); }
-					matched = true;
-				}
-			}
-		}
-		if let Some((prefix, _)) = line.split_once(": Too many running at once (0 vs 0): waiting") {
-			// Askrene logs both its own command and a forwarded notification.
-			// Count only its native command ID, never the Xpay notification.
-			if let Some((_, command)) = prefix.rsplit_once("askrene: ") {
-				logs.queued.insert(command.to_owned()); matched = true;
-			}
-		}
-		if matched { logs.lines.push(line.to_owned()); }
+		observed.lock().unwrap().observe(line, &endpoints);
 		false
 	});
 	askrene_threads(node, 0).await?;
