@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bark::{OpenWalletArgs, Wallet, WalletSeed};
-use bark::import::ImportVtxoError;
+use bark::{ImportVtxoError, OpenWalletArgs, Wallet, WalletSeed};
 use bark::onchain::OnchainWallet;
 use bark::persist::{BarkPersister, sqlite::SqliteClient};
 use bark::persist::adaptor::StorageAdaptorWrapper;
