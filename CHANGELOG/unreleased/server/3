@@ -9,6 +9,10 @@
   with its preimage. Missing or inconsistent provenance holds the affected funds
   instead of authorizing a refund or an operator payout from cached status.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Expose durable expiry hold reasons on the private operator listener and through
+  `captaind rpc expiry-holds`. Holds remain alarmed and counted until an actual
+  decision clears them; listing cannot change a payment or release held funds.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
 - Derive fallback payouts from admitted joint coin/mailbox bindings and the
   existing stage-entitlement rules. Authenticated mailbox receipts also discover
   provisional input-owner and unmaterialized recipient claims.

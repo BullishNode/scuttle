@@ -20,7 +20,7 @@ use ark::integration::{TokenStatus, TokenType};
 use ark::VtxoId;
 use server::{bitcoind as bcd, filters, Config, Server, CAPTAIND_CLI_API_KEY};
 use server::utils::block_duration;
-use server_rpc::{self as rpc, protos};
+use server_rpc::{self as rpc, protos, RequestExt};
 
 /// Defaults to our default port on localhost.
 const DEFAULT_ADMIN_RPC_ADDR: &str = "127.0.0.1:3536";
@@ -115,6 +115,9 @@ enum Command {
 
 #[derive(clap::Subcommand)]
 enum RpcCommand {
+	/// List unresolved expiry holds on the private operator listener.
+	#[command()]
+	ExpiryHolds,
 	/// Report server wallet status
 	#[command()]
 	Wallet,
@@ -683,6 +686,19 @@ async fn run_rpc(addr: &str, cmd: RpcCommand) -> anyhow::Result<()> {
 	debug!("Query admin rpc-endpoint at {}", endpoint);
 
 	match cmd {
+		RpcCommand::ExpiryHolds => {
+			let mut rpc = rpc::admin::ScuttleServiceClient::connect(endpoint)
+				.await.context("failed to connect to operator rpc")?;
+			let mut request = tonic::Request::new(protos::Empty {});
+			request.set_pver(rpc::pver::PROTOCOL_VERSION_SCUTTLE);
+			let response = rpc.list_expiry_holds(request).await?.into_inner();
+			let holds = response.holds.into_iter().map(|hold| Ok(serde_json::json!({
+				"vtxo_id": VtxoId::from_slice(&hold.vtxo_id)?.to_string(), "reason": hold.reason,
+				"first_seen": hold.first_seen, "last_seen": hold.last_seen,
+			}))).collect::<anyhow::Result<Vec<_>>>()?;
+			serde_json::to_writer_pretty(std::io::stdout(), &holds)?;
+			println!();
+		},
 		RpcCommand::Wallet => {
 			let mut rpc = rpc::admin::WalletAdminServiceClient::connect(endpoint)
 				.await.context("failed to connect to rpc")?;

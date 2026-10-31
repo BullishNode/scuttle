@@ -241,7 +241,13 @@ impl rpc::server::ScuttleService for Server {
 		&self, req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::scuttle::ListExpiryHoldsResponse>, tonic::Status> {
 		super::validate_scuttle_pver(&req)?;
-		Err(tonic::Status::unimplemented("expiry hold administration is not enabled"))
+		let holds = self.db.read(async |tx| tx.list_expiry_holds().await).await.to_status()?;
+		Ok(tonic::Response::new(protos::scuttle::ListExpiryHoldsResponse {
+			holds: holds.into_iter().map(|hold| protos::scuttle::ExpiryHold {
+				vtxo_id: hold.vtxo_id.to_bytes().to_vec(), reason: hold.reason,
+				first_seen: hold.first_seen.timestamp(), last_seen: hold.last_seen.timestamp(),
+			}).collect(),
+		}))
 	}
 
 	async fn fail_lightning_attempt(
