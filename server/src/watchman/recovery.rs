@@ -189,6 +189,9 @@ impl Watchman {
 					&i64::from(point.height),
 					&point.hash.to_string()
 				]).await?;
+				let source = t.query_one("SELECT vtxo_id FROM expiry_entitlement WHERE id=$1", &[id]).await?
+					.get::<_, String>(0).parse()?;
+				t.clear_expiry_hold(source).await?;
 			}
 			let duplicated = t.query_one("
 				SELECT EXISTS(SELECT 1

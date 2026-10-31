@@ -130,8 +130,7 @@ impl Tx<'_> {
 	}
 
 	pub(crate) async fn hold_settlement_integrity(&self, source: VtxoId, reason: &str) -> anyhow::Result<()> {
-		self.execute("INSERT INTO expiry_hold(vtxo_id,reason) VALUES($1,$2) \
-			ON CONFLICT(vtxo_id) DO UPDATE SET reason=EXCLUDED.reason,last_seen=NOW()", &[&source.to_string(), &reason]).await?;
+		self.record_expiry_hold(source, reason).await?;
 		tracing::error!(vtxo_id = %source, reason, "Settlement integrity is unresolved; holding principal");
 		Ok(())
 	}

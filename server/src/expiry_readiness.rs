@@ -53,14 +53,10 @@ impl Tx<'_> {
 			OwnershipDisposition::Customer { .. } => {
 				match self.derived_expiry_owner(&ownership).await? {
 					Attribution::Owned { mailbox_pk, spk } => {
-						self.execute("DELETE FROM expiry_hold WHERE vtxo_id=$1 AND reason=$2",
-							&[&ownership.id.to_string(), &"owner_binding_unresolved"]).await?;
 						Some(VerifiedPayee { mailbox: mailbox_pk, script: spk })
 					},
 					Attribution::Unresolved => {
-						self.execute("INSERT INTO expiry_hold (vtxo_id,reason) VALUES($1,$2)
-							ON CONFLICT(vtxo_id) DO UPDATE SET reason=excluded.reason,last_seen=NOW()",
-							&[&ownership.id.to_string(), &"owner_binding_unresolved"]).await?;
+						self.record_expiry_hold(ownership.id, "owner_binding_unresolved").await?;
 						warn!(vtxo_id = %ownership.id, "Expiry owner binding is missing or inconsistent; holding principal");
 						return Ok(PreparedCoin::Hold);
 					},
@@ -70,6 +66,8 @@ impl Tx<'_> {
 			OwnershipDisposition::Unresolved(reason) => {
 				if ownership.settlement_integrity_hold {
 					self.hold_settlement_integrity(ownership.id, reason).await?;
+				} else {
+					self.record_expiry_hold(ownership.id, reason).await?;
 				}
 				debug!(vtxo_id = %ownership.id, reason, "Expiry settlement remains unresolved");
 				return Ok(if ownership.needs_chain_progress {
@@ -93,6 +91,10 @@ impl Server {
 				match self.expiry_readiness_pass(cursor).await {
 					Ok(next) => cursor = next,
 					Err(error) => warn!("Expiry readiness pass failed; no incomplete payout authorized: {:#}", error),
+				}
+				match self.db.read(async |tx| tx.expiry_hold_count().await).await {
+					Ok(count) => crate::telemetry::set_expiry_hold_count(count),
+					Err(error) => warn!("Could not refresh expiry hold gauge: {error:#}"),
 				}
 				tokio::select! {
 					_ = self.rtmgr.shutdown_signal() => break,
@@ -149,9 +151,14 @@ impl Server {
 			if self.rtmgr.shutdown_requested() {
 				break;
 			}
+			let root_ids = roots.iter().map(|root| root.id()).collect::<Vec<_>>();
 			if let Err(error) = self.prepare_expiry_anchor(
 				view, anchor, roots, &mut ready, &mut prepared_bytes
 			).await {
+				self.db.write(async |tx| {
+					for id in &root_ids { tx.record_expiry_hold(*id, "anchor_preparation_failed").await?; }
+					Ok(())
+				}).await?;
 				warn!(%anchor, %error, "Expiry anchor remains unready; other anchors continue");
 			}
 		}
@@ -164,7 +171,10 @@ impl Server {
 					self.commit_ready_group(view, std::mem::take(&mut group)).await?;
 				}
 				if !ReadyOutput::group_fits(&[&output])? {
-					self.db.write(async |t| t.request_expiry_split(view, output.root()).await).await?;
+					self.db.write(async |t| {
+						t.record_expiry_hold(output.root().id(), "output_requires_split").await?;
+						t.request_expiry_split(view, output.root()).await
+					}).await?;
 				} else {
 					group.push(output);
 				}
@@ -232,6 +242,7 @@ impl Server {
 					return Ok(());
 				}
 				let Some(output) = self.bitcoind.try_get_tx_out(root.point(), true).await? else {
+					self.db.write(async |tx| tx.record_expiry_hold(root.id(), "backing_output_unavailable").await).await?;
 					return Ok(());
 				};
 				ensure!(output.confirmations > 0 && output.value == root.amount()
@@ -299,6 +310,7 @@ impl Server {
 				Ok::<_, anyhow::Error>(())
 			}.await;
 			if let Err(error) = result {
+				self.db.write(async |tx| tx.record_expiry_hold(root.id(), "output_preparation_failed").await).await?;
 				warn!(vtxo_id = %root.id(), %anchor, error = %format!("{error:#}"),
 					"Expiry output remains unready; siblings continue");
 			}

@@ -245,7 +245,10 @@ impl Tx<'_> {
 				let cancellations = output.coins.iter().flat_map(|c| c.ownership.cancellations.iter().copied()).collect::<Vec<_>>();
 				valid = self.cancel_expiry_participations(&cancellations).await?;
 			}
-			if valid { accepted.push(output); } else { dropped += 1; }
+			if valid { accepted.push(output); } else {
+				for coin in &output.coins { self.record_expiry_hold(coin.ownership.id, "decision_revalidation_changed").await?; }
+				dropped += 1;
+			}
 		}
 		if accepted.is_empty() { return Ok(None); }
 		let leaves = accepted.iter().flat_map(|o| &o.coins).filter_map(|c| c.payee.as_ref().map(|payee| CustomerLeaf {
@@ -292,12 +295,17 @@ impl Tx<'_> {
 				.into_iter().map(|r| r.get::<_, String>("anchor_point")).collect::<Vec<_>>();
 			loop {
 				let count = accepted.len();
+				let mut held = Vec::new();
 				accepted.retain(|o| {
 					let hold = undecided.contains(&o.root().chain_anchor().to_string())
 						&& o.coins.iter().any(|c| plan.forfeits.iter().any(|f| f.id == c.ownership.id));
-					if hold { dropped += 1; }
+					if hold {
+						dropped += 1;
+						held.extend(o.coins.iter().map(|coin| coin.ownership.id));
+					}
 					!hold
 				});
+				for id in held { self.record_expiry_hold(id, "dust_aggregation_pending").await?; }
 				if accepted.is_empty() { return Ok(None); }
 				if accepted.len() == count { break; }
 				let leaves = accepted.iter().flat_map(|o| &o.coins).filter_map(|c| c.payee.as_ref().map(|p| CustomerLeaf {
@@ -316,6 +324,7 @@ impl Tx<'_> {
 		}
 		for output in &accepted {
 			self.execute("INSERT INTO expiry_allocation_input(allocation_id,vtxo_id) VALUES($1,$2)", &[&id,&output.root().id().to_string()]).await?;
+			self.clear_expiry_hold(output.root().id()).await?;
 			for coin in &output.coins {
 				let proposal = &coin.ownership;
 				let evidence = proposal.evidence.as_ref().context("ready ownership lacks evidence")?;
@@ -378,6 +387,7 @@ impl Tx<'_> {
 						&observed.to_string()
 					]).await?;
 				self.execute("UPDATE vtxo SET spend_state='spent',updated_at=NOW() WHERE vtxo_id=$1", &[&proposal.id.to_string()]).await?;
+				self.clear_expiry_hold(proposal.id).await?;
 			}
 		}
 		let inputs = accepted.len();

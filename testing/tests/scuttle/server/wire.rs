@@ -1,6 +1,7 @@
 use bitcoin::secp256k1::{Keypair, rand::thread_rng};
 use server_rpc::{protos, RequestExt};
-use ark_testing::TestContext;
+use ark_testing::{sat, Captaind, TestContext};
+use server::database::Db;
 
 /// The fork epoch is required before operations, and operator methods are not public.
 #[tokio::test]
@@ -97,4 +98,56 @@ async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	let error = operator.scoped_payment_status(request).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::InvalidArgument);
 	assert!(!error.message().contains("pver"), "the same scoped handler validates the invalid hash after version admission");
+}
+
+/// Admin authority is the existing private listener/network boundary, as for
+/// wallet and nursery administration; no application credentials are claimed.
+#[tokio::test]
+async fn list_expiry_holds_requires_admin_auth() {
+	let ctx = TestContext::new("server/list_expiry_holds_requires_admin_auth").await;
+	let srv = ctx.captaind("server").no_vtxo_pool().create().await;
+	let wallet = ctx.bark_sdk("owner", &srv).funded(sat(200_000)).boarded(sat(100_000)).create().await;
+	let coin = wallet.spendable_vtxos().await.unwrap().remove(0);
+	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	// Explicit visibility/upsert metadata on a real owned board. The separate
+	// held_coin_is_listed_and_cleared_on_decision case drives a natural hold.
+	db.write(async |tx| tx.record_expiry_hold(coin.id(), "operator_visibility_control").await).await.unwrap();
+	let first = db.read(async |tx| tx.list_expiry_holds().await).await.unwrap();
+	assert_eq!(first.len(), 1);
+	db.write(async |tx| tx.record_expiry_hold(coin.id(), "operator_visibility_updated").await).await.unwrap();
+	let current = db.read(async |tx| tx.list_expiry_holds().await).await.unwrap();
+	assert_eq!(current.len(), 1);
+	assert_eq!(current[0].first_seen, first[0].first_seen);
+	assert!(current[0].last_seen >= first[0].last_seen);
+	let request = || {
+		let mut request = tonic::Request::new(protos::Empty {});
+		request.set_pver(server_rpc::pver::PROTOCOL_VERSION_SCUTTLE);
+		request
+	};
+	let mut public = server_rpc::admin::ScuttleServiceClient::connect(srv.ark_url()).await.unwrap();
+	assert_eq!(public.list_expiry_holds(request()).await.unwrap_err().code(), tonic::Code::Unimplemented);
+	let address = srv.config().rpc.admin_address.unwrap().to_string();
+	let mut admin = server_rpc::admin::ScuttleServiceClient::connect(format!("http://{address}")).await.unwrap();
+	assert_eq!(admin.list_expiry_holds(protos::Empty {}).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+	let mut old = tonic::Request::new(protos::Empty {});
+	old.set_pver(server_rpc::pver::PROTOCOL_VERSION_SCUTTLE - 1);
+	assert_eq!(admin.list_expiry_holds(old).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+	let listed = admin.list_expiry_holds(request()).await.unwrap().into_inner().holds;
+	assert_eq!(listed.len(), 1);
+	assert_eq!(listed[0].vtxo_id, coin.id().to_bytes().to_vec());
+	assert_eq!(listed[0].reason, "operator_visibility_updated");
+	assert!(listed[0].last_seen >= listed[0].first_seen && listed[0].first_seen > 0);
+	let output = Captaind::base_cmd().env("RUST_LOG", "off")
+		.args(["rpc", "--addr", &address, "expiry-holds"]).output().await.unwrap();
+	assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+	let cli: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+	assert_eq!(cli.as_array().unwrap().len(), 1);
+	assert_eq!(cli[0]["vtxo_id"], coin.id().to_string());
+	assert_eq!(cli[0]["reason"], "operator_visibility_updated");
+	let mut fail = tonic::Request::new(protos::scuttle::FailLightningAttemptRequest {
+		attempt_id: 0, reason: "listing must not enable a money override".into(),
+	});
+	fail.set_pver(server_rpc::pver::PROTOCOL_VERSION_SCUTTLE);
+	assert_eq!(admin.fail_lightning_attempt(fail).await.unwrap_err().code(), tonic::Code::Unimplemented);
+	assert_eq!(db.read(async |tx| tx.expiry_hold_count().await).await.unwrap(), 1);
 }

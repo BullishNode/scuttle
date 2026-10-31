@@ -5,13 +5,25 @@ use bitcoin_ext::{BlockDelta, BlockHeight};
 use server_rpc::protos;
 
 use ark_testing::{btc, sat, TestContext};
+use std::time::Duration;
 
 
 /// A registered grant is a real HTLC even when the sender never submits an
 /// external payment. The preimage settler has no timeout event for this case.
 #[tokio::test]
 async fn expiry_abandoned_registered_send_needs_no_client_refund() {
-	let ctx = TestContext::new("server/expiry_abandoned_registered_send").await;
+	abandoned_registered_send(false).await;
+}
+
+#[tokio::test]
+async fn held_coin_is_listed_and_cleared_on_decision() {
+	abandoned_registered_send(true).await;
+}
+
+async fn abandoned_registered_send(check_holds: bool) {
+	let name = if check_holds { "server/held_coin_is_listed_and_cleared_on_decision" }
+		else { "server/expiry_abandoned_registered_send" };
+	let ctx = TestContext::new(name).await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal)
 		.funded(btc(10)).cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24))
@@ -61,6 +73,19 @@ async fn expiry_abandoned_registered_send_needs_no_client_refund() {
 		fact, &funding, expired, Some(expired),
 	).await).await.unwrap();
 	assert!(matches!(pending.disposition, server::database::expiry_ownership::OwnershipDisposition::Unresolved(_)));
+	if check_holds {
+		tokio::time::timeout(Duration::from_secs(30), async {
+			loop {
+				let holds = db.read(async |tx| tx.list_expiry_holds().await).await.unwrap();
+				if let Some(hold) = holds.iter().find(|hold| hold.vtxo_id == htlc.id()) {
+					assert_eq!(hold.reason, "Lightning settlement pending");
+					assert!(hold.last_seen >= hold.first_seen);
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+		}).await.expect("the genuine unresolved source must have a durable hold before its deadline");
+	}
 	let tip = ctx.generate_blocks(deadline.to_u32() + 1 - expired.to_u32()).await;
 	srv.watchmand().wait_for_sync_height(tip).await;
 	let snapshot = db.read(async |t| t.backing_snapshot(&[root.clone()], limits).await).await.unwrap();
@@ -80,6 +105,22 @@ async fn expiry_abandoned_registered_send_needs_no_client_refund() {
 	// background allocation may already have recorded the spend fence.
 	let upstream = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, htlc.id()).await).await.unwrap().unwrap();
 	assert_eq!(upstream.htlc.resolution(), None);
+	if check_holds {
+		tokio::time::timeout(Duration::from_secs(30), async {
+			loop {
+				let decided = db.read(async |tx| Ok(tx.query_one("SELECT EXISTS(SELECT 1 FROM expiry_entitlement e \
+					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation a ON a.id=c.allocation_id \
+					WHERE e.vtxo_id=$1 AND c.active AND a.status<>'conflicted')", &[&htlc.id().to_string()]).await?
+					.get::<_, bool>(0))).await.unwrap();
+				if decided {
+					assert!(!db.read(async |tx| tx.list_expiry_holds().await).await.unwrap()
+						.iter().any(|hold| hold.vtxo_id == htlc.id()));
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+		}).await.expect("the ordinary matured-source decision must clear its hold atomically");
+	}
 }
 
 /// An issued refresh can be cancelled before its forfeit binds. The
