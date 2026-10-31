@@ -58,7 +58,7 @@ impl ArkoorSend {
 	/// checkpoint until the receipts actually retire every input on our chain.
 	async fn follow_fallback_registration(self, wallet: &Wallet) -> Advance<Self> {
 		match reconcile_fallback_registration(wallet, &self).await {
-			Ok(true) => Advance::Done,
+			Ok(true) => Advance::Failed(FallbackRefusal::DecidedForFallback.into()),
 			Ok(false) => Advance::Park { state: self, wake_after: None,
 				error: Some(FallbackRefusal::DecidedForFallback.into()) },
 			Err(error) => Advance::Park { state: self, wake_after: None, error: Some(error) },

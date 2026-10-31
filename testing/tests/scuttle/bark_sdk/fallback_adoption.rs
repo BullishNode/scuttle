@@ -450,22 +450,28 @@ impl captaind::proxy::ArkRpcProxy for HoldArkoorRegistration {
 
 #[tokio::test]
 async fn provisional_recipient_transfer_pays_input_owner() {
-	Box::pin(stalled_change(false, false)).await;
+	Box::pin(stalled_change(false, false, false)).await;
+}
+
+#[tokio::test]
+async fn already_confirmed_input_owner_refund_still_refuses_the_transfer() {
+	Box::pin(stalled_change(false, false, true)).await;
 }
 
 #[tokio::test]
 async fn stalled_arkoor_change_reopens_from_its_signed_registration_checkpoint() {
-	Box::pin(stalled_change(true, false)).await;
+	Box::pin(stalled_change(true, false, false)).await;
 }
 
 #[tokio::test]
 async fn trusted_pending_adoption_rejects_unsigned_arkoor_history() {
-	Box::pin(stalled_change(false, true)).await;
+	Box::pin(stalled_change(false, true, false)).await;
 }
 
-async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
+async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refund_before_release: bool) {
 	let name = if reopen_wallet { "bark_sdk/stalled_arkoor_change_reopen" }
 		else if check_unsigned_history { "bark_sdk/trusted_unsigned_arkoor_history" }
+		else if refund_before_release { "bark_sdk/stalled_arkoor_confirmed_refund" }
 		else { "bark_sdk/stalled_arkoor_change_pending" };
 	let ctx = TestContext::new(name).await;
 	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| {
@@ -565,6 +571,35 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 		drop(history);
 		drop(history_db);
 	}
+	let confirm_refund = async || {
+		ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
+		ctx.generate_blocks(2).await;
+		let payout = tokio::time::timeout(Duration::from_secs(30), async {
+			'payout: loop {
+				for txid in ctx.bitcoind().sync_client().get_raw_mempool().unwrap() {
+					let tx = ctx.bitcoind().await_transaction(txid).await;
+					if tx.output.iter().any(|output| output.script_pubkey == destination && output.value == sat(99_000)) { break 'payout tx; }
+				}
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+		}).await.expect("the retained input owner's real payout must become relayable after funding");
+		ctx.generate_blocks(6).await;
+		payout
+	};
+	let confirmed_payout = if refund_before_release {
+		let payout = confirm_refund().await;
+		tokio::time::timeout(Duration::from_secs(30), async {
+			loop {
+				let confirmed = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement e \
+					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id AND c.active \
+					JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) AND a.status='confirmed'",
+					&[&ids]).await?.get::<_, i64>(0))).await.unwrap();
+				if usize::try_from(confirmed).unwrap() == leaves.len() { break; }
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+		}).await.expect("the actual refund must be confirmed before releasing the original registration");
+		Some(payout)
+	} else { None };
 	gate.release.notify_one();
 	let owner = match owner {
 		Some(owner) => {
@@ -582,8 +617,15 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 		},
 	};
 	owner.sync().await;
-	assert_eq!(serde_json::to_vec(&owner.pending_arkoor_sends().await.unwrap()).unwrap(), checkpoint,
-		"an unfunded committed claim retains the complete original signed Registration checkpoint");
+	if refund_before_release {
+		assert!(owner.pending_arkoor_sends().await.unwrap().is_empty());
+	} else {
+		assert_eq!(serde_json::to_vec(&owner.pending_arkoor_sends().await.unwrap()).unwrap(), checkpoint,
+			"an unfunded committed claim retains the complete original signed Registration checkpoint");
+	}
+	let own_status = if refund_before_release { protos::VtxoSpendState::Spent } else { protos::VtxoSpendState::FallbackPending };
+	let own_state = if refund_before_release { VtxoState::Spent } else { VtxoState::Locked { holder: None } };
+	let pending_amount = if refund_before_release { sat(0) } else { sat(100_000) };
 	let sends = owner.history().await.unwrap().into_iter().filter(|movement| movement.subsystem.name == "bark.arkoor")
 		.collect::<Vec<_>>();
 	assert_eq!(sends.len(), 1);
@@ -602,13 +644,14 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 			vtxo_id: query.vtxo_id.clone(), attestation: query.attestation.clone(),
 		}).await.unwrap().into_inner().spend_state;
 		assert_eq!(state, if coin.user_pubkey() == recipient_key { protos::VtxoSpendState::Spent }
-			else { protos::VtxoSpendState::FallbackPending } as i32);
+			else { own_status } as i32);
 		queries.push(query);
 	}
 	let batch = rpc.get_vtxos_status_by_ids(protos::GetVtxosStatusByIdsRequest { vtxos: queries }).await.unwrap().into_inner();
 	assert!(batch.missing_vtxo_ids.is_empty());
 	assert_eq!(batch.vtxos.len(), leaves.len());
-	assert_eq!(batch.vtxos.iter().filter(|coin| coin.spend_state == protos::VtxoSpendState::FallbackPending as i32).count(), changes.len());
+	assert_eq!(batch.vtxos.iter().filter(|coin| coin.spend_state == protos::VtxoSpendState::FallbackPending as i32).count(),
+		if refund_before_release { 0 } else { changes.len() });
 	// Inspect xpub status separately from importing the server's unsigned body.
 	// Only the resumed action above supplies the change's signed path.
 	let seed = mnemonic(&ctx, "owner").await;
@@ -623,18 +666,19 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 	}).await.unwrap().into_inner();
 	for change in &changes {
 		assert_eq!(recovered.vtxos.iter().find(|entry| Vtxo::<Full>::deserialize(&entry.vtxo).unwrap().id() == change.id())
-			.unwrap().spend_state, protos::VtxoSpendState::FallbackPending as i32);
-		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
+			.unwrap().spend_state, own_status as i32);
+		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, own_state);
 	}
-	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
-	assert_eq!(owner.balance().await.unwrap().awaiting_settlement, sat(100_000));
-	assert_eq!(owner.balance().await.unwrap().total(), sat(100_000), "both provisional leaves remain owed to the original input owner, once");
+	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, own_state);
+	assert_eq!(owner.balance().await.unwrap().awaiting_settlement, pending_amount);
+	assert_eq!(owner.balance().await.unwrap().total(), pending_amount, "the original input is counted once until actual retirement");
 	assert!(owner.spendable_vtxos().await.unwrap().is_empty());
-	assert!(owner.awaiting_settlement_vtxos().await.unwrap().contains(&source.id()));
+	assert_eq!(owner.awaiting_settlement_vtxos().await.unwrap().contains(&source.id()), !refund_before_release);
 	let claims = owner.fallback_receipts().await.unwrap();
 	assert_eq!(claims.iter().map(|receipt| receipt.gross).sum::<bitcoin::Amount>(), source.amount());
 	assert!(claims.iter().all(|receipt| receipt.owner_mailbox == owner.mailbox_keypair().public_key()
 		&& receipt.source_vtxo_ids.contains(&source.id())));
+	assert!(claims.iter().all(|receipt| receipt.retired_block.is_some() == refund_before_release));
 	let mut cursor = None;
 	let mut paged = BTreeSet::new();
 	loop {
@@ -649,18 +693,7 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool) {
 	recipient.sync_fallback_payouts().await.unwrap();
 	assert!(recipient.fallback_receipts().await.unwrap().is_empty());
 	assert_eq!(recipient.balance().await.unwrap().total(), sat(0));
-	ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
-	ctx.generate_blocks(2).await;
-	let payout = tokio::time::timeout(Duration::from_secs(30), async {
-		'payout: loop {
-			for txid in ctx.bitcoind().sync_client().get_raw_mempool().unwrap() {
-				let tx = ctx.bitcoind().await_transaction(txid).await;
-				if tx.output.iter().any(|output| output.script_pubkey == destination && output.value == sat(99_000)) { break 'payout tx; }
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("the retained input owner's real payout must become relayable after funding");
-	ctx.generate_blocks(6).await;
+	let payout = match confirmed_payout { Some(payout) => payout, None => confirm_refund().await };
 	owner.chain().invalidate_caches().await;
 	owner.sync_fallback_payouts().await.unwrap();
 	owner.sync_pending_arkoor_sends().await.unwrap();
