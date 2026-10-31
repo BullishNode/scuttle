@@ -53,7 +53,7 @@ use ark::lightning::{Bolt12Invoice, Bolt12InvoiceExt, Invoice, Offer, PaymentHas
 use ark::mailbox::MailboxIdentifier;
 
 use crate::Server;
-use crate::ln::cln::{ClnNodeInfo, ClnNodeOnlineState, NodeHandle};
+use crate::ln::cln::{ClnNodeInfo, ClnNodeOnlineState, NodeHandle, unary_rpc};
 use crate::ln::cln::hold::ClnHoldConfig;
 use crate::ln::cln::xpay::ClnXpayConfig;
 use crate::ln::guard::PaymentGuards;
@@ -326,7 +326,7 @@ impl LightningManager {
 		let info = if sub.is_none() {
 			node.xpay.qualify_before_attempt().await.map_err(PaymentPreflightRefusal)?
 		} else {
-			node.rpc.clone().getinfo(cln_rpc::GetinfoRequest {}).await
+			unary_rpc(node.rpc.clone().getinfo(cln_rpc::GetinfoRequest {})).await
 				.context("failed to get info from rpc")?.into_inner()
 		};
 		let tip = info.blockheight;
@@ -720,9 +720,9 @@ impl LightningManager {
 			let mut hold_client = self.node_by_id(htlc_subscription.lightning_node_id)
 				.context("invoice cannot be settled: node is now offline")?
 				.hold_rpc.context("node doesn't support hold anymore")?;
-			if let Err(err) = hold_client.settle(hold_plugin::SettleRequest {
+			if let Err(err) = unary_rpc(hold_client.settle(hold_plugin::SettleRequest {
 				payment_preimage: preimage.to_vec(),
-			}).await {
+			})).await {
 				// The cooperative claim and the hold settler both settle on
 				// the same preimage, so one of them can find the HTLCs
 				// already gone. That is the outcome we wanted, not a failure.
@@ -883,11 +883,11 @@ async fn is_hold_invoice_paid(
 	hold_client: &mut hold_plugin::hold_client::HoldClient<tonic::transport::Channel>,
 	payment_hash: PaymentHash,
 ) -> anyhow::Result<bool> {
-	let res = hold_client.list(hold_plugin::ListRequest {
+	let res = unary_rpc(hold_client.list(hold_plugin::ListRequest {
 		constraint: Some(hold_plugin::list_request::Constraint::PaymentHash(
 			payment_hash.to_byte_array().to_vec(),
 		)),
-	}).await?.into_inner();
+	})).await?.into_inner();
 
 	Ok(res.invoices.iter().any(|i| i.state == hold_plugin::InvoiceState::Paid as i32))
 }

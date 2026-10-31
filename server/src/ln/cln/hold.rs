@@ -82,7 +82,7 @@ async fn fetch_accepted_payment_hashes(
 			hold::list_request::PaymentHashes { payment_hashes },
 		)),
 	};
-	let res = hold_client.list(req).await?.into_inner();
+	let res = super::unary_rpc(hold_client.list(req)).await?.into_inner();
 
 	let mut accepted = HashSet::new();
 	for inv in &res.invoices {
@@ -374,7 +374,7 @@ impl ClnHoldProcess {
 				payment_hash.to_byte_array().to_vec(),
 			)),
 		};
-		let res = hold_client.list(req).await?.into_inner();
+		let res = super::unary_rpc(hold_client.list(req)).await?.into_inner();
 
 		let accepted_invoice = match res.invoices.iter().find(|i| i.state == InvoiceState::Accepted as i32) {
 			Some(invoice) => invoice,
@@ -607,9 +607,9 @@ impl ClnHoldProcess {
 		htlc_subscription: &LightningHtlcSubscription,
 		reason: &str,
 	) -> anyhow::Result<()> {
-		hold_client.cancel(hold::CancelRequest {
+		super::unary_rpc(hold_client.cancel(hold::CancelRequest {
 			payment_hash: payment_hash.to_byte_array().to_vec(),
-		}).await?;
+		})).await?;
 
 		slog!(LightningReceiveCanceled,
 			payment_hash: htlc_subscription.payment_hash,

@@ -259,7 +259,7 @@ impl ClnXpayClient {
 		// stored error, mirror, empty lookup or monitor invocation cannot.
 		let no_route = if result.as_ref().err().and_then(native_xpay_error_code) == Some(205)
 			&& first_dispatch_only(&qualified.record) {
-			match rpc.getinfo(cln_rpc::GetinfoRequest {}).await {
+			match super::unary_rpc(rpc.getinfo(cln_rpc::GetinfoRequest {})).await {
 				Ok(info) => if qualified.same_node(&info.into_inner()) {
 					Some(qualified.finish(result.as_ref().unwrap_err()))
 				} else {
@@ -335,11 +335,11 @@ impl ClnXpayClient {
 	async fn qualify_node(&self, rpc: &mut ClnGrpcClient)
 		-> anyhow::Result<(cln_rpc::GetinfoResponse, cln_rpc::SetconfigResponse)>
 	{
-		let info = rpc.getinfo(cln_rpc::GetinfoRequest {}).await?.into_inner();
+		let info = super::unary_rpc(rpc.getinfo(cln_rpc::GetinfoRequest {})).await?.into_inner();
 		ensure!(qualified_node(&info, self.node_pubkey, self.network), "unqualified xpay node/version/network");
-		let ack = rpc.set_config(cln_rpc::SetconfigRequest {
+		let ack = super::unary_rpc(rpc.set_config(cln_rpc::SetconfigRequest {
 			config: "xpay-slow-mode".into(), val: Some("true".into()), transient: Some(false),
-		}).await?.into_inner();
+		})).await?.into_inner();
 		ensure!(slow_mode_ack(&ack), "native xpay-slow-mode acknowledgement is missing or inconsistent");
 		Ok((info, ack))
 	}
@@ -451,7 +451,7 @@ impl ClnXpayClient {
 			limit: None,
 			start: None,
 		};
-		let mut listpays_response = self.rpc.clone().list_pays(req).await
+		let mut listpays_response = super::unary_rpc(self.rpc.clone().list_pays(req)).await
 			.context("Could not fetch cln payments")?
 			.into_inner();
 		let label = attempt.id.to_string();
