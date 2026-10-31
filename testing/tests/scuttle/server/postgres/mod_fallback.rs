@@ -386,7 +386,7 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 			&[]).await?.get::<_, i64>(0), 0);
 		anyhow::bail!("roll back the overlapping-attempt witness control")
 	}).await;
-	assert!(overlap.is_err());
+	assert!(format!("{:#}", overlap.unwrap_err()).contains("roll back the overlapping-attempt witness control"));
 	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
 	let outgoing: anyhow::Result<()> = db.write(async |t| {
 		t.execute("UPDATE lightning_payment_attempt SET lightning_htlc_subscription_id=$2,updated_at=NOW() WHERE id=$1",
@@ -397,7 +397,7 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 		assert_eq!(t.source_settlement(hash, ids[1]).await?, SourceSettlement::Disjoint);
 		anyhow::bail!("roll back the outgoing-grant funding control")
 	}).await;
-	assert!(outgoing.is_err());
+	assert!(format!("{:#}", outgoing.unwrap_err()).contains("roll back the outgoing-grant funding control"));
 	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
 	let rolled_back: anyhow::Result<()> = db.write(async |t| {
 		t.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Receive(subscription)).await?;
