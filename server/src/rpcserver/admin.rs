@@ -249,20 +249,6 @@ impl rpc::server::ScuttleService for Server {
 			}).collect(),
 		}))
 	}
-
-	async fn fail_lightning_attempt(
-		&self, req: tonic::Request<protos::scuttle::FailLightningAttemptRequest>,
-	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
-		Err(tonic::Status::unimplemented("Lightning attempt administration is not enabled"))
-	}
-
-	async fn scoped_payment_status(
-		&self, req: tonic::Request<protos::CheckLightningPaymentRequest>,
-	) -> Result<tonic::Response<protos::LightningPaymentStatus>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
-		<Self as rpc::server::ArkService>::check_lightning_payment(self, req).await
-	}
 }
 
 /// Run the captaind admin gRPC endpoint.
