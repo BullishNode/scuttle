@@ -52,3 +52,6 @@ getrandom = { version = "0.2", optional = true }
 tonic-prost-build.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
