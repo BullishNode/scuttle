@@ -1,6 +1,6 @@
 //! Background preparation of independently ready expiry backing outputs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,13 +11,13 @@ use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
 use bitcoind_async_client::traits::Reader;
 use tracing::{debug, info, warn};
 
-use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy};
+use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId};
 
 use crate::Server;
 use crate::database::Tx;
 use crate::database::expiry_attribution::Attribution;
 use crate::database::expiry_chain::ExpiryViewToken;
-use crate::database::expiry_decision::{ReadyCoin, ReadyOutput, VerifiedPayee};
+use crate::database::expiry_decision::{DustCandidate, ReadyCoin, ReadyOutput, VerifiedPayee};
 use crate::database::expiry_inventory::{
 	BackingSnapshot, BackingSnapshotLimits, BackingVtxoFact,
 };
@@ -184,13 +184,15 @@ impl Server {
 				warn!(%anchor, %error, "Expiry anchor remains unready; other anchors continue");
 			}
 		}
+		let frontier = ready.values().flat_map(|outputs| outputs.iter().flat_map(ReadyOutput::dust_candidates)).collect::<Vec<_>>();
+		let mut included = BTreeSet::new();
 		for outputs in ready.into_values() {
 			let mut group = Vec::new();
 			for output in outputs {
 				let mut proposed = group.iter().collect::<Vec<_>>();
 				proposed.push(&output);
 				if !ReadyOutput::group_fits(&proposed)? && !group.is_empty() {
-					self.commit_ready_group(view, std::mem::take(&mut group)).await?;
+					self.commit_ready_group(view, std::mem::take(&mut group), &frontier, &mut included).await?;
 				}
 				if !ReadyOutput::group_fits(&[&output])? {
 					self.request_held_expiry_split(view, output.root(), "output_requires_split").await?;
@@ -198,7 +200,7 @@ impl Server {
 					group.push(output);
 				}
 			}
-			self.commit_ready_group(view, group).await?;
+			self.commit_ready_group(view, group, &frontier, &mut included).await?;
 		}
 		Ok(next)
 	}
@@ -357,21 +359,29 @@ impl Server {
 		}).await
 	}
 
-	async fn commit_ready_group(&self, view: ExpiryViewToken, outputs: Vec<ReadyOutput>) -> anyhow::Result<()> {
+	async fn commit_ready_group(
+		&self, view: ExpiryViewToken, outputs: Vec<ReadyOutput>,
+		frontier: &[DustCandidate], included: &mut BTreeSet<VtxoId>,
+	) -> anyhow::Result<()> {
 		if outputs.is_empty() {
 			return Ok(());
 		}
 		view.verify(&self.bitcoind).await?;
+		let pass_included = &*included;
 		match self.db.write(async |t| t.commit_expiry_group(
 			view,
-			outputs,
+			outputs, frontier, pass_included,
 		).await).await {
-			Ok(Some(group)) => info!(
-				allocation_id = group.id,
-				inputs = group.inputs,
-				dropped = group.dropped,
-				"Expiry payout decision committed"
-			),
+			Ok(Some(group)) => {
+				// A planned, held, dropped or rolled-back group is not included.
+				included.extend(group.included);
+				info!(
+					allocation_id = group.id,
+					inputs = group.inputs,
+					dropped = group.dropped,
+					"Expiry payout decision committed"
+				);
+			},
 			Ok(None) => {},
 			Err(error) => return Err(error.context("expiry group was not committed")),
 		}

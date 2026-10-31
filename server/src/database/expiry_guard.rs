@@ -1,7 +1,7 @@
 //! The durable expiry decision fences every competing obligation-changing write.
 
 use ark::VtxoId;
-use tokio_postgres::Transaction;
+use tokio_postgres::{Row, Transaction};
 
 /// Acquire the same coin locks as allocation, then re-read the durable fences.
 /// The locks live until the caller's transaction commits. Process-local flux
@@ -55,11 +55,14 @@ pub(crate) async fn guard_new_lightning_inputs(
 }
 
 impl super::Tx<'_> {
-	/// Cancel whole unfinished exchanges, including inputs in other trees.
-	/// Accepted forfeits always win if they committed first. Revalidation and
-	/// entitlement/fence writes must occur in this same transaction.
-	pub async fn cancel_expiry_participations(&self, participation_ids: &[i64]) -> anyhow::Result<bool> {
-		if participation_ids.is_empty() { return Ok(true); }
+	/// Lock and validate cancellation candidates without changing the exchange.
+	/// Dust-held or otherwise dropped groups must leave no tombstone/unlock.
+	pub(crate) async fn can_cancel_expiry_participations(&self, participation_ids: &[i64]) -> anyhow::Result<bool> {
+		Ok(self.cancellable_expiry_parts(participation_ids).await?.is_some())
+	}
+
+	async fn cancellable_expiry_parts(&self, participation_ids: &[i64]) -> anyhow::Result<Option<Vec<Row>>> {
+		if participation_ids.is_empty() { return Ok(Some(Vec::new())); }
 		let inputs = self.query("SELECT DISTINCT v.vtxo_id FROM round_part_input i \
 			JOIN vtxo v ON v.vtxo_id=i.vtxo_id WHERE i.participation_id=ANY($1) ORDER BY v.vtxo_id",
 			&[&participation_ids]).await?.into_iter().map(|r| r.get::<_, String>("vtxo_id")).collect::<Vec<_>>();
@@ -70,15 +73,23 @@ impl super::Tx<'_> {
 		for id in participation_ids {
 			let Some(part) = parts.iter().find(|r| r.get::<_, i64>("id") == *id) else {
 				if self.query_opt("SELECT participation_id FROM expiry_cancelled_participation WHERE participation_id=$1", &[id]).await?.is_none() {
-					return Ok(false);
+					return Ok(None);
 				}
 				continue;
 			};
 			if part.get::<_, Option<chrono::DateTime<chrono::Local>>>("forfeited_at").is_some()
 				|| self.query_opt("SELECT participation_id FROM round_part_input WHERE participation_id=$1 AND signed_forfeit_tx IS NOT NULL LIMIT 1", &[id]).await?.is_some() {
-				return Ok(false);
+				return Ok(None);
 			}
 		}
+		Ok(Some(parts))
+	}
+
+	/// Cancel only the final selected group under the locks taken above.
+	/// Accepted forfeits always win if they committed first. Revalidation and
+	/// entitlement/fence writes must occur in this same transaction.
+	pub async fn cancel_expiry_participations(&self, participation_ids: &[i64]) -> anyhow::Result<bool> {
+		let Some(parts) = self.cancellable_expiry_parts(participation_ids).await? else { return Ok(false); };
 		for part in parts {
 			let id = part.get::<_, i64>("id");
 			let hash = part.get::<_, &str>("unlock_hash");

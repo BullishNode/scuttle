@@ -1,10 +1,15 @@
 use ark_testing::util::ToAltString;
-use bitcoin::{Network, Txid};
+use std::collections::BTreeSet;
+
+use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use bitcoin::secp256k1::{rand, Keypair};
 use chrono::{DateTime, Local};
 use bitcoin::hashes::Hash;
 
 use ark::{ServerVtxo, VtxoId};
+use ark::board::BoardBuilder;
+use ark::vtxo::Full;
+use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef, TxOutExt};
 use ark::encode::ProtocolEncoding;
 use ark::fallback::OwnerLink;
 use ark::mailbox::MailboxIdentifier;
@@ -12,7 +17,10 @@ use ark::test_util::VTXO_VECTORS;
 
 use server::OwnershipRefusal;
 use server::owner_proof::OwnerLinks;
-use server::database::{Db, SpendState};
+use server::database::{BlockTable, Db, SpendState};
+use server::database::expiry_chain::ExpiryViewToken;
+use server::database::expiry_decision::{ReadyCoin, ReadyOutput, VerifiedPayee};
+use server::database::expiry_inventory::{BackingPartitionResidual, BackingSnapshotLimits};
 use server::database::expiry_attribution::Attribution;
 use server::database::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
 use server::database::tree::VtxoTreeUpdate;
