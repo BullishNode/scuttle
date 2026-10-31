@@ -219,7 +219,7 @@ async fn boundaries(family: Family) {
 		assert_eq!(**binding, ScriptBuf::new_p2tr(&SECP, mailbox.as_pubkey().x_only_public_key().0, None));
 		for input in &board.input {
 			let funding = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-			assert!(funding.output.iter().all(|output| output.script_pubkey != binding));
+			assert!(funding.output.iter().all(|output| &output.script_pubkey != binding));
 		}
 	}
 	let dust = family.dust();
